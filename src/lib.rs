@@ -36,3 +36,6 @@ pub use llm::LanguageModel;
 ///
 /// Type alias for [`anyhow::Result<T>`](anyhow::Result) with [`String`] as default success type.
 pub type Result<T = String> = anyhow::Result<T>;
+
+pub use schemars::JsonSchema;
+pub use serde::{Deserialize, Serialize};
