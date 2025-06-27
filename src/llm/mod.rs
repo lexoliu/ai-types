@@ -5,20 +5,18 @@ pub mod model;
 mod provider;
 /// Tool system for function calling and external integrations.
 pub mod tool;
+use crate::Result;
 use alloc::{format, string::String};
 use core::future::Future;
 use futures_core::Stream;
 use futures_lite::StreamExt;
 pub use message::{Message, Role};
 pub use provider::LanguageModelProvider;
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 pub use tool::Tool;
 
 use crate::llm::{model::Profile, tool::json};
-
-/// Type alias for results returned by language model operations.
-pub type Result<T = String> = anyhow::Result<T>;
 
 /// Creates a simple two-message conversation with a system prompt and user message.
 pub fn oneshot(system: impl Into<String>, user: impl Into<String>) -> [Message; 2] {

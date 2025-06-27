@@ -11,6 +11,13 @@ pub mod image;
 /// Language model traits, message types, and tool system.
 pub mod llm;
 
+use alloc::string::String;
+#[doc(inline)]
 pub use embedding::EmbeddingModel;
+#[doc(inline)]
 pub use image::ImageGenerator;
+#[doc(inline)]
 pub use llm::LanguageModel;
+
+/// Convenient result type used throughout the crate, defaulting to `String` as the success type.
+pub type Result<T = String> = anyhow::Result<T>;

@@ -1,14 +1,12 @@
+use crate::Result;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::BTreeMap};
 use core::fmt::Debug;
 use core::{future::Future, pin::Pin};
-use schemars::{schema_for, JsonSchema, Schema};
-use serde::{de::DeserializeOwned, Serialize};
-
-/// Type alias for tool execution results.
-pub type Result<T = String> = anyhow::Result<T>;
+use schemars::{JsonSchema, Schema, schema_for};
+use serde::{Serialize, de::DeserializeOwned};
 
 /// Trait for tools that can be called by language models.
 ///
@@ -431,10 +429,12 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Unknown operation"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Unknown operation")
+        );
     }
 
     #[tokio::test]
@@ -477,10 +477,12 @@ mod tests {
 
         let result = tools.call("nonexistent", r#"{}"#.to_string()).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Tool 'nonexistent' not found"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Tool 'nonexistent' not found")
+        );
     }
 
     #[tokio::test]

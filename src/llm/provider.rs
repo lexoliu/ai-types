@@ -44,11 +44,11 @@ mod tests {
         fn respond(
             &self,
             _messages: impl Messages,
-        ) -> impl Stream<Item = crate::llm::Result> + Send + Unpin {
+        ) -> impl Stream<Item = crate::Result> + Send + Unpin {
             futures_lite::stream::iter(vec![Ok("Mock response".to_string())])
         }
 
-        fn complete(&self, _prefix: &str) -> impl Stream<Item = crate::llm::Result> + Send + Unpin {
+        fn complete(&self, _prefix: &str) -> impl Stream<Item = crate::Result> + Send + Unpin {
             futures_lite::stream::iter(vec![Ok("Mock completion".to_string())])
         }
 
