@@ -1,9 +1,9 @@
 /// Message types and conversation handling.
 pub mod message;
-/// Model profiles, capabilities, and configuration.
+/// Model profiles and capabilities.
 pub mod model;
 mod provider;
-/// Tool system for function calling and external integrations.
+/// Tool system for function calling.
 pub mod tool;
 use crate::Result;
 use alloc::{format, string::String};
@@ -18,22 +18,30 @@ pub use tool::Tool;
 
 use crate::llm::{model::Profile, tool::json};
 
-/// Creates a simple two-message conversation with a system prompt and user message.
+/// Creates a two-message conversation with system and user prompts.
+///
+/// Returns an array containing a [`Message`] with [`Role::System`] and a [`Message`] with [`Role::User`].
 pub fn oneshot(system: impl Into<String>, user: impl Into<String>) -> [Message; 2] {
     [Message::system(system.into()), Message::user(user.into())]
 }
 
-/// Trait for types that can be converted into an iterator of messages.
+/// Types that can be converted into message iterators.
+///
+/// Implemented for [`Vec<Message>`](alloc::vec::Vec), arrays, and other iterables of [`Message`].
 pub trait Messages: IntoIterator<Item = Message, IntoIter: Send> + Send {}
 
 impl<T> Messages for T where T: IntoIterator<Item = Message, IntoIter: Send> + Send {}
 
-/// Trait for language models that can generate text and handle conversations.
+/// Language models for text generation and conversation.
 pub trait LanguageModel: Sized + Send + Sync + 'static {
-    /// Generates a streaming response to a conversation.
+    /// Generates streaming response to conversation.
+    ///
+    /// Takes any type implementing [`Messages`] and returns a stream of text chunks.
     fn respond(&self, messages: impl Messages) -> impl Stream<Item = Result> + Send + Unpin;
 
-    /// Generates structured output conforming to a JSON schema.
+    /// Generates structured output conforming to JSON schema.
+    ///
+    /// Uses [`schemars::JsonSchema`] to define the expected output structure.
     fn generate<T: JsonSchema + DeserializeOwned>(
         &self,
         messages: impl Messages,
@@ -41,23 +49,19 @@ pub trait LanguageModel: Sized + Send + Sync + 'static {
         generate(self, messages)
     }
 
-    /// Completes a given text prefix.
-    ///
-    /// # Arguments
-    ///
-    /// * `prefix` - The text to complete
-    ///
-    /// # Returns
-    ///
-    /// A stream of text chunks representing the completion.
+    /// Completes given text prefix.
     fn complete(&self, prefix: &str) -> impl Stream<Item = Result> + Send + Unpin;
 
-    /// Summarizes the given text.
+    /// Summarizes text.
+    ///
+    /// Convenience method that uses [`oneshot`] with a summarization prompt.
     fn summarize(&self, text: &str) -> impl Stream<Item = Result> + Send + Unpin {
         summarize(self, text)
     }
 
-    /// Categorizes text according to a provided JSON schema.
+    /// Categorizes text according to JSON schema.
+    ///
+    /// Uses structured generation internally with a categorization prompt.
     fn categorize<T: JsonSchema + DeserializeOwned>(
         &self,
         text: &str,
@@ -65,7 +69,9 @@ pub trait LanguageModel: Sized + Send + Sync + 'static {
         categorize(self, text)
     }
 
-    /// Returns the model's profile including capabilities and limitations.
+    /// Returns model profile and capabilities.
+    ///
+    /// See [`Profile`] for details on model metadata.
     fn profile(&self) -> Profile;
 }
 

@@ -4,37 +4,32 @@
 [![Documentation](https://docs.rs/ai_types/badge.svg)](https://docs.rs/ai_types)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A library providing unified trait abstractions for AI models including language models, embedding models, image generators, and audio processing models. This library enables you to write AI-powered applications that are agnostic to specific AI service providers.
+Unified trait abstractions for AI models. Write provider-agnostic AI applications.
 
 ## Features
 
-- **🚫 `no_std` compatible** - Works in embedded and resource-constrained environments
-- **🔧 Provider agnostic** - Unified traits for different AI model types
-- **⚡ Async/await support** - Built on modern Rust async primitives
-- **🛠️ Tool system** - Support for function calling and tool use
-- **📸 Multimodal** - Support for text, images, embeddings, and audio
-- **🎵 Audio processing** - Unified interface for audio generation and transcription
+- **🚫 `no_std`** - Works in embedded environments
+- **🔧 Provider agnostic** - Unified traits for different AI models
+- **⚡ Async/await** - Built on modern Rust async primitives
+- **🛠️ Tool system** - Function calling support
+- **📸 Multimodal** - Text, images, embeddings, and audio
+- **🎵 Audio processing** - Generation and transcription
 
-## Supported Model Types
-- **LLM** - Large Language Models for text generation and conversation
-- **Embedding model** - Text and multimodal embedding generation
-- **Text-to-image model** - Image generation from text prompts
-- **Audio generation** - Text-to-speech and audio synthesis
-- **Audio transcription** - Speech-to-text and audio transcription
+## Supported Models
+
+- **LLM** - Text generation and conversation
+- **Embedding** - Text and multimodal embeddings
+- **Image generation** - Text-to-image synthesis
+- **Audio generation** - Text-to-speech
+- **Audio transcription** - Speech-to-text
 
 ## Quick Start
-
-Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 ai_types = "0.0.1"
 ```
 
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT

@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::future::Future;
 
-/// Trait for embedding models that can convert text to vector representations.
+/// Converts text to vector representations.
 ///
 /// # Example
 ///
@@ -11,29 +11,20 @@ use core::future::Future;
 /// struct MyEmbedding;
 ///
 /// impl EmbeddingModel for MyEmbedding {
-///     fn dim(&self) -> usize {
-///         768  // Common embedding dimension
-///     }
+///     fn dim(&self) -> usize { 768 }
 ///     
 ///     async fn embed(&self, text: &str) -> Vec<f32> {
-///         // Implementation would call actual embedding service
-///         vec![0.0; self.dim()]
+///         vec![0.0; self.dim()] // Implementation calls embedding service
 ///     }
 /// }
 /// ```
 pub trait EmbeddingModel {
-    /// Returns the dimension of the embedding vectors produced by this model.
+    /// Embedding vector dimension.
     fn dim(&self) -> usize;
 
-    /// Converts the input text into a vector representation.
+    /// Converts text to embedding vector.
     ///
-    /// # Arguments
-    ///
-    /// * `text` - The text to embed
-    ///
-    /// # Returns
-    ///
-    /// A future that resolves to a vector of f32 values representing the text embedding.
+    /// Returns a [`Vec<f32>`] with length equal to [`Self::dim`].
     fn embed(&self, text: &str) -> impl Future<Output = Vec<f32>> + Send;
 }
 

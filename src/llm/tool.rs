@@ -8,11 +8,7 @@ use core::{future::Future, pin::Pin};
 use schemars::{JsonSchema, Schema, schema_for};
 use serde::{Serialize, de::DeserializeOwned};
 
-/// Trait for tools that can be called by language models.
-///
-/// Tools provide a way for language models to interact with external systems
-/// or perform specific operations. Each tool has a name, description, and
-/// a defined set of arguments.
+/// Tools that can be called by language models.
 ///
 /// # Example
 ///
@@ -53,42 +49,24 @@ use serde::{Serialize, de::DeserializeOwned};
 /// }
 /// ```
 pub trait Tool: Send {
-    /// The name of the tool. This should be unique and descriptive.
+    /// Tool name. Must be unique.
     const NAME: &str;
-    /// A description of what the tool does and when to use it.
+    /// Tool description for the language model.
     const DESCRIPTION: &str;
 
-    /// The type representing the arguments this tool accepts.
-    /// Must implement `JsonSchema` for schema generation and `DeserializeOwned` for parsing.
+    /// Tool arguments type. Must implement [`schemars::JsonSchema`] and [`serde::de::DeserializeOwned`].
     type Arguments: JsonSchema + DeserializeOwned;
 
     /// Executes the tool with the provided arguments.
     ///
-    /// # Arguments
-    ///
-    /// * `arguments` - The parsed arguments for this tool call
-    ///
-    /// # Returns
-    ///
-    /// A future that resolves to the tool execution result.
+    /// Returns a [`crate::Result`] containing the tool's output.
     fn call(&mut self, arguments: Self::Arguments) -> impl Future<Output = Result> + Send;
 }
 
-/// Utility function to serialize a value to JSON string.
+/// Serializes a value to JSON string.
 ///
-/// This is a convenience function for tools that need to return JSON responses.
-///
-/// # Arguments
-///
-/// * `value` - The value to serialize
-///
-/// # Returns
-///
-/// A JSON string representation of the value.
-///
-/// # Panics
-///
-/// Panics if the value cannot be serialized to JSON.
+/// Convenience function for tools that need to return JSON responses.
+/// Uses [`serde_json::to_string_pretty`] internally.
 pub fn json<T: Serialize>(value: &T) -> String {
     serde_json::to_string_pretty(value).expect("Failed to serialize to JSON")
 }
@@ -115,27 +93,19 @@ impl<T: Tool> ToolImpl for T {
     }
 }
 
-/// A collection of tools that can be managed and called by name.
+/// Tool registry for managing and calling tools by name.
 ///
-/// The `Tools` struct provides a registry for tools, allowing you to register
-/// multiple tools and call them by name with JSON arguments.
 ///
 /// # Example
 ///
 /// ```rust
 /// use ai_types::llm::tool::Tools;
-/// // Assuming you have a Calculator tool implemented
 ///
 /// let mut tools = Tools::new();
 /// // tools.register(Calculator);
-///
-/// // Get tool definitions for the language model
 /// let definitions = tools.definitions();
-///
-/// // Call a tool
 /// // let result = tools.call("calculator", r#"{"operation": "add", "a": 5, "b": 3}"#).await;
 /// ```
-///
 pub struct Tools {
     tools: BTreeMap<String, Box<dyn ToolImpl>>,
 }
@@ -148,26 +118,21 @@ impl Debug for Tools {
     }
 }
 
-/// Represents the definition of a tool, including its schema.
+/// Tool definition including schema for language models.
 ///
-/// This is used to provide language models with information about
-/// available tools and their expected arguments.
+/// Used to provide language models with information about available [`Tool`]s.
 #[derive(Debug, Clone)]
 pub struct ToolDefinition {
-    /// The name of the tool.
+    /// Tool name.
     pub name: &'static str,
-    /// A description of what the tool does.
+    /// Tool description.
     pub description: &'static str,
-    /// The JSON schema for the tool's arguments.
+    /// JSON schema for tool arguments.
     pub arguments: Schema,
 }
 
 impl ToolDefinition {
-    /// Creates a new tool definition for a given tool type.
-    ///
-    /// # Type Parameters
-    ///
-    /// * `T` - The tool type that implements the `Tool` trait
+    /// Creates a tool definition for a given tool type.
     pub fn new<T: Tool>() -> Self {
         Self {
             name: T::NAME,
@@ -191,52 +156,30 @@ impl Tools {
         }
     }
 
-    /// Returns the definitions of all registered tools.
-    ///
-    /// This is typically used to provide the language model with
-    /// information about available tools.
+    /// Returns definitions of all registered tools.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.values().map(|tool| tool.definition()).collect()
     }
 
-    /// Registers a new tool in the registry.
+    /// Registers a new tool. Replaces existing tool with same name.
     ///
-    /// If a tool with the same name already exists, it will be replaced.
-    ///
-    /// # Arguments
-    ///
-    /// * `tool` - The tool instance to register
+    /// The tool must implement [`Tool`] and be `'static`.
     pub fn register<T: Tool + 'static>(&mut self, tool: T) {
         self.tools
             .insert(T::NAME.to_string(), Box::new(tool) as Box<dyn ToolImpl>);
     }
 
     /// Removes a tool from the registry.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the tool to remove
     pub fn unregister(&mut self, name: &str) {
         self.tools.remove(name);
     }
 
-    /// Calls a tool by name with the provided JSON arguments.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - The name of the tool to call
-    /// * `args` - The JSON string containing the tool arguments
-    ///
-    /// # Returns
-    ///
-    /// A future that resolves to the tool execution result.
+    /// Calls a tool by name with JSON arguments.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The tool is not found
-    /// - The arguments cannot be parsed
-    /// - The tool execution fails
+    /// Returns an error if the tool is not found, arguments cannot be parsed,
+    /// or tool execution fails.
     pub async fn call(&mut self, name: &str, args: String) -> Result {
         if let Some(tool) = self.tools.get_mut(name) {
             tool.call(args).await

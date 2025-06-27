@@ -3,22 +3,22 @@ use core::fmt::Debug;
 use alloc::{string::String, vec::Vec};
 use url::Url;
 
-/// Represents the role of a participant in a conversation.
+/// Conversation participant role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// A message from the user/human.
+    /// User message.
     User,
-    /// A message from the AI assistant.
+    /// AI assistant message.
     Assistant,
-    /// A system message providing context or instructions.
+    /// System message for context/instructions.
     System,
-    /// A message from a tool or function call.
+    /// Tool/function call message.
     Tool,
 }
 
-/// Represents a single message in a conversation.
+/// A message in a conversation.
 ///
-/// A message contains the role of the sender, text content, and optionally attached images.
+/// Contains a [`Role`], text content, and optional attachments and annotations.
 ///
 /// # Example
 ///
@@ -27,45 +27,43 @@ pub enum Role {
 ///
 /// let user_msg = Message::user("Hello, how are you?".to_string());
 /// let system_msg = Message::system("You are a helpful assistant.".to_string());
-///
-/// // Message with custom role
-/// let custom_msg = Message::new(Role::Assistant, "I'm doing well, thank you!".to_string());
+/// let custom_msg = Message::new(Role::Assistant, "I'm doing well!".to_string());
 /// ```
 #[derive(Debug, Clone)]
 pub struct Message {
-    /// The role of the message sender.
+    /// Message sender role.
     pub role: Role,
-    /// The text content of the message.
+    /// Message text content.
     pub content: String,
-    /// The list of attachment URLs associated with the message.
+    /// Attachment URLs.
     pub attachments: Vec<Url>,
-    /// The list of annotations associated with the message.
+    /// Message annotations. See [`Anotation`] for details.
     pub anotation: Vec<Anotation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// Represents an annotation for a URL within a message.
+/// URL annotation metadata.
 ///
-/// This struct contains metadata about a URL, including its title, content, and the range in the message it refers to.
+/// Contains metadata about a [`url::Url`] referenced in a [`Message`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UrlAnotation {
-    /// The URL being annotated.
+    /// The annotated URL.
     pub url: Url,
-    /// The title of the annotated URL.
+    /// URL title.
     pub title: String,
-    /// The content or description associated with the URL.
+    /// URL content/description.
     pub content: String,
-    /// The start index in the message content where the annotation applies.
+    /// Start index in message content.
     pub start: usize,
-    /// The end index in the message content where the annotation applies.
+    /// End index in message content.
     pub end: usize,
 }
 
-/// Represents an annotation within a message.
+/// Message annotation.
 ///
-/// An annotation can provide additional metadata or context, such as a URL annotation.
+/// Provides additional metadata for [`Message`] content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Anotation {
-    /// An annotation for a URL within the message.
+    /// URL annotation. See [`UrlAnotation`].
     Url(UrlAnotation),
 }
 

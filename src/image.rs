@@ -1,10 +1,12 @@
 use alloc::vec::Vec;
 use futures_core::Stream;
 
-/// Type alias for image data as a vector of bytes.
+/// Image data as bytes.
+///
+/// Type alias for [`Vec<u8>`] representing image data.
 pub type Data = Vec<u8>;
 
-/// Trait for image generation models that can create images from text prompts.
+/// Generates images from text prompts.
 ///
 /// # Example
 ///
@@ -16,22 +18,14 @@ pub type Data = Vec<u8>;
 ///
 /// impl ImageGenerator for MyImageGen {
 ///     fn generate(&self, prompt: &str) -> impl Stream<Item = ai_types::image::Data> + Send {
-///         // Implementation would call actual image generation service
 ///         futures_lite::stream::iter(vec![vec![0u8; 1024]]) // Mock data
 ///     }
 /// }
 /// ```
 pub trait ImageGenerator {
-    /// Generates an image from a text prompt.
+    /// Generates image from text prompt.
     ///
-    /// # Arguments
-    ///
-    /// * `prompt` - The text description of the image to generate
-    ///
-    /// # Returns
-    ///
-    /// A stream of image data chunks. The stream may yield multiple chunks
-    /// as the image is being generated, allowing for progressive loading.
+    /// Returns a [`Stream`] of [`Data`] chunks for progressive loading.
     fn generate(&self, prompt: &str) -> impl Stream<Item = Data> + Send;
 }
 
