@@ -1,6 +1,6 @@
 # AI Types
 
-[![Crates.io](https://img.shields.io/crates/v/ai_types.svg)](https://crates.io/crates/ai_types)
+[![Crates.io](https://img.shields.io/crates/v/ai-types.svg)](https://crates.io/crates/ai-types)
 [![Documentation](https://docs.rs/ai_types/badge.svg)](https://docs.rs/ai_types)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
