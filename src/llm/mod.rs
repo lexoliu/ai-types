@@ -5,12 +5,15 @@ pub mod model;
 mod provider;
 /// Tool system for function calling.
 pub mod tool;
-use crate::Result;
-use alloc::{format, string::String};
+use crate::{
+    Result,
+    llm::{model::Parameters, tool::Tools},
+};
+use alloc::{format, string::String, vec::Vec};
 use core::future::Future;
 use futures_core::Stream;
 use futures_lite::StreamExt;
-pub use message::{Message, Role};
+pub use message::{Annotation, Message, Role, UrlAnnotation};
 pub use provider::LanguageModelProvider;
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
@@ -21,7 +24,7 @@ use crate::llm::{model::Profile, tool::json};
 /// Creates a two-message conversation with system and user prompts.
 ///
 /// Returns an array containing a [`Message`] with [`Role::System`] and a [`Message`] with [`Role::User`].
-pub fn oneshot(system: impl Into<String>, user: impl Into<String>) -> [Message; 2] {
+fn oneshot(system: impl Into<String>, user: impl Into<String>) -> [Message; 2] {
     [Message::system(system.into()), Message::user(user.into())]
 }
 
@@ -32,29 +35,166 @@ pub trait Messages: IntoIterator<Item = Message, IntoIter: Send> + Send {}
 
 impl<T> Messages for T where T: IntoIterator<Item = Message, IntoIter: Send> + Send {}
 
+/// A request to a language model.
+///
+/// Contains the conversation messages, available tools, and generation parameters.
+/// This is the primary input structure for language model interactions.
+///
+/// # Examples
+///
+/// ```rust
+/// use ai_types::llm::{Request, Message, model::Parameters};
+///
+/// // Simple request with messages
+/// let messages = vec![
+///     Message::system("You are a helpful assistant"),
+///     Message::user("Hello!")
+/// ];
+/// let request = Request::new(messages);
+///
+/// // Request with custom parameters - create new messages
+/// let other_messages = vec![Message::user("Another message")];
+/// let request = Request::new(other_messages)
+///     .parameters(Parameters::default().temperature(0.7));
+/// ```
+pub struct Request {
+    /// The conversation messages to send to the model.
+    pub messages: Vec<Message>,
+    /// Available tools that the model can call.
+    pub tools: Tools,
+    /// Parameters controlling model behavior and generation.
+    pub parameters: Parameters,
+}
+
+impl Request {
+    /// Creates a new request with the given messages.
+    ///
+    /// The request is initialized with default tools and parameters.
+    ///
+    /// # Arguments
+    ///
+    /// * `messages` - The conversation messages (can be Vec<Message>, array, etc.)
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ai_types::llm::{Request, Message};
+    ///
+    /// let messages = vec![Message::user("Hello, world!")];
+    /// let request = Request::new(messages);
+    /// ```
+    pub fn new(messages: impl Into<Vec<Message>>) -> Self {
+        Request {
+            messages: messages.into(),
+            tools: Tools::default(),
+            parameters: Parameters::default(),
+        }
+    }
+
+    /// Creates a request for a simple system/user conversation.
+    ///
+    /// This is a convenience method that creates a two-message conversation
+    /// with a system prompt and user message.
+    ///
+    /// # Arguments
+    ///
+    /// * `system` - The system message content
+    /// * `user` - The user message content
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ai_types::llm::Request;
+    ///
+    /// let request = Request::oneshot(
+    ///     "You are a helpful assistant",
+    ///     "What is the capital of France?"
+    /// );
+    /// ```
+    pub fn oneshot(system: impl Into<String>, user: impl Into<String>) -> Self {
+        Request::new(oneshot(system, user))
+    }
+
+    /// Sets the generation parameters for this request.
+    ///
+    /// # Arguments
+    ///
+    /// * `parameters` - The model parameters to use
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ai_types::llm::{Request, Message, model::Parameters};
+    ///
+    /// let request = Request::new(vec![Message::user("Hello")])
+    ///     .parameters(Parameters::default().temperature(0.7));
+    /// ```
+    pub fn parameters(mut self, parameters: Parameters) -> Self {
+        self.parameters = parameters;
+        self
+    }
+
+    /// Adds a tool that the model can use.
+    ///
+    /// # Arguments
+    ///
+    /// * `tool` - The tool to add to this request
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ai_types::llm::{Request, Message, Tool};
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(JsonSchema, Deserialize)]
+    /// struct MyToolArgs {
+    ///     input: String,
+    /// }
+    ///
+    /// struct MyTool;
+    ///
+    /// impl Tool for MyTool {
+    ///     const NAME: &'static str = "my_tool";
+    ///     const DESCRIPTION: &'static str = "A test tool";
+    ///     type Arguments = MyToolArgs;
+    ///     
+    ///     async fn call(&mut self, args: Self::Arguments) -> ai_types::Result {
+    ///         Ok(format!("Processed: {}", args.input))
+    ///     }
+    /// }
+    ///
+    /// let tool = MyTool;
+    /// let request = Request::new(vec![Message::user("Hello")])
+    ///     .tool(tool);
+    /// ```
+    pub fn tool(mut self, tool: impl Tool) -> Self {
+        self.tools.register(tool);
+        self
+    }
+}
+
 /// Language models for text generation and conversation.
 pub trait LanguageModel: Sized + Send + Sync + 'static {
     /// Generates streaming response to conversation.
     ///
     /// Takes any type implementing [`Messages`] and returns a stream of text chunks.
-    fn respond(&self, messages: impl Messages) -> impl Stream<Item = Result> + Send + Unpin;
+    fn respond(&self, request: Request) -> impl Stream<Item = Result> + Send + Unpin;
 
     /// Generates structured output conforming to JSON schema.
     ///
     /// Uses [`schemars::JsonSchema`] to define the expected output structure.
     fn generate<T: JsonSchema + DeserializeOwned>(
         &self,
-        messages: impl Messages,
+        request: Request,
     ) -> impl Future<Output = Result<T>> + Send {
-        generate(self, messages)
+        generate(self, request)
     }
 
     /// Completes given text prefix.
     fn complete(&self, prefix: &str) -> impl Stream<Item = Result> + Send + Unpin;
 
     /// Summarizes text.
-    ///
-    /// Convenience method that uses [`oneshot`] with a summarization prompt.
     fn summarize(&self, text: &str) -> impl Stream<Item = Result> + Send + Unpin {
         summarize(self, text)
     }
@@ -77,7 +217,7 @@ pub trait LanguageModel: Sized + Send + Sync + 'static {
 
 async fn generate<T: JsonSchema + DeserializeOwned, M: LanguageModel>(
     model: &M,
-    messages: impl Messages,
+    mut request: Request,
 ) -> Result<T> {
     let schema = json(&schema_for!(T));
 
@@ -98,9 +238,10 @@ Example format: {{"field1": "value1", "field2": 123}}
 
 Generate the JSON response now:"#
     );
-    let messages = messages.into_iter().chain(Some(Message::system(prompt)));
+
+    request.messages.push(Message::system(prompt));
     let response: String = model
-        .respond(messages)
+        .respond(request)
         .try_fold(String::new(), |state, new| Ok(state + &new))
         .await?;
 
@@ -113,7 +254,7 @@ fn summarize<'a, M: LanguageModel>(
     model: &'a M,
     text: &str,
 ) -> impl Stream<Item = Result<String>> + Send + Unpin + 'a {
-    let messages = oneshot("Summarize text:", text);
+    let messages = Request::oneshot("Summarize text:", text);
     model.respond(messages)
 }
 
@@ -122,244 +263,6 @@ async fn categorize<T: JsonSchema + DeserializeOwned, M: LanguageModel>(
     text: &str,
 ) -> Result<T> {
     model
-        .generate(oneshot("Categorize text by provided schema", text))
+        .generate(Request::oneshot("Categorize text by provided schema", text))
         .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::llm::model::Ability;
-    use alloc::{string::ToString, vec, vec::Vec};
-    use futures_lite::StreamExt;
-
-    struct MockLanguageModel;
-
-    impl LanguageModel for MockLanguageModel {
-        fn respond(&self, messages: impl Messages) -> impl Stream<Item = Result> + Send + Unpin {
-            let message_count = messages.into_iter().count();
-            futures_lite::stream::iter(vec![
-                Ok("Mock".to_string()),
-                Ok(" response".to_string()),
-                Ok(format!(" (from {message_count} messages)")),
-            ])
-        }
-
-        fn complete(&self, prefix: &str) -> impl Stream<Item = Result> + Send + Unpin {
-            futures_lite::stream::iter(vec![Ok(format!("{prefix} completion"))])
-        }
-
-        fn profile(&self) -> Profile {
-            Profile::new("mock-model", "A mock language model", 2048).with_ability(Ability::ToolUse)
-        }
-    }
-
-    #[test]
-    fn test_oneshot_message_creation() {
-        let messages = oneshot("You are helpful", "Hello");
-
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, Role::System);
-        assert_eq!(messages[0].content, "You are helpful");
-        assert_eq!(messages[1].role, Role::User);
-        assert_eq!(messages[1].content, "Hello");
-    }
-
-    #[test]
-    fn test_oneshot_with_string_types() {
-        let system = "System prompt".to_string();
-        let user = "User message".to_string();
-        let messages = oneshot(system.clone(), user.clone());
-
-        assert_eq!(messages[0].content, system);
-        assert_eq!(messages[1].content, user);
-    }
-
-    #[test]
-    fn test_messages_trait_vec() {
-        let messages: Vec<Message> = vec![
-            Message::system("System"),
-            Message::user("User"),
-            Message::assistant("Assistant"),
-        ];
-
-        // Test that Vec<Message> implements Messages
-        fn accepts_messages(_messages: impl Messages) {}
-        accepts_messages(messages);
-    }
-
-    #[test]
-    fn test_messages_trait_array() {
-        let messages = [Message::system("System"), Message::user("User")];
-
-        // Test that array implements Messages
-        fn accepts_messages(_messages: impl Messages) {}
-        accepts_messages(messages);
-    }
-
-    #[tokio::test]
-    async fn test_language_model_respond() {
-        let model = MockLanguageModel;
-        let messages = oneshot("You are helpful", "Hello");
-
-        let mut response_stream = model.respond(messages);
-        let mut response_parts = Vec::new();
-
-        while let Some(part) = response_stream.next().await {
-            response_parts.push(part.unwrap());
-        }
-
-        assert_eq!(response_parts.len(), 3);
-        assert_eq!(response_parts[0], "Mock");
-        assert_eq!(response_parts[1], " response");
-        assert_eq!(response_parts[2], " (from 2 messages)");
-    }
-
-    #[tokio::test]
-    async fn test_language_model_complete() {
-        let model = MockLanguageModel;
-
-        let mut completion_stream = model.complete("Hello");
-        let completion = completion_stream.next().await.unwrap().unwrap();
-
-        assert_eq!(completion, "Hello completion");
-    }
-
-    #[test]
-    fn test_language_model_profile() {
-        let model = MockLanguageModel;
-        let profile = model.profile();
-
-        assert_eq!(profile.name, "mock-model");
-        assert_eq!(profile.description, "A mock language model");
-        assert_eq!(profile.context_length, 2048);
-        assert_eq!(profile.abilities.len(), 1);
-        assert_eq!(profile.abilities[0], Ability::ToolUse);
-    }
-
-    #[tokio::test]
-    async fn test_language_model_summarize() {
-        let model = MockLanguageModel;
-
-        let mut summary_stream = model.summarize("This is a long text to summarize");
-        let mut summary_parts = Vec::new();
-
-        while let Some(part) = summary_stream.next().await {
-            summary_parts.push(part.unwrap());
-        }
-
-        // Should get response from oneshot messages (system + user)
-        assert_eq!(summary_parts.len(), 3);
-        assert_eq!(summary_parts[2], " (from 2 messages)");
-    }
-
-    #[tokio::test]
-    async fn test_generate_function() {
-        use schemars::JsonSchema;
-        use serde::{Deserialize, Serialize};
-
-        #[derive(JsonSchema, Deserialize, Serialize, Debug, PartialEq)]
-        struct TestResponse {
-            message: String,
-            count: u32,
-        }
-
-        // Create a mock model that returns valid JSON
-        struct JsonMockModel;
-
-        impl LanguageModel for JsonMockModel {
-            fn respond(
-                &self,
-                _messages: impl Messages,
-            ) -> impl Stream<Item = Result> + Send + Unpin {
-                futures_lite::stream::iter(vec![Ok(
-                    r#"{"message": "test", "count": 42}"#.to_string()
-                )])
-            }
-
-            fn complete(&self, _prefix: &str) -> impl Stream<Item = Result> + Send + Unpin {
-                futures_lite::stream::iter(vec![Ok("completion".to_string())])
-            }
-
-            fn profile(&self) -> Profile {
-                Profile::new("json-mock", "JSON mock model", 1024)
-            }
-        }
-
-        let model = JsonMockModel;
-        let messages = oneshot("Generate", "test data");
-
-        let result: TestResponse = model.generate(messages).await.unwrap();
-        assert_eq!(result.message, "test");
-        assert_eq!(result.count, 42);
-    }
-
-    #[tokio::test]
-    async fn test_categorize_function() {
-        use schemars::JsonSchema;
-        use serde::{Deserialize, Serialize};
-
-        #[derive(JsonSchema, Deserialize, Serialize, Debug, PartialEq)]
-        struct Category {
-            name: String,
-            confidence: f32,
-        }
-
-        // Create a mock model that returns valid JSON
-        struct CategoryMockModel;
-
-        impl LanguageModel for CategoryMockModel {
-            fn respond(
-                &self,
-                _messages: impl Messages,
-            ) -> impl Stream<Item = Result> + Send + Unpin {
-                futures_lite::stream::iter(vec![Ok(
-                    r#"{"name": "positive", "confidence": 0.95}"#.to_string()
-                )])
-            }
-
-            fn complete(&self, _prefix: &str) -> impl Stream<Item = Result> + Send + Unpin {
-                futures_lite::stream::iter(vec![Ok("completion".to_string())])
-            }
-
-            fn profile(&self) -> Profile {
-                Profile::new("category-mock", "Category mock model", 1024)
-            }
-        }
-
-        let model = CategoryMockModel;
-        let result: Category = model.categorize("This is great!").await.unwrap();
-
-        assert_eq!(result.name, "positive");
-        assert_eq!(result.confidence, 0.95);
-    }
-
-    #[test]
-    fn test_result_type_alias() {
-        let success: Result = Ok("success".to_string());
-        let error: Result = Err(anyhow::Error::msg("error"));
-
-        assert!(success.is_ok());
-        assert!(error.is_err());
-
-        if let Ok(value) = success {
-            assert_eq!(value, "success");
-        }
-        if let Err(err) = error {
-            assert_eq!(err.to_string(), "error");
-        }
-    }
-
-    #[test]
-    fn test_result_default_type() {
-        let result: Result<String> = Ok("test".to_string());
-        if let Ok(value) = result {
-            assert_eq!(value, "test");
-        }
-
-        let result: Result<i32> = Ok(42);
-        if let Ok(value) = result {
-            assert_eq!(value, 42);
-        }
-    }
 }

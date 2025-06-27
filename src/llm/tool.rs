@@ -48,7 +48,7 @@ use serde::{Serialize, de::DeserializeOwned};
 ///     }
 /// }
 /// ```
-pub trait Tool: Send {
+pub trait Tool: Send + 'static {
     /// Tool name. Must be unique.
     const NAME: &str;
     /// Tool description for the language model.

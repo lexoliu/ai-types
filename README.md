@@ -8,7 +8,6 @@ Unified trait abstractions for AI models. Write provider-agnostic AI application
 
 ## Features
 
-- **🚫 `no_std`** - Works in embedded environments
 - **🔧 Provider agnostic** - Unified traits for different AI models
 - **⚡ Async/await** - Built on modern Rust async primitives
 - **🛠️ Tool system** - Function calling support
@@ -29,7 +28,3 @@ Unified trait abstractions for AI models. Write provider-agnostic AI application
 [dependencies]
 ai_types = "0.0.1"
 ```
-
-## License
-
-MIT

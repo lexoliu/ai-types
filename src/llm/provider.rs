@@ -30,8 +30,7 @@ pub struct Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::model::Profile as ModelProfile;
-    use crate::llm::{Message, Messages};
+    use crate::llm::Message;
     use alloc::{string::ToString, vec};
     use futures_core::Stream;
     use futures_lite::StreamExt;
@@ -43,17 +42,20 @@ mod tests {
     impl LanguageModel for MockModel {
         fn respond(
             &self,
-            _messages: impl Messages,
-        ) -> impl Stream<Item = crate::Result> + Send + Unpin {
+            _request: crate::llm::Request,
+        ) -> impl Stream<Item = crate::Result<String>> + Send + Unpin {
             futures_lite::stream::iter(vec![Ok("Mock response".to_string())])
         }
 
-        fn complete(&self, _prefix: &str) -> impl Stream<Item = crate::Result> + Send + Unpin {
+        fn complete(
+            &self,
+            _prefix: &str,
+        ) -> impl Stream<Item = crate::Result<String>> + Send + Unpin {
             futures_lite::stream::iter(vec![Ok("Mock completion".to_string())])
         }
 
-        fn profile(&self) -> ModelProfile {
-            ModelProfile::new(&self.name, "A mock model", 2048)
+        fn profile(&self) -> crate::llm::model::Profile {
+            crate::llm::model::Profile::new(&self.name, "A mock model", 2048)
         }
     }
 
@@ -122,7 +124,8 @@ mod tests {
         let model = provider.get_model("test-model").await;
 
         let messages = vec![Message::user("Hello")];
-        let mut response_stream = model.respond(messages);
+        let request = crate::llm::Request::new(messages);
+        let mut response_stream = model.respond(request);
 
         let response = response_stream.next().await.unwrap().unwrap();
         assert_eq!(response, "Mock response");

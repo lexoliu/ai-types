@@ -1,46 +1,192 @@
+//! AI language model configuration and profiling types.
+//!
+//! This module provides types for configuring AI language models, including
+//! parameters for model behavior, pricing information, and capability profiles.
+//!
+//! # Examples
+//!
+//! ## Creating a model profile
+//!
+//! ```rust
+//! use ai_types::llm::model::{Profile, Ability, Pricing};
+//!
+//! let pricing = Pricing {
+//!     prompt: 0.001,
+//!     completion: 0.002,
+//!     request: 0.01,
+//!     image: 0.1,
+//!     web_search: 0.05,
+//!     internal_reasoning: 0.003,
+//!     input_cache_read: 0.0005,
+//!     input_cache_write: 0.001,
+//! };
+//!
+//! let profile = Profile::new("gpt-4", "GPT-4 model", 8192)
+//!     .with_ability(Ability::ToolUse)
+//!     .with_ability(Ability::Vision)
+//!     .with_pricing(pricing);
+//! ```
+//!
+//! ## Configuring model parameters
+//!
+//! ```rust
+//! use ai_types::llm::model::Parameters;
+//!
+//! let params = Parameters::default()
+//!     .temperature(0.7)
+//!     .top_p(0.9)
+//!     .max_tokens(1000)
+//!     .seed(42);
+//! ```
+
 use alloc::{string::String, vec::Vec};
 
 use crate::llm::tool::Tools;
 
-#[derive(Debug)]
 /// Parameters for configuring the behavior of a language model.
+///
+/// This struct contains various parameters that can be used to control
+/// how a language model generates responses. All parameters are optional
+/// and use the builder pattern for easy configuration.
+///
+/// # Examples
+///
+/// ```rust
+/// use ai_types::llm::model::Parameters;
+///
+/// let params = Parameters::default()
+///     .temperature(0.7)
+///     .top_p(0.9)
+///     .max_tokens(1000)
+///     .seed(42);
+/// ```
+#[derive(Debug, Default)]
 pub struct Parameters {
     /// Sampling temperature.
-    pub temperature: f32,
+    ///
+    /// Controls randomness in generation. Higher values (e.g., 1.0) make output more random,
+    /// lower values (e.g., 0.1) make it more deterministic.
+    pub temperature: Option<f32>,
     /// Nucleus sampling probability.
-    pub top_p: f32,
+    ///
+    /// Only consider tokens with cumulative probability up to this value.
+    /// Typical values are between 0.9 and 1.0.
+    pub top_p: Option<f32>,
     /// Top-k sampling parameter.
-    pub top_k: u32,
+    ///
+    /// Only consider the k most likely tokens at each step.
+    pub top_k: Option<u32>,
     /// Frequency penalty to reduce repetition.
-    pub frequency_penalty: f32,
+    ///
+    /// Positive values penalize tokens that have already appeared.
+    pub frequency_penalty: Option<f32>,
     /// Presence penalty to encourage new tokens.
-    pub presence_penalty: f32,
+    ///
+    /// Positive values encourage the model to talk about new topics.
+    pub presence_penalty: Option<f32>,
     /// Repetition penalty to penalize repeated tokens.
-    pub repetition_penalty: f32,
+    ///
+    /// Values > 1.0 discourage repetition, values < 1.0 encourage it.
+    pub repetition_penalty: Option<f32>,
     /// Minimum probability for nucleus sampling.
-    pub min_p: f32,
+    ///
+    /// Alternative to top_p that sets a minimum threshold for token probabilities.
+    pub min_p: Option<f32>,
     /// Top-a sampling parameter.
-    pub top_a: f32,
+    ///
+    /// Adaptive sampling that adjusts the number of considered tokens.
+    pub top_a: Option<f32>,
     /// Random seed for reproducibility.
-    pub seed: u32,
+    ///
+    /// Use the same seed to get deterministic outputs.
+    pub seed: Option<u32>,
     /// Maximum number of tokens to generate.
-    pub max_tokens: u32,
+    ///
+    /// Limits the length of the generated response.
+    pub max_tokens: Option<u32>,
     /// Biases for specific logits.
+    ///
+    /// Each tuple contains a token string and its bias value.
     pub logit_bias: Option<Vec<(String, f32)>>,
     /// Whether to return log probabilities.
-    pub logprobs: bool,
+    ///
+    /// When true, the model returns probability information for tokens.
+    pub logprobs: Option<bool>,
     /// Number of top log probabilities to return.
-    pub top_logprobs: u8,
+    ///
+    /// Only used when logprobs is true.
+    pub top_logprobs: Option<u8>,
     /// Stop sequences to end generation.
+    ///
+    /// Generation stops when any of these strings are encountered.
     pub stop: Option<Vec<String>>,
     /// Tools available to the model.
+    ///
+    /// Defines what external functions the model can call.
     pub tools: Tools,
     /// Tool choices available to the model.
+    ///
+    /// Specifies which tools the model is allowed to use.
     pub tool_choice: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+macro_rules! impl_with_methods {
+    (
+        impl $ty:ty {
+            $($field:ident : $field_ty:ty),* $(,)?
+        }
+    ) => {
+        impl $ty {
+            $(
+                /// Sets the parameter value using a builder pattern.
+                ///
+                /// # Arguments
+                ///
+                /// * `value` - The value to set for this parameter
+                pub fn $field(mut self, value: $field_ty) -> Self {
+                    self.$field = Some(value);
+                    self
+                }
+            )*
+        }
+    };
+}
+
+impl_with_methods! {
+    impl Parameters {
+        temperature: f32,
+        top_p: f32,
+        top_k: u32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+        repetition_penalty: f32,
+        min_p: f32,
+        top_a: f32,
+        seed: u32,
+        max_tokens: u32,
+        logit_bias: Vec<(String, f32)>,
+        logprobs: bool,
+        top_logprobs: u8,
+        stop: Vec<String>,
+    }
+}
+
 /// Represents a language model's profile, including its name, description, abilities, context length, and optional pricing.
+///
+/// A model profile provides comprehensive information about a language model's
+/// capabilities, limitations, and pricing structure. This allows applications
+/// to make informed decisions about which model to use for specific tasks.
+///
+/// # Examples
+///
+/// ```rust
+/// use ai_types::llm::model::{Profile, Ability, Pricing};
+///
+/// let profile = Profile::new("gpt-4", "GPT-4 Turbo", 128000)
+///     .with_ability(Ability::ToolUse)
+///     .with_ability(Ability::Vision);
+/// ```
+#[derive(Debug, Clone, PartialEq)]
 pub struct Profile {
     /// The name of the model.
     pub name: String,
@@ -55,6 +201,27 @@ pub struct Profile {
 }
 
 /// Pricing information for a model's various capabilities (unit: USD).
+///
+/// This struct contains detailed pricing information for different aspects
+/// of model usage. All prices are in USD and typically represent costs
+/// per unit (token, request, image, etc.).
+///
+/// # Examples
+///
+/// ```rust
+/// use ai_types::llm::model::Pricing;
+///
+/// let pricing = Pricing {
+///     prompt: 0.01,      // $0.01 per 1K prompt tokens
+///     completion: 0.03,  // $0.03 per 1K completion tokens
+///     request: 0.0,      // No per-request fee
+///     image: 0.25,       // $0.25 per image
+///     web_search: 0.005, // $0.005 per search
+///     internal_reasoning: 0.0,
+///     input_cache_read: 0.0,
+///     input_cache_write: 0.0,
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct Pricing {
     /// Price per prompt token.
@@ -76,6 +243,33 @@ pub struct Pricing {
 }
 
 /// Indicates which parameters are supported by a model.
+///
+/// This struct is used to communicate which configuration parameters
+/// a specific model supports, allowing applications to adjust their
+/// requests accordingly.
+///
+/// # Examples
+///
+/// ```rust
+/// use ai_types::llm::model::SupportedParameters;
+///
+/// let support = SupportedParameters {
+///     tools: true,
+///     temperature: true,
+///     max_tokens: true,
+///     tool_choice: false,
+///     // ... other fields
+/// #   top_p: true,
+/// #   reasoning: false,
+/// #   include_reasoning: false,
+/// #   structured_outputs: false,
+/// #   response_format: false,
+/// #   stop: true,
+/// #   frequency_penalty: false,
+/// #   presence_penalty: false,
+/// #   seed: true,
+/// };
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SupportedParameters {
     /// Whether tools are supported.
@@ -108,6 +302,20 @@ pub struct SupportedParameters {
 
 impl Profile {
     /// Creates a new `Profile` with the given name, description, and context length.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The name of the model (e.g., "gpt-4", "claude-3-opus")
+    /// * `description` - A human-readable description of the model
+    /// * `context_length` - Maximum number of tokens the model can process
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ai_types::llm::model::Profile;
+    ///
+    /// let profile = Profile::new("gpt-4", "GPT-4 Turbo", 128000);
+    /// ```
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -123,17 +331,69 @@ impl Profile {
     }
 
     /// Adds a single ability to the profile.
+    ///
+    /// # Arguments
+    ///
+    /// * `ability` - The ability to add to this profile
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ai_types::llm::model::{Profile, Ability};
+    ///
+    /// let profile = Profile::new("vision-model", "A vision-capable model", 8192)
+    ///     .with_ability(Ability::Vision);
+    /// ```
     pub fn with_ability(self, ability: Ability) -> Self {
         self.with_abilities([ability])
     }
 
     /// Adds multiple abilities to the profile.
+    ///
+    /// # Arguments
+    ///
+    /// * `abilities` - An iterable collection of abilities to add
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ai_types::llm::model::{Profile, Ability};
+    ///
+    /// let abilities = vec![Ability::ToolUse, Ability::Vision, Ability::Audio];
+    /// let profile = Profile::new("multimodal", "A multimodal model", 32768)
+    ///     .with_abilities(abilities);
+    /// ```
     pub fn with_abilities(mut self, abilities: impl IntoIterator<Item = Ability>) -> Self {
         self.abilities.extend(abilities);
         self
     }
 
     /// Sets the pricing information for the profile.
+    ///
+    /// # Arguments
+    ///
+    /// * `pricing` - The pricing structure for this model
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use ai_types::llm::model::{Profile, Pricing};
+    ///
+    /// let pricing = Pricing {
+    ///     prompt: 0.01,
+    ///     completion: 0.03,
+    ///     // ... other pricing fields
+    /// #   request: 0.0,
+    /// #   image: 0.0,
+    /// #   web_search: 0.0,
+    /// #   internal_reasoning: 0.0,
+    /// #   input_cache_read: 0.0,
+    /// #   input_cache_write: 0.0,
+    /// };
+    ///
+    /// let profile = Profile::new("paid-model", "A paid model", 4096)
+    ///     .with_pricing(pricing);
+    /// ```
     pub fn with_pricing(mut self, pricing: Pricing) -> Self {
         self.pricing = Some(pricing);
         self
@@ -141,6 +401,20 @@ impl Profile {
 }
 
 /// Represents the capabilities that a language model may support.
+///
+/// This enum defines the various advanced capabilities that modern language
+/// models can possess beyond basic text generation. These capabilities can
+/// be used to determine which models are suitable for specific use cases.
+///
+/// # Examples
+///
+/// ```rust
+/// use ai_types::llm::model::Ability;
+///
+/// // Check if a model supports vision
+/// let abilities = vec![Ability::Vision, Ability::ToolUse];
+/// let has_vision = abilities.contains(&Ability::Vision);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ability {
     /// The model can use external tools/functions.
@@ -149,7 +423,7 @@ pub enum Ability {
     Vision,
     /// The model can process and understand audio.
     Audio,
-    /// The model can perform web searches naitvely.
+    /// The model can perform web searches natively.
     WebSearch,
 }
 
@@ -393,24 +667,12 @@ mod tests {
 
     #[test]
     fn test_parameters_debug() {
-        let params = Parameters {
-            temperature: 0.7,
-            top_p: 0.9,
-            top_k: 40,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
-            repetition_penalty: 1.0,
-            min_p: 0.05,
-            top_a: 0.0,
-            seed: 42,
-            max_tokens: 1000,
-            logit_bias: None,
-            logprobs: false,
-            top_logprobs: 0,
-            stop: None,
-            tools: Tools::new(),
-            tool_choice: None,
-        };
+        let params = Parameters::default()
+            .temperature(0.7)
+            .top_p(0.9)
+            .top_k(40)
+            .seed(42)
+            .max_tokens(1000);
 
         let debug_str = alloc::format!("{params:?}");
         assert!(debug_str.contains("0.7"));
