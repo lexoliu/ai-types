@@ -3,7 +3,6 @@
 #![warn(missing_docs)]
 
 extern crate alloc;
-
 /// Audio generation and transcription.
 ///
 /// Contains [`AudioGenerator`] and [`AudioTranscriber`] traits.
@@ -37,5 +36,4 @@ pub use llm::LanguageModel;
 /// Type alias for [`anyhow::Result<T>`](anyhow::Result) with [`String`] as default success type.
 pub type Result<T = String> = anyhow::Result<T>;
 
-pub use schemars::JsonSchema;
-pub use serde::{Deserialize, Serialize};
+pub use anyhow::Error;

@@ -25,7 +25,7 @@ pub trait EmbeddingModel {
     /// Converts text to embedding vector.
     ///
     /// Returns a [`Vec<f32>`] with length equal to [`Self::dim`].
-    fn embed(&self, text: &str) -> impl Future<Output = Vec<f32>> + Send;
+    fn embed(&self, text: &str) -> impl Future<Output = crate::Result<Vec<f32>>> + Send;
 }
 
 #[cfg(test)]
