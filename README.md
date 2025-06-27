@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/ai_types/badge.svg)](https://docs.rs/ai_types)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A library providing unified trait abstractions for AI models including language models, embedding models, and image generators. This library enables you to write AI-powered applications that are agnostic to specific AI service providers.
+A library providing unified trait abstractions for AI models including language models, embedding models, image generators, and audio processing models. This library enables you to write AI-powered applications that are agnostic to specific AI service providers.
 
 ## Features
 
@@ -12,12 +12,15 @@ A library providing unified trait abstractions for AI models including language 
 - **🔧 Provider agnostic** - Unified traits for different AI model types
 - **⚡ Async/await support** - Built on modern Rust async primitives
 - **🛠️ Tool system** - Support for function calling and tool use
-- **📸 Multimodal** - Support for text, images, and embeddings
+- **📸 Multimodal** - Support for text, images, embeddings, and audio
+- **🎵 Audio processing** - Unified interface for audio generation and transcription
 
 ## Supported Model Types
-- LLM
-- Embedding model
-- Text-to-image model
+- **LLM** - Large Language Models for text generation and conversation
+- **Embedding model** - Text and multimodal embedding generation
+- **Text-to-image model** - Image generation from text prompts
+- **Audio generation** - Text-to-speech and audio synthesis
+- **Audio transcription** - Speech-to-text and audio transcription
 
 ## Quick Start
 

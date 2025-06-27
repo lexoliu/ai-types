@@ -15,7 +15,7 @@ pub type Data = Vec<u8>;
 /// struct MyImageGen;
 ///
 /// impl ImageGenerator for MyImageGen {
-///     fn generate_image(&self, prompt: &str) -> impl Stream<Item = ai_types::image::Data> + Send {
+///     fn generate(&self, prompt: &str) -> impl Stream<Item = ai_types::image::Data> + Send {
 ///         // Implementation would call actual image generation service
 ///         futures_lite::stream::iter(vec![vec![0u8; 1024]]) // Mock data
 ///     }
@@ -32,7 +32,7 @@ pub trait ImageGenerator {
     ///
     /// A stream of image data chunks. The stream may yield multiple chunks
     /// as the image is being generated, allowing for progressive loading.
-    fn generate_image(&self, prompt: &str) -> impl Stream<Item = Data> + Send;
+    fn generate(&self, prompt: &str) -> impl Stream<Item = Data> + Send;
 }
 
 #[cfg(test)]
@@ -44,7 +44,7 @@ mod tests {
     struct MockImageGenerator;
 
     impl ImageGenerator for MockImageGenerator {
-        fn generate_image(&self, prompt: &str) -> impl Stream<Item = Data> + Send {
+        fn generate(&self, prompt: &str) -> impl Stream<Item = Data> + Send {
             // Create mock image data based on prompt
             let prompt_bytes = prompt.as_bytes();
             let chunk1 = prompt_bytes.to_vec();
@@ -58,7 +58,7 @@ mod tests {
     #[tokio::test]
     async fn test_image_generation() {
         let generator = MockImageGenerator;
-        let mut stream = generator.generate_image("a cat");
+        let mut stream = generator.generate("a cat");
 
         let mut chunks = Vec::new();
         while let Some(chunk) = stream.next().await {
@@ -74,7 +74,7 @@ mod tests {
     #[tokio::test]
     async fn test_image_generation_empty_prompt() {
         let generator = MockImageGenerator;
-        let mut stream = generator.generate_image("");
+        let mut stream = generator.generate("");
 
         let mut chunks = Vec::new();
         while let Some(chunk) = stream.next().await {
@@ -91,7 +91,7 @@ mod tests {
     async fn test_image_generation_long_prompt() {
         let generator = MockImageGenerator;
         let long_prompt = "a very detailed and elaborate description of a beautiful landscape with mountains, rivers, and forests";
-        let mut stream = generator.generate_image(long_prompt);
+        let mut stream = generator.generate(long_prompt);
 
         let mut total_bytes = 0;
         while let Some(chunk) = stream.next().await {

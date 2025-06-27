@@ -35,7 +35,7 @@ use serde::{Serialize, de::DeserializeOwned};
 ///     const DESCRIPTION: &str = "Performs basic mathematical operations";
 ///     type Arguments = CalculatorArgs;
 ///     
-///     async fn call(&mut self, args: Self::Arguments) -> ai_types::llm::tool::Result {
+///     async fn call(&mut self, args: Self::Arguments) -> ai_types::Result {
 ///         match args.operation.as_str() {
 ///             "add" => Ok((args.a + args.b).to_string()),
 ///             "subtract" => Ok((args.a - args.b).to_string()),

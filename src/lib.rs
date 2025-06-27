@@ -4,6 +4,8 @@
 
 extern crate alloc;
 
+/// Audio generation and transcription traits and types.
+pub mod audio;
 /// Embedding model traits and types.
 pub mod embedding;
 /// Image generation traits and types.
@@ -12,6 +14,8 @@ pub mod image;
 pub mod llm;
 
 use alloc::string::String;
+#[doc(inline)]
+pub use audio::{AudioGenerator, AudioTranscriber};
 #[doc(inline)]
 pub use embedding::EmbeddingModel;
 #[doc(inline)]
