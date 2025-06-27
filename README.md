@@ -1,7 +1,7 @@
 # AI Types
 
 [![Crates.io](https://img.shields.io/crates/v/ai-types.svg)](https://crates.io/crates/ai-types)
-[![Documentation](https://docs.rs/ai_types/badge.svg)](https://docs.rs/ai_types)
+[![Documentation](https://docs.rs/ai-types/badge.svg)](https://docs.rs/ai-types)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Unified trait abstractions for AI models. Write provider-agnostic AI applications.
@@ -26,5 +26,5 @@ Unified trait abstractions for AI models. Write provider-agnostic AI application
 
 ```toml
 [dependencies]
-ai_types = "0.0.1"
+ai-types = "0.0.1"
 ```
