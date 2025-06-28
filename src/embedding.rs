@@ -42,7 +42,7 @@ mod tests {
             self.dimension
         }
 
-        async fn embed(&self, text: &str) -> Vec<f32> {
+        async fn embed(&self, text: &str) -> crate::Result<Vec<f32>> {
             // Create a simple mock embedding based on text length
             let mut embedding = vec![0.0; self.dimension];
             let text_len = text.len();
@@ -51,7 +51,7 @@ mod tests {
                 *value = (text_len + i) as f32 * 0.01;
             }
 
-            embedding
+            Ok(embedding)
         }
     }
 
@@ -64,7 +64,7 @@ mod tests {
     #[tokio::test]
     async fn test_embedding_generation() {
         let model = MockEmbeddingModel { dimension: 4 };
-        let embedding = model.embed("test").await;
+        let embedding = model.embed("test").await.unwrap();
 
         assert_eq!(embedding.len(), 4);
         assert!((embedding[0] - 0.04).abs() < f32::EPSILON); // text length 4 + index 0 = 4 * 0.01
@@ -77,8 +77,8 @@ mod tests {
     async fn test_embedding_different_texts() {
         let model = MockEmbeddingModel { dimension: 2 };
 
-        let embedding1 = model.embed("a").await;
-        let embedding2 = model.embed("ab").await;
+        let embedding1 = model.embed("a").await.unwrap();
+        let embedding2 = model.embed("ab").await.unwrap();
 
         assert_eq!(embedding1.len(), 2);
         assert_eq!(embedding2.len(), 2);
@@ -91,7 +91,7 @@ mod tests {
     #[tokio::test]
     async fn test_embedding_empty_text() {
         let model = MockEmbeddingModel { dimension: 3 };
-        let embedding = model.embed("").await;
+        let embedding = model.embed("").await.unwrap();
 
         assert_eq!(embedding.len(), 3);
         assert_eq!(embedding[0], 0.00); // length 0 + index 0 = 0 * 0.01
@@ -102,7 +102,7 @@ mod tests {
     #[tokio::test]
     async fn test_embedding_large_dimension() {
         let model = MockEmbeddingModel { dimension: 1536 }; // Common OpenAI dimension
-        let embedding = model.embed("test text").await;
+        let embedding = model.embed("test text").await.unwrap();
 
         assert_eq!(embedding.len(), 1536);
         assert!((embedding[0] - 0.09).abs() < f32::EPSILON); // text length 9 + index 0 = 9 * 0.01
