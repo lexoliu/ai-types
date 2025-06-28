@@ -183,7 +183,8 @@ impl UrlAnnotation {
     ///     10
     /// );
     /// ```
-    pub fn new(url: Url, title: String, content: String, start: usize, end: usize) -> Self {
+    #[must_use]
+    pub const fn new(url: Url, title: String, content: String, start: usize, end: usize) -> Self {
         Self {
             url,
             title,
@@ -216,6 +217,7 @@ impl Message {
     ///
     /// * `role` - The role of the message sender
     /// * `content` - The text content of the message
+    #[must_use]
     pub const fn new(role: Role, content: String) -> Self {
         Self {
             role,
@@ -266,6 +268,11 @@ impl Message {
     /// # Arguments
     ///
     /// * `url` - The URL to attach
+    ///
+    /// # Panics
+    ///
+    /// Panics if the URL conversion fails.
+    #[must_use]
     pub fn with_attachment<U: TryInto<Url, Error: Debug>>(mut self, url: U) -> Self {
         self.attachments.push(url.try_into().unwrap());
         self
@@ -276,6 +283,10 @@ impl Message {
     /// # Arguments
     ///
     /// * `urls` - An iterable of URLs to attach
+    ///
+    /// # Panics
+    ///
+    /// Panics if any URL conversion fails.
     ///
     /// # Example
     ///
@@ -289,6 +300,7 @@ impl Message {
     /// ];
     /// let message = Message::user("Check these links").with_attachments(urls);
     /// ```
+    #[must_use]
     pub fn with_attachments<U: TryInto<Url, Error: Debug>>(
         mut self,
         urls: impl IntoIterator<Item = U>,
@@ -321,6 +333,7 @@ impl Message {
     /// let message = Message::user("Visit https://example.com")
     ///     .with_annotation(Annotation::Url(url_annotation));
     /// ```
+    #[must_use]
     pub fn with_annotation(mut self, annotation: Annotation) -> Self {
         self.annotation.push(annotation);
         self
@@ -331,6 +344,7 @@ impl Message {
     /// # Arguments
     ///
     /// * `annotations` - An iterable of annotations to add
+    #[must_use]
     pub fn with_annotations(mut self, annotations: impl IntoIterator<Item = Annotation>) -> Self {
         self.annotation.extend(annotations);
         self
@@ -360,7 +374,8 @@ impl Annotation {
     ///
     /// let annotation = Annotation::url(url_annotation);
     /// ```
-    pub fn url(url_annotation: UrlAnnotation) -> Self {
+    #[must_use]
+    pub const fn url(url_annotation: UrlAnnotation) -> Self {
         Self::Url(url_annotation)
     }
 }
@@ -501,7 +516,7 @@ mod tests {
         );
 
         let message = Message::user("Visit https://example.com")
-            .with_annotation(Annotation::url(url_annotation.clone()));
+            .with_annotation(Annotation::url(url_annotation));
 
         assert_eq!(message.annotation.len(), 1);
         match &message.annotation[0] {
@@ -563,8 +578,7 @@ mod tests {
     #[test]
     fn test_annotation_url_constructor() {
         let url = "https://example.com".parse::<Url>().unwrap();
-        let url_annotation =
-            UrlAnnotation::new(url.clone(), "Test".into(), "Test content".into(), 0, 5);
+        let url_annotation = UrlAnnotation::new(url, "Test".into(), "Test content".into(), 0, 5);
 
         let annotation = Annotation::url(url_annotation.clone());
 

@@ -67,6 +67,10 @@ pub trait Tool: Send + 'static {
 ///
 /// Convenience function for tools that need to return JSON responses.
 /// Uses [`serde_json::to_string_pretty`] internally.
+///
+/// # Panics
+///
+/// Panics if the value cannot be serialized to JSON.
 pub fn json<T: Serialize>(value: &T) -> String {
     serde_json::to_string_pretty(value).expect("Failed to serialize to JSON")
 }
@@ -133,6 +137,7 @@ pub struct ToolDefinition {
 
 impl ToolDefinition {
     /// Creates a tool definition for a given tool type.
+    #[must_use]
     pub fn new<T: Tool>() -> Self {
         Self {
             name: T::NAME,
@@ -150,6 +155,7 @@ impl Default for Tools {
 
 impl Tools {
     /// Creates a new empty tools registry.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             tools: BTreeMap::new(),
@@ -157,6 +163,7 @@ impl Tools {
     }
 
     /// Returns definitions of all registered tools.
+    #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools.values().map(|tool| tool.definition()).collect()
     }
@@ -216,10 +223,10 @@ mod tests {
                 "subtract" => Ok((args.a - args.b).to_string()),
                 "multiply" => Ok((args.a * args.b).to_string()),
                 "divide" => {
-                    if args.b != 0.0 {
-                        Ok((args.a / args.b).to_string())
-                    } else {
+                    if args.b == 0.0 {
                         Err(anyhow::Error::msg("Division by zero"))
+                    } else {
+                        Ok((args.a / args.b).to_string())
                     }
                 }
                 _ => Err(anyhow::Error::msg(format!(
@@ -418,7 +425,7 @@ mod tests {
     async fn test_tool_not_found() {
         let mut tools = Tools::new();
 
-        let result = tools.call("nonexistent", r#"{}"#.to_string()).await;
+        let result = tools.call("nonexistent", "{}".to_string()).await;
         assert!(result.is_err());
         assert!(
             result

@@ -84,7 +84,7 @@ impl Request {
     /// let request = Request::new(messages);
     /// ```
     pub fn new(messages: impl Into<Vec<Message>>) -> Self {
-        Request {
+        Self {
             messages: messages.into(),
             tools: Tools::default(),
             parameters: Parameters::default(),
@@ -112,7 +112,7 @@ impl Request {
     /// );
     /// ```
     pub fn oneshot(system: impl Into<String>, user: impl Into<String>) -> Self {
-        Request::new(oneshot(system, user))
+        Self::new(oneshot(system, user))
     }
 
     /// Sets the generation parameters for this request.
@@ -129,6 +129,7 @@ impl Request {
     /// let request = Request::new(vec![Message::user("Hello")])
     ///     .parameters(Parameters::default().temperature(0.7));
     /// ```
+    #[must_use]
     pub fn parameters(mut self, parameters: Parameters) -> Self {
         self.parameters = parameters;
         self
@@ -168,6 +169,7 @@ impl Request {
     /// let request = Request::new(vec![Message::user("Hello")])
     ///     .tool(tool);
     /// ```
+    #[must_use]
     pub fn tool(mut self, tool: impl Tool) -> Self {
         self.tools.register(tool);
         self

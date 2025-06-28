@@ -13,8 +13,8 @@ use core::future::Future;
 /// impl EmbeddingModel for MyEmbedding {
 ///     fn dim(&self) -> usize { 768 }
 ///     
-///     async fn embed(&self, text: &str) -> Vec<f32> {
-///         vec![0.0; self.dim()] // Implementation calls embedding service
+///     async fn embed(&self, text: &str) -> ai_types::Result<Vec<f32>> {
+///         Ok(vec![0.0; self.dim()]) // Implementation calls embedding service
 ///     }
 /// }
 /// ```
@@ -42,6 +42,7 @@ mod tests {
             self.dimension
         }
 
+        #[allow(clippy::cast_precision_loss)]
         async fn embed(&self, text: &str) -> crate::Result<Vec<f32>> {
             // Create a simple mock embedding based on text length
             let mut embedding = vec![0.0; self.dimension];
@@ -74,6 +75,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::float_cmp)]
     async fn test_embedding_different_texts() {
         let model = MockEmbeddingModel { dimension: 2 };
 
@@ -89,6 +91,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::float_cmp)]
     async fn test_embedding_empty_text() {
         let model = MockEmbeddingModel { dimension: 3 };
         let embedding = model.embed("").await.unwrap();

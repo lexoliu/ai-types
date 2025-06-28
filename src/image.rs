@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 use futures_core::Stream;
 
 /// Image data as bytes.
@@ -6,31 +6,133 @@ use futures_core::Stream;
 /// Type alias for [`Vec<u8>`] representing image data.
 pub type Data = Vec<u8>;
 
-/// Generates images from text prompts.
-///
-/// # Example
-///
-/// ```rust
-/// use ai_types::ImageGenerator;
-/// use futures_core::Stream;
-///
-/// struct MyImageGen;
-///
-/// impl ImageGenerator for MyImageGen {
-///     fn generate(&self, prompt: &str) -> impl Stream<Item = ai_types::image::Data> + Send {
-///         futures_lite::stream::iter(vec![vec![0u8; 1024]]) // Mock data
-///     }
-/// }
-/// ```
+/// Trait for generating and editing images from prompts and masks.
 pub trait ImageGenerator {
-    /// Generates image from text prompt.
+    /// The error type returned by the image generator.
+    type Error: core::error::Error + Send + Sync;
+
+    /// Create an image from a prompt and a specified size.
     ///
-    /// Returns a [`Stream`] of [`Data`] chunks for progressive loading.
-    fn generate(&self, prompt: &str) -> impl Stream<Item = Data> + Send;
+    /// # Arguments
+    ///
+    /// * `prompt` - The prompt containing text and optional images.
+    /// * `size` - The desired size of the generated image.
+    ///
+    /// # Returns
+    ///
+    /// A stream of image data chunks or errors.
+    fn create(
+        &self,
+        prompt: Prompt,
+        size: Size,
+    ) -> impl Stream<Item = Result<Data, Self::Error>> + Send;
+
+    /// Edit an image using a prompt and a mask.
+    ///
+    /// # Arguments
+    ///
+    /// * `prompt` - The prompt containing text and optional images.
+    /// * `mask` - The mask to apply to the image data.
+    ///
+    /// # Returns
+    ///
+    /// A stream of edited image data chunks or errors.
+    fn edit(
+        &self,
+        prompt: Prompt,
+        mask: &[u8],
+    ) -> impl Stream<Item = Result<Data, Self::Error>> + Send;
+}
+
+/// Represents a prompt for image generation, including text and optional images.
+pub struct Prompt {
+    /// The text description for the image generation.
+    pub text: String,
+    /// Optional images to guide the generation process.
+    pub image: Vec<Data>,
+}
+
+impl Prompt {
+    /// Creates a new `Prompt` with the given text
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            image: Vec::new(),
+        }
+    }
+
+    /// Adds an image to the prompt and returns the updated `Prompt`.
+    ///
+    /// # Arguments
+    ///
+    /// * `image` - The image data to add to the prompt.
+    #[must_use]
+    pub fn with_image(mut self, image: Data) -> Self {
+        self.image.push(image);
+        self
+    }
+}
+
+impl From<String> for Prompt {
+    /// Converts a `String` into a `Prompt`.
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - The text to use for the prompt.
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<&str> for Prompt {
+    /// Converts a `&str` into a `Prompt`.
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - The text to use for the prompt.
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
+/// Represents the size (width and height) of an image.
+pub struct Size {
+    /// The width of the image in pixels.
+    pub width: u32,
+    /// The height of the image in pixels.
+    pub height: u32,
+}
+
+impl Size {
+    /// Creates a new `Size` with the given width and height.
+    ///
+    /// # Arguments
+    ///
+    /// * `width` - The width of the image in pixels.
+    /// * `height` - The height of the image in pixels.
+    #[must_use]
+    pub const fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
+    /// Creates a new `Size` with equal width and height (a square).
+    ///
+    /// # Arguments
+    ///
+    /// * `size` - The width and height of the square image in pixels.
+    #[must_use]
+    pub const fn square(size: u32) -> Self {
+        Self {
+            width: size,
+            height: size,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use core::convert::Infallible;
+
     use super::*;
     use alloc::vec;
     use futures_lite::StreamExt;
@@ -38,25 +140,44 @@ mod tests {
     struct MockImageGenerator;
 
     impl ImageGenerator for MockImageGenerator {
-        fn generate(&self, prompt: &str) -> impl Stream<Item = Data> + Send {
+        type Error = Infallible;
+        fn create(
+            &self,
+            prompt: Prompt,
+            _size: Size,
+        ) -> impl Stream<Item = Result<Data, Self::Error>> + Send {
             // Create mock image data based on prompt
-            let prompt_bytes = prompt.as_bytes();
+            let prompt_bytes = prompt.text.as_bytes();
             let chunk1 = prompt_bytes.to_vec();
             let chunk2 = vec![0xFF, 0xD8, 0xFF, 0xE0]; // Mock JPEG header
             let chunk3 = vec![0x00; 100]; // Mock image data
 
-            futures_lite::stream::iter(vec![chunk1, chunk2, chunk3])
+            futures_lite::stream::iter(vec![chunk1, chunk2, chunk3].into_iter().map(Ok))
+        }
+
+        fn edit(
+            &self,
+            prompt: Prompt,
+            _mask: &[u8],
+        ) -> impl Stream<Item = Result<Data, Self::Error>> + Send {
+            // Create mock image data based on prompt
+            let prompt_bytes = prompt.text.as_bytes();
+            let chunk1 = prompt_bytes.to_vec();
+            let chunk2 = vec![0xFF, 0xD8, 0xFF, 0xE0]; // Mock JPEG header
+            let chunk3 = vec![0x00; 100]; // Mock image data
+
+            futures_lite::stream::iter(vec![chunk1, chunk2, chunk3].into_iter().map(Ok))
         }
     }
 
     #[tokio::test]
     async fn test_image_generation() {
         let generator = MockImageGenerator;
-        let mut stream = generator.generate("a cat");
+        let mut stream = generator.create(Prompt::new("a cat"), Size::square(256));
 
         let mut chunks = Vec::new();
         while let Some(chunk) = stream.next().await {
-            chunks.push(chunk);
+            chunks.push(chunk.unwrap());
         }
 
         assert_eq!(chunks.len(), 3);
@@ -68,11 +189,11 @@ mod tests {
     #[tokio::test]
     async fn test_image_generation_empty_prompt() {
         let generator = MockImageGenerator;
-        let mut stream = generator.generate("");
+        let mut stream = generator.create(Prompt::new(""), Size::square(256));
 
         let mut chunks = Vec::new();
         while let Some(chunk) = stream.next().await {
-            chunks.push(chunk);
+            chunks.push(chunk.unwrap());
         }
 
         assert_eq!(chunks.len(), 3);
@@ -85,11 +206,11 @@ mod tests {
     async fn test_image_generation_long_prompt() {
         let generator = MockImageGenerator;
         let long_prompt = "a very detailed and elaborate description of a beautiful landscape with mountains, rivers, and forests";
-        let mut stream = generator.generate(long_prompt);
+        let mut stream = generator.create(Prompt::new(long_prompt), Size::square(512));
 
         let mut total_bytes = 0;
         while let Some(chunk) = stream.next().await {
-            total_bytes += chunk.len();
+            total_bytes += chunk.unwrap().len();
         }
 
         // Should have prompt bytes + header bytes + 100 mock data bytes

@@ -90,7 +90,7 @@ pub struct Parameters {
     pub repetition_penalty: Option<f32>,
     /// Minimum probability for nucleus sampling.
     ///
-    /// Alternative to top_p that sets a minimum threshold for token probabilities.
+    /// Alternative to `top_p` that sets a minimum threshold for token probabilities.
     pub min_p: Option<f32>,
     /// Top-a sampling parameter.
     ///
@@ -143,7 +143,8 @@ macro_rules! impl_with_methods {
                 /// # Arguments
                 ///
                 /// * `value` - The value to set for this parameter
-                pub fn $field(mut self, value: $field_ty) -> Self {
+                #[allow(clippy::missing_const_for_fn)]
+                #[must_use] pub fn $field(mut self, value: $field_ty) -> Self {
                     self.$field = Some(value);
                     self
                 }
@@ -271,16 +272,17 @@ pub struct Pricing {
 /// };
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SupportedParameters {
     /// Whether tools are supported.
     pub tools: bool,
     /// Whether tool choice is supported.
     pub tool_choice: bool,
-    /// Whether max_tokens is supported.
+    /// Whether `max_tokens` is supported.
     pub max_tokens: bool,
     /// Whether temperature is supported.
     pub temperature: bool,
-    /// Whether top_p is supported.
+    /// Whether `top_p` is supported.
     pub top_p: bool,
     /// Whether reasoning is supported.
     pub reasoning: bool,
@@ -344,6 +346,7 @@ impl Profile {
     /// let profile = Profile::new("vision-model", "A vision-capable model", 8192)
     ///     .with_ability(Ability::Vision);
     /// ```
+    #[must_use]
     pub fn with_ability(self, ability: Ability) -> Self {
         self.with_abilities([ability])
     }
@@ -363,6 +366,7 @@ impl Profile {
     /// let profile = Profile::new("multimodal", "A multimodal model", 32768)
     ///     .with_abilities(abilities);
     /// ```
+    #[must_use]
     pub fn with_abilities(mut self, abilities: impl IntoIterator<Item = Ability>) -> Self {
         self.abilities.extend(abilities);
         self
@@ -394,7 +398,8 @@ impl Profile {
     /// let profile = Profile::new("paid-model", "A paid model", 4096)
     ///     .with_pricing(pricing);
     /// ```
-    pub fn with_pricing(mut self, pricing: Pricing) -> Self {
+    #[must_use]
+    pub const fn with_pricing(mut self, pricing: Pricing) -> Self {
         self.pricing = Some(pricing);
         self
     }
@@ -463,6 +468,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_profile_with_pricing() {
         let pricing = Pricing {
             prompt: 0.0001,
@@ -475,8 +481,7 @@ mod tests {
             input_cache_write: 0.0001,
         };
 
-        let profile =
-            Profile::new("paid-model", "A paid model", 2048).with_pricing(pricing.clone());
+        let profile = Profile::new("paid-model", "A paid model", 2048).with_pricing(pricing);
 
         assert!(profile.pricing.is_some());
         let profile_pricing = profile.pricing.unwrap();
@@ -578,6 +583,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_pricing_clone() {
         let original = Pricing {
             prompt: 0.001,

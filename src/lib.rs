@@ -1,6 +1,5 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
-#![warn(missing_docs)]
 
 extern crate alloc;
 /// Audio generation and transcription.
@@ -19,6 +18,11 @@ pub mod image;
 ///
 /// Contains [`LanguageModel`] trait, [`llm::Message`] types, and [`llm::Tool`] system.
 pub mod llm;
+
+/// Content moderation utilities.
+///
+/// Contains traits and types for detecting and handling unsafe or inappropriate content.
+pub mod moderation;
 
 use alloc::string::String;
 
