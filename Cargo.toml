@@ -10,6 +10,20 @@ license = "MIT"
 keywords = ["ai", "llm", "embedding", "image-generation", "no-std"]
 categories = ["api-bindings", "no-std"]
 readme = "README.md"
+exclude = [
+    ".github/",
+    ".gitignore",
+    "target/",
+]
+
+rust-version = "1.85"
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 anyhow = { version = "1.0", default-features = false }
@@ -31,7 +45,7 @@ clippy.style = "warn"
 clippy.correctness = "warn"
 clippy.complexity = "warn"
 clippy.suspicious = "warn"
-clippy.performance = "warn"
+clippy.perf = "warn"
 clippy.pedantic = "warn"
 clippy.nursery = "warn"
 clippy.cargo = "warn"

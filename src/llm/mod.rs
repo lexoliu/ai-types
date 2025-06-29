@@ -73,7 +73,7 @@ impl Request {
     ///
     /// # Arguments
     ///
-    /// * `messages` - The conversation messages (can be Vec<Message>, array, etc.)
+    /// * `messages` - The conversation messages (can be `Vec<Message>`, array, etc.)
     ///
     /// # Examples
     ///
