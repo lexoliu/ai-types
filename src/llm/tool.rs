@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn test_json_utility() {
+    fn json_utility() {
         let value = serde_json::json!({
             "name": "test",
             "value": 42
@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_definition_creation() {
+    fn tool_definition_creation() {
         let definition = ToolDefinition::new::<Calculator>();
 
         assert_eq!(definition.name, "calculator");
@@ -280,19 +280,19 @@ mod tests {
     }
 
     #[test]
-    fn test_tools_creation() {
+    fn tools_creation() {
         let tools = Tools::new();
         assert_eq!(tools.definitions().len(), 0);
     }
 
     #[test]
-    fn test_tools_default() {
+    fn tools_default() {
         let tools = Tools::default();
         assert_eq!(tools.definitions().len(), 0);
     }
 
     #[tokio::test]
-    async fn test_tools_register_and_call() {
+    async fn tools_register_and_call() {
         let mut tools = Tools::new();
         tools.register(Calculator);
 
@@ -311,7 +311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_calculator_operations() {
+    async fn calculator_operations() {
         let mut tools = Tools::new();
         tools.register(Calculator);
 
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_calculator_division_by_zero() {
+    async fn calculator_division_by_zero() {
         let mut tools = Tools::new();
         tools.register(Calculator);
 
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_calculator_unknown_operation() {
+    async fn calculator_unknown_operation() {
         let mut tools = Tools::new();
         tools.register(Calculator);
 
@@ -388,7 +388,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multiple_tools() {
+    async fn multiple_tools() {
         let mut tools = Tools::new();
         tools.register(Calculator);
         tools.register(Greeter);
@@ -422,7 +422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tool_not_found() {
+    async fn tool_not_found() {
         let mut tools = Tools::new();
 
         let result = tools.call("nonexistent", "{}".to_string()).await;
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_json() {
+    async fn invalid_json() {
         let mut tools = Tools::new();
         tools.register(Calculator);
 
@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tools_unregister() {
+    fn tools_unregister() {
         let mut tools = Tools::new();
         tools.register(Calculator);
         tools.register(Greeter);
@@ -463,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tools_debug() {
+    fn tools_debug() {
         let mut tools = Tools::new();
         tools.register(Calculator);
         tools.register(Greeter);
@@ -475,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_definition_debug() {
+    fn tool_definition_debug() {
         let definition = ToolDefinition::new::<Calculator>();
         let debug_str = format!("{definition:?}");
 
@@ -485,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_definition_clone() {
+    fn tool_definition_clone() {
         let original = ToolDefinition::new::<Calculator>();
         let cloned = original.clone();
 

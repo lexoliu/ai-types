@@ -29,7 +29,7 @@
 //! let message = Message::user("Check out this image")
 //!     .with_attachment("https://example.com/image.jpg".parse::<Url>().unwrap());
 //!
-//! let urls = vec![
+//! let urls = [
 //!     "https://example.com/doc1.pdf".parse::<Url>().unwrap(),
 //!     "https://example.com/doc2.pdf".parse::<Url>().unwrap(),
 //! ];
@@ -43,16 +43,16 @@
 //! use ai_types::llm::{Message, Annotation, UrlAnnotation};
 //! use url::Url;
 //!
-//! let url_annotation = UrlAnnotation::new(
-//!     "https://example.com".parse().unwrap(),
-//!     "Example Site".into(),
-//!     "A useful example website".into(),
+//! let annotation =Annotation::url(
+//!     "https://example.com",
+//!     "Example Site",
+//!     "A useful example website",
 //!     6,  // start index of URL in content
 //!     25, // end index of URL in content
 //! );
 //!
 //! let message = Message::user("Visit https://example.com for examples")
-//!     .with_annotation(Annotation::url(url_annotation));
+//!     .with_annotation(annotation);
 //! ```
 
 use core::fmt::Debug;
@@ -90,14 +90,6 @@ pub enum Role {
 ///
 /// Contains a [`Role`], text content, and optional attachments and annotations.
 /// Messages form the building blocks of conversations with AI language models.
-///
-/// # Fields
-///
-/// * `role` - The role of the message sender (User, Assistant, System, or Tool)
-/// * `content` - The text content of the message
-/// * `attachments` - Optional URLs to external resources (images, documents, etc.)
-/// * `annotation` - Optional metadata annotations for URLs mentioned in the content
-///
 /// # Example
 ///
 /// ```rust
@@ -111,24 +103,44 @@ pub enum Role {
 ///
 /// // Add attachments to a message
 /// let msg_with_attachment = Message::user("Check out this image")
-///     .with_attachment("https://example.com/image.jpg".parse::<Url>().unwrap());
+///     .with_attachment("https://example.com/image.jpg");
 /// ```
 #[derive(Debug, Clone)]
 pub struct Message {
-    /// Message sender role.
-    pub role: Role,
-    /// Message text content.
-    pub content: String,
-    /// Attachment URLs.
-    ///
+    attachments: Vec<Url>,
+    annotation: Vec<Annotation>,
+    content: String,
+    role: Role,
+}
+
+impl Message {
+    /// Returns the message sender role.
+    #[must_use]
+    pub const fn role(&self) -> Role {
+        self.role
+    }
+    /// Returns the text content of the message.
+    #[must_use]
+    pub const fn content(&self) -> &str {
+        self.content.as_str()
+    }
+
+    /// Returns the attachment URLs associated with the message.
     /// URLs to external resources like images, documents, or other media
     /// that are referenced by this message.
-    pub attachments: Vec<Url>,
-    /// Message annotations. See [`Annotation`] for details.
+    #[must_use]
+    pub const fn attachments(&self) -> &[Url] {
+        self.attachments.as_slice()
+    }
+
+    /// Returns Message annotations. See [`Annotation`] for details.
     ///
     /// Metadata annotations for URLs mentioned in the message content,
     /// providing additional context like titles and descriptions.
-    pub annotation: Vec<Annotation>,
+    #[must_use]
+    pub const fn annotations(&self) -> &[Annotation] {
+        self.annotation.as_slice()
+    }
 }
 
 /// URL annotation metadata.
@@ -176,19 +188,28 @@ impl UrlAnnotation {
     /// use url::Url;
     ///
     /// let annotation = UrlAnnotation::new(
-    ///     "https://example.com".parse().unwrap(),
-    ///     "Example Site".into(),
-    ///     "An example website".into(),
+    ///     "https://example.com",
+    ///     "Example Site",
+    ///     "An example website",
     ///     0,
     ///     10
     /// );
     /// ```
+    ///
+    /// # Panics
+    /// Panics if the URL is invalid.
     #[must_use]
-    pub const fn new(url: Url, title: String, content: String, start: usize, end: usize) -> Self {
+    pub fn new(
+        url: impl TryInto<Url, Error: Debug>,
+        title: impl Into<String>,
+        content: impl Into<String>,
+        start: usize,
+        end: usize,
+    ) -> Self {
         Self {
-            url,
-            title,
-            content,
+            url: url.try_into().unwrap(),
+            title: title.into(),
+            content: content.into(),
             start,
             end,
         }
@@ -294,9 +315,9 @@ impl Message {
     /// use ai_types::llm::Message;
     /// use url::Url;
     ///
-    /// let urls = vec![
-    ///     "https://example.com".parse::<Url>().unwrap(),
-    ///     "https://example.org".parse::<Url>().unwrap(),
+    /// let urls = [
+    ///     "https://example.com",
+    ///     "https://example.org",
     /// ];
     /// let message = Message::user("Check these links").with_attachments(urls);
     /// ```
@@ -322,13 +343,14 @@ impl Message {
     /// use ai_types::llm::{Message, Annotation, UrlAnnotation};
     /// use url::Url;
     ///
-    /// let url_annotation = UrlAnnotation {
-    ///     url: "https://example.com".parse().unwrap(),
-    ///     title: "Example Site".into(),
-    ///     content: "An example website".into(),
-    ///     start: 0,
-    ///     end: 10,
-    /// };
+    /// let url_annotation = UrlAnnotation::new(
+    ///     "https://example.com",
+    ///     "Example Site",
+    ///     "An example website",
+    ///     0,
+    ///     10,
+    /// );
+    ///
     ///
     /// let message = Message::user("Visit https://example.com")
     ///     .with_annotation(Annotation::Url(url_annotation));
@@ -361,32 +383,36 @@ impl Annotation {
     /// # Example
     ///
     /// ```rust
-    /// use ai_types::llm::{Annotation, UrlAnnotation};
+    /// use ai_types::llm::{Annotation};
     /// use url::Url;
     ///
-    /// let url_annotation = UrlAnnotation::new(
-    ///     "https://example.com".parse().unwrap(),
-    ///     "Example".into(),
-    ///     "Example content".into(),
+    /// let url_annotation = Annotation::url(
+    ///     "https://example.com",
+    ///     "Example",
+    ///     "Example content",
     ///     0,
     ///     10
     /// );
     ///
-    /// let annotation = Annotation::url(url_annotation);
     /// ```
     #[must_use]
-    pub const fn url(url_annotation: UrlAnnotation) -> Self {
-        Self::Url(url_annotation)
+    pub fn url(
+        url: impl TryInto<Url, Error: Debug>,
+        title: impl Into<String>,
+        content: impl Into<String>,
+        start: usize,
+        end: usize,
+    ) -> Self {
+        Self::Url(UrlAnnotation::new(url, title, content, start, end))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
 
     #[test]
-    fn test_role_equality() {
+    fn role_equality() {
         assert_eq!(Role::User, Role::User);
         assert_eq!(Role::Assistant, Role::Assistant);
         assert_eq!(Role::System, Role::System);
@@ -397,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_creation() {
+    fn message_creation() {
         let message = Message::new(Role::User, "Hello".into());
         assert_eq!(message.role, Role::User);
         assert_eq!(message.content, "Hello");
@@ -406,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_convenience_constructors() {
+    fn message_convenience_constructors() {
         let user_msg = Message::user("User message");
         assert_eq!(user_msg.role, Role::User);
         assert_eq!(user_msg.content, "User message");
@@ -425,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_with_attachment() {
+    fn message_with_attachment() {
         let url = "https://example.com".parse::<Url>().unwrap();
         let message = Message::user("Hello").with_attachment(url.clone());
 
@@ -434,8 +460,8 @@ mod tests {
     }
 
     #[test]
-    fn test_message_with_multiple_attachments() {
-        let urls = vec![
+    fn message_with_multiple_attachments() {
+        let urls = [
             "https://example.com".parse::<Url>().unwrap(),
             "https://example.org".parse::<Url>().unwrap(),
         ];
@@ -447,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn test_url_annotation() {
+    fn url_annotation() {
         let url = "https://example.com".parse::<Url>().unwrap();
         let annotation = UrlAnnotation {
             url: url.clone(),
@@ -465,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn test_annotation_enum() {
+    fn annotation_enum() {
         let url = "https://example.com".parse::<Url>().unwrap();
         let url_annotation = UrlAnnotation {
             url,
@@ -486,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_debug() {
+    fn message_debug() {
         let message = Message::user("Test message");
         let debug_str = alloc::format!("{message:?}");
         assert!(debug_str.contains("User"));
@@ -494,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_clone() {
+    fn message_clone() {
         let original = Message::user("Original message");
         let cloned = original.clone();
 
@@ -505,18 +531,11 @@ mod tests {
     }
 
     #[test]
-    fn test_message_with_annotation() {
+    fn message_with_annotation() {
         let url = "https://example.com".parse::<Url>().unwrap();
-        let url_annotation = UrlAnnotation::new(
-            url.clone(),
-            "Example".into(),
-            "Example content".into(),
-            0,
-            10,
-        );
+        let url_annotation = Annotation::url(url.clone(), "Example", "Example content", 0, 10);
 
-        let message = Message::user("Visit https://example.com")
-            .with_annotation(Annotation::url(url_annotation));
+        let message = Message::user("Visit https://example.com").with_annotation(url_annotation);
 
         assert_eq!(message.annotation.len(), 1);
         match &message.annotation[0] {
@@ -531,25 +550,13 @@ mod tests {
     }
 
     #[test]
-    fn test_message_with_multiple_annotations() {
-        let url1 = "https://example.com".parse::<Url>().unwrap();
-        let url2 = "https://example.org".parse::<Url>().unwrap();
+    fn message_with_multiple_annotations() {
+        let url1 = "https://example.com";
+        let url2 = "https://example.org";
 
-        let annotations = vec![
-            Annotation::url(UrlAnnotation::new(
-                url1,
-                "Example 1".into(),
-                "First example".into(),
-                0,
-                10,
-            )),
-            Annotation::url(UrlAnnotation::new(
-                url2,
-                "Example 2".into(),
-                "Second example".into(),
-                20,
-                30,
-            )),
+        let annotations = [
+            Annotation::url(url1, "Example 1", "First example", 0, 10),
+            Annotation::url(url2, "Example 2", "Second example", 20, 30),
         ];
 
         let message = Message::user("Visit these sites").with_annotations(annotations);
@@ -558,35 +565,14 @@ mod tests {
     }
 
     #[test]
-    fn test_url_annotation_constructor() {
+    fn url_annotation_constructor() {
         let url = "https://example.com".parse::<Url>().unwrap();
-        let annotation = UrlAnnotation::new(
-            url.clone(),
-            "Test Title".into(),
-            "Test Content".into(),
-            5,
-            15,
-        );
+        let annotation = UrlAnnotation::new(url.clone(), "Test Title", "Test Content", 5, 15);
 
         assert_eq!(annotation.url, url);
         assert_eq!(annotation.title, "Test Title");
         assert_eq!(annotation.content, "Test Content");
         assert_eq!(annotation.start, 5);
         assert_eq!(annotation.end, 15);
-    }
-
-    #[test]
-    fn test_annotation_url_constructor() {
-        let url = "https://example.com".parse::<Url>().unwrap();
-        let url_annotation = UrlAnnotation::new(url, "Test".into(), "Test content".into(), 0, 5);
-
-        let annotation = Annotation::url(url_annotation.clone());
-
-        match annotation {
-            Annotation::Url(inner) => {
-                assert_eq!(inner.url, url_annotation.url);
-                assert_eq!(inner.title, url_annotation.title);
-            }
-        }
     }
 }

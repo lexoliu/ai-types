@@ -20,15 +20,36 @@ pub trait LanguageModelProvider {
 }
 
 /// Provider profile information.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Profile {
-    /// The name of the provider.
-    pub name: String,
-    /// A description of the provider.
-    pub description: String,
+    name: String,
+    description: String,
+}
+
+impl Profile {
+    /// Creates a new profile with the given name and description.
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+
+    /// Returns the provider's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the provider's description.
+    pub fn description(&self) -> &str {
+        &self.description
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use core::convert::Infallible;
+
     use super::*;
     use crate::llm::Message;
     use alloc::{string::ToString, vec};
@@ -40,18 +61,19 @@ mod tests {
     }
 
     impl LanguageModel for MockModel {
+        type Error = Infallible;
         fn respond(
             &self,
             _request: crate::llm::Request,
-        ) -> impl Stream<Item = crate::Result<String>> + Send + Unpin {
-            futures_lite::stream::iter(vec![Ok("Mock response".to_string())])
+        ) -> impl Stream<Item = Result<String, Self::Error>> + Send + Unpin {
+            futures_lite::stream::iter(Some(Ok("Mock response".to_string())))
         }
 
         fn complete(
             &self,
             _prefix: &str,
-        ) -> impl Stream<Item = crate::Result<String>> + Send + Unpin {
-            futures_lite::stream::iter(vec![Ok("Mock completion".to_string())])
+        ) -> impl Stream<Item = Result<String, Self::Error>> + Send + Unpin {
+            futures_lite::stream::iter(Some(Ok("Mock completion".to_string())))
         }
 
         fn profile(&self) -> crate::llm::model::Profile {
@@ -87,7 +109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_provider_list_models() {
+    async fn provider_list_models() {
         let provider = MockProvider;
         let models = provider.list_models().await;
 
@@ -98,7 +120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_provider_get_model() {
+    async fn provider_get_model() {
         let provider = MockProvider;
         let model = provider.get_model("test-model").await;
 
@@ -111,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn test_provider_profile() {
+    fn provider_profile() {
         let profile = MockProvider::profile();
 
         assert_eq!(profile.name, "MockProvider");
@@ -119,7 +141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_model_respond() {
+    async fn model_respond() {
         let provider = MockProvider;
         let model = provider.get_model("test-model").await;
 
@@ -132,7 +154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_model_complete() {
+    async fn model_complete() {
         let provider = MockProvider;
         let model = provider.get_model("test-model").await;
 
@@ -142,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_creation() {
+    fn profile_creation() {
         let profile = Profile {
             name: "TestProvider".to_string(),
             description: "A test provider".to_string(),

@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use futures_core::Stream;
 
 /// Image data as bytes.
@@ -7,9 +7,12 @@ use futures_core::Stream;
 pub type Data = Vec<u8>;
 
 /// Trait for generating and editing images from prompts and masks.
+///
+/// Images are returned as a stream where each item represents a complete image
+/// with progressively improving quality, allowing for real-time preview during generation.
 pub trait ImageGenerator {
     /// The error type returned by the image generator.
-    type Error: core::error::Error + Send + Sync;
+    type Error: core::error::Error + Send + Sync + 'static;
 
     /// Create an image from a prompt and a specified size.
     ///
@@ -20,12 +23,12 @@ pub trait ImageGenerator {
     ///
     /// # Returns
     ///
-    /// A stream of image data chunks or errors.
+    /// A stream where each item is a complete image with progressively improving quality.
     fn create(
         &self,
         prompt: Prompt,
         size: Size,
-    ) -> impl Stream<Item = Result<Data, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<Data, Self::Error>> + Unpin + Send;
 
     /// Edit an image using a prompt and a mask.
     ///
@@ -36,29 +39,71 @@ pub trait ImageGenerator {
     ///
     /// # Returns
     ///
-    /// A stream of edited image data chunks or errors.
+    /// A stream where each item is a complete image with progressively improving quality.
     fn edit(
         &self,
         prompt: Prompt,
         mask: &[u8],
-    ) -> impl Stream<Item = Result<Data, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<Data, Self::Error>> + Unpin + Send;
 }
 
+macro_rules! impl_image_generator {
+    ($($name:ident),*) => {
+        $(
+            impl<T: ImageGenerator> ImageGenerator for $name<T> {
+                type Error = T::Error;
+
+                fn create(
+                    &self,
+                    prompt: Prompt,
+                    size: Size,
+                ) -> impl Stream<Item = Result<Data, Self::Error>> + Unpin + Send {
+                    T::create(self, prompt, size)
+                }
+
+                fn edit(
+                    &self,
+                    prompt: Prompt,
+                    mask: &[u8],
+                ) -> impl Stream<Item = Result<Data, Self::Error>> + Unpin + Send {
+                    T::edit(self, prompt, mask)
+                }
+            }
+        )*
+    };
+}
+
+impl_image_generator!(Arc, Box);
+
 /// Represents a prompt for image generation, including text and optional images.
+#[derive(Debug)]
 pub struct Prompt {
     /// The text description for the image generation.
-    pub text: String,
+    text: String,
     /// Optional images to guide the generation process.
-    pub image: Vec<Data>,
+    image: Vec<Data>,
 }
 
 impl Prompt {
     /// Creates a new `Prompt` with the given text
+    #[must_use]
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             image: Vec::new(),
         }
+    }
+
+    /// Returns the text description of the prompt.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Returns the images associated with the prompt.
+    #[must_use]
+    pub fn images(&self) -> &[Data] {
+        &self.image
     }
 
     /// Adds an image to the prompt and returns the updated `Prompt`.
@@ -96,11 +141,12 @@ impl From<&str> for Prompt {
 }
 
 /// Represents the size (width and height) of an image.
+#[derive(Debug)]
 pub struct Size {
     /// The width of the image in pixels.
-    pub width: u32,
+    width: u32,
     /// The height of the image in pixels.
-    pub height: u32,
+    height: u32,
 }
 
 impl Size {
@@ -126,6 +172,30 @@ impl Size {
             width: size,
             height: size,
         }
+    }
+
+    /// Returns the width of the image in pixels.
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Returns the height of the image in pixels.
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Returns the total number of pixels (width × height).
+    #[must_use]
+    pub const fn pixel_count(&self) -> u64 {
+        self.width as u64 * self.height as u64
+    }
+
+    /// Returns whether this is a square image (width equals height).
+    #[must_use]
+    pub const fn is_square(&self) -> bool {
+        self.width == self.height
     }
 }
 
@@ -171,7 +241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_image_generation() {
+    async fn image_generation() {
         let generator = MockImageGenerator;
         let mut stream = generator.create(Prompt::new("a cat"), Size::square(256));
 
@@ -187,7 +257,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_image_generation_empty_prompt() {
+    async fn image_generation_empty_prompt() {
         let generator = MockImageGenerator;
         let mut stream = generator.create(Prompt::new(""), Size::square(256));
 
@@ -203,7 +273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_image_generation_long_prompt() {
+    async fn image_generation_long_prompt() {
         let generator = MockImageGenerator;
         let long_prompt = "a very detailed and elaborate description of a beautiful landscape with mountains, rivers, and forests";
         let mut stream = generator.create(Prompt::new(long_prompt), Size::square(512));
@@ -218,7 +288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_data_type_alias() {
+    async fn data_type_alias() {
         let data: Data = vec![1, 2, 3, 4];
         assert_eq!(data.len(), 4);
         assert_eq!(data[0], 1);
@@ -226,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn test_data_operations() {
+    fn data_operations() {
         let mut data: Data = vec![0xFF; 1024];
         assert_eq!(data.len(), 1024);
 

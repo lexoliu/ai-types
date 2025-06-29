@@ -24,9 +24,10 @@
 //! |------------|-------|-------------|
 //! | **Language Models** | [`LanguageModel`] | Text generation, conversations, structured output |
 //! | **Embeddings** | [`EmbeddingModel`] | Convert text to vectors for semantic search |
-//! | **Image Generation** | [`ImageGenerator`] | Create and edit images from text prompts |
+//! | **Image Generation** | [`ImageGenerator`] | Create images with progressive quality improvement |
 //! | **Text-to-Speech** | [`AudioGenerator`] | Generate speech audio from text |
 //! | **Speech-to-Text** | [`AudioTranscriber`] | Transcribe audio to text |
+//! | **Content Moderation** | [`Moderation`] | Detect policy violations with confidence scores |
 //!
 //! ## Examples
 //!
@@ -37,7 +38,7 @@
 //! use futures_lite::StreamExt;
 //!
 //! async fn chat_example(model: impl LanguageModel) -> ai_types::Result {
-//!     let messages = vec![
+//!     let messages = [
 //!         Message::system("You are a helpful assistant"),
 //!         Message::user("What's the capital of France?")
 //!     ];
@@ -70,8 +71,8 @@
 //! struct WeatherTool;
 //!
 //! impl Tool for WeatherTool {
-//!     const NAME: &'static str = "get_weather";
-//!     const DESCRIPTION: &'static str = "Get current weather for a location";
+//!     const NAME: &str = "get_weather";
+//!     const DESCRIPTION: &str = "Get current weather for a location";
 //!     type Arguments = WeatherQuery;
 //!     
 //!     async fn call(&mut self, args: Self::Arguments) -> ai_types::Result {
@@ -82,7 +83,7 @@
 //! async fn weather_bot(model: impl LanguageModel) -> ai_types::Result {
 //!     let request = Request::new(vec![
 //!         Message::user("What's the weather like in Tokyo?")
-//!     ]).tool(WeatherTool);
+//!     ]).with_tool(WeatherTool);
 //!     
 //!     // Model can now call the weather tool automatically
 //!     let response: String = model.generate(request).await?;
@@ -110,7 +111,7 @@
 //! }
 //! ```
 //!
-//! ### Image Generation
+//! ### Progressive Image Generation
 //!
 //! ```rust
 //! use ai_types::{ImageGenerator, image::{Prompt, Size}};
@@ -118,16 +119,21 @@
 //!
 //! async fn generate_image(generator: impl ImageGenerator) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
 //!     let prompt = Prompt::new("A beautiful sunset over mountains");
-//!     let size = Size::Square1024;
+//!     let size = Size::square(1024);
 //!     
 //!     let mut image_stream = generator.create(prompt, size);
-//!     let mut image_data = Vec::new();
+//!     let mut final_image = Vec::new();
 //!     
-//!     while let Some(chunk) = image_stream.next().await {
-//!         image_data.extend_from_slice(&chunk?);
+//!     // Each iteration gives us a complete image with progressively better quality
+//!     while let Some(image_result) = image_stream.next().await {
+//!         let current_image = image_result?;
+//!         final_image = current_image; // Keep the latest (highest quality) version
+//!         
+//!         // Optional: Display preview of current quality level
+//!         println!("Received image update, {} bytes", final_image.len());
 //!     }
 //!     
-//!     Ok(image_data)
+//!     Ok(final_image) // Return the final highest-quality image
 //! }
 //! ```
 //!
@@ -139,17 +145,12 @@ extern crate alloc;
 ///
 /// Contains [`AudioGenerator`] and [`AudioTranscriber`] traits.
 pub mod audio;
-/// Text and multimodal embeddings.
-///
-/// Contains [`EmbeddingModel`] trait for vector representations.
+/// Text embeddings.
 pub mod embedding;
 /// Text-to-image generation.
 ///
 /// Contains [`ImageGenerator`] trait for creating images from text.
 pub mod image;
-/// Language models, messages, and tools.
-///
-/// Contains [`LanguageModel`] trait, [`llm::Message`] types, and [`llm::Tool`] system.
 pub mod llm;
 
 /// Content moderation utilities.
@@ -167,6 +168,8 @@ pub use embedding::EmbeddingModel;
 pub use image::ImageGenerator;
 #[doc(inline)]
 pub use llm::LanguageModel;
+#[doc(inline)]
+pub use moderation::Moderation;
 
 /// Result type used throughout the crate.
 ///

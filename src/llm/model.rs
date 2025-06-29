@@ -10,16 +10,16 @@
 //! ```rust
 //! use ai_types::llm::model::{Profile, Ability, Pricing};
 //!
-//! let pricing = Pricing {
-//!     prompt: 0.001,
-//!     completion: 0.002,
-//!     request: 0.01,
-//!     image: 0.1,
-//!     web_search: 0.05,
-//!     internal_reasoning: 0.003,
-//!     input_cache_read: 0.0005,
-//!     input_cache_write: 0.001,
-//! };
+//! let mut pricing = Pricing::default();
+//!
+//! pricing.prompt = 0.01; // $0.01 per 1K prompt tokens
+//! pricing.completion = 0.03; // $0.03 per 1K completion tokens
+//! pricing.request = 0.01; // $0.01 per request
+//! pricing.image = 0.1; // $0.1 per image
+//! pricing.web_search = 0.05; // $0.05 per web search
+//! pricing.internal_reasoning = 0.003; // $0.003 per internal reasoning
+//! pricing.input_cache_read = 0.0005; // $0.0005 per input cache read
+//! pricing.input_cache_write = 0.001; // $0.001 per input cache write
 //!
 //! let profile = Profile::new("gpt-4", "GPT-4 model", 8192)
 //!     .with_ability(Ability::ToolUse)
@@ -187,7 +187,8 @@ impl_with_methods! {
 ///     .with_ability(Ability::ToolUse)
 ///     .with_ability(Ability::Vision);
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+#[non_exhaustive]
 pub struct Profile {
     /// The name of the model.
     pub name: String,
@@ -212,18 +213,15 @@ pub struct Profile {
 /// ```rust
 /// use ai_types::llm::model::Pricing;
 ///
-/// let pricing = Pricing {
-///     prompt: 0.01,      // $0.01 per 1K prompt tokens
-///     completion: 0.03,  // $0.03 per 1K completion tokens
-///     request: 0.0,      // No per-request fee
-///     image: 0.25,       // $0.25 per image
-///     web_search: 0.005, // $0.005 per search
-///     internal_reasoning: 0.0,
-///     input_cache_read: 0.0,
-///     input_cache_write: 0.0,
-/// };
+/// let mut pricing = Pricing::default();
+///
+/// pricing.prompt = 0.01; // $0.01 per 1K prompt tokens
+/// pricing.completion = 0.03; // $0.03 per 1K completion tokens
+/// pricing.image = 0.25; // $0.25 per image
+/// pricing.web_search = 0.005; // $0.005 per search
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, PartialOrd, Default)]
+#[non_exhaustive]
 pub struct Pricing {
     /// Price per prompt token.
     pub prompt: f64,
@@ -254,30 +252,18 @@ pub struct Pricing {
 /// ```rust
 /// use ai_types::llm::model::SupportedParameters;
 ///
-/// let support = SupportedParameters {
-///     tools: true,
-///     temperature: true,
-///     max_tokens: true,
-///     tool_choice: false,
-///     // ... other fields
-/// #   top_p: true,
-/// #   reasoning: false,
-/// #   include_reasoning: false,
-/// #   structured_outputs: false,
-/// #   response_format: false,
-/// #   stop: true,
-/// #   frequency_penalty: false,
-/// #   presence_penalty: false,
-/// #   seed: true,
-/// };
+/// let mut support = SupportedParameters::default();
+///
+/// support.temperature = true;
+/// support.max_tokens = true;
+/// support.top_p = true;
+/// support.stop = true;
+/// support.seed = true;
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[allow(clippy::struct_excessive_bools)]
+#[non_exhaustive]
 pub struct SupportedParameters {
-    /// Whether tools are supported.
-    pub tools: bool,
-    /// Whether tool choice is supported.
-    pub tool_choice: bool,
     /// Whether `max_tokens` is supported.
     pub max_tokens: bool,
     /// Whether temperature is supported.
@@ -362,7 +348,7 @@ impl Profile {
     /// ```rust
     /// use ai_types::llm::model::{Profile, Ability};
     ///
-    /// let abilities = vec![Ability::ToolUse, Ability::Vision, Ability::Audio];
+    /// let abilities = [Ability::ToolUse, Ability::Vision, Ability::Audio];
     /// let profile = Profile::new("multimodal", "A multimodal model", 32768)
     ///     .with_abilities(abilities);
     /// ```
@@ -383,17 +369,10 @@ impl Profile {
     /// ```rust
     /// use ai_types::llm::model::{Profile, Pricing};
     ///
-    /// let pricing = Pricing {
-    ///     prompt: 0.01,
-    ///     completion: 0.03,
-    ///     // ... other pricing fields
-    /// #   request: 0.0,
-    /// #   image: 0.0,
-    /// #   web_search: 0.0,
-    /// #   internal_reasoning: 0.0,
-    /// #   input_cache_read: 0.0,
-    /// #   input_cache_write: 0.0,
-    /// };
+    /// let mut pricing = Pricing::default();
+    ///
+    /// pricing.prompt = 0.01;
+    /// pricing.completion = 0.03;
     ///
     /// let profile = Profile::new("paid-model", "A paid model", 4096)
     ///     .with_pricing(pricing);
@@ -417,10 +396,10 @@ impl Profile {
 /// use ai_types::llm::model::Ability;
 ///
 /// // Check if a model supports vision
-/// let abilities = vec![Ability::Vision, Ability::ToolUse];
+/// let abilities = [Ability::Vision, Ability::ToolUse];
 /// let has_vision = abilities.contains(&Ability::Vision);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Ability {
     /// The model can use external tools/functions.
     ToolUse,
@@ -435,10 +414,9 @@ pub enum Ability {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
 
     #[test]
-    fn test_profile_creation() {
+    fn profile_creation() {
         let profile = Profile::new("test-model", "A test model", 4096);
 
         assert_eq!(profile.name, "test-model");
@@ -449,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_with_single_ability() {
+    fn profile_with_single_ability() {
         let profile =
             Profile::new("vision-model", "A vision model", 8192).with_ability(Ability::Vision);
 
@@ -458,10 +436,10 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_with_multiple_abilities() {
-        let abilities = vec![Ability::ToolUse, Ability::Vision, Ability::Audio];
-        let profile = Profile::new("multimodal-model", "A multimodal model", 16384)
-            .with_abilities(abilities.clone());
+    fn profile_with_multiple_abilities() {
+        let abilities = [Ability::ToolUse, Ability::Vision, Ability::Audio];
+        let profile =
+            Profile::new("multimodal-model", "A multimodal model", 16384).with_abilities(abilities);
 
         assert_eq!(profile.abilities.len(), 3);
         assert_eq!(profile.abilities, abilities);
@@ -469,7 +447,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::float_cmp)]
-    fn test_profile_with_pricing() {
+    fn profile_with_pricing() {
         let pricing = Pricing {
             prompt: 0.0001,
             completion: 0.0002,
@@ -496,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_builder_pattern() {
+    fn profile_builder_pattern() {
         let pricing = Pricing {
             prompt: 0.001,
             completion: 0.002,
@@ -511,7 +489,7 @@ mod tests {
         let profile = Profile::new("full-model", "A full-featured model", 32768)
             .with_ability(Ability::ToolUse)
             .with_ability(Ability::Vision)
-            .with_abilities(vec![Ability::Audio, Ability::WebSearch])
+            .with_abilities([Ability::Audio, Ability::WebSearch])
             .with_pricing(pricing);
 
         assert_eq!(profile.name, "full-model");
@@ -526,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ability_equality() {
+    fn ability_equality() {
         assert_eq!(Ability::ToolUse, Ability::ToolUse);
         assert_eq!(Ability::Vision, Ability::Vision);
         assert_eq!(Ability::Audio, Ability::Audio);
@@ -537,14 +515,14 @@ mod tests {
     }
 
     #[test]
-    fn test_ability_debug() {
+    fn ability_debug() {
         let ability = Ability::ToolUse;
         let debug_str = alloc::format!("{ability:?}");
         assert!(debug_str.contains("ToolUse"));
     }
 
     #[test]
-    fn test_profile_debug() {
+    fn profile_debug() {
         let profile = Profile::new("debug-model", "A debug model", 1024);
         let debug_str = alloc::format!("{profile:?}");
         assert!(debug_str.contains("debug-model"));
@@ -553,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_clone() {
+    fn profile_clone() {
         let original =
             Profile::new("original", "Original model", 2048).with_ability(Ability::Vision);
         let cloned = original.clone();
@@ -565,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pricing_debug() {
+    fn pricing_debug() {
         let pricing = Pricing {
             prompt: 0.001,
             completion: 0.002,
@@ -584,7 +562,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::float_cmp)]
-    fn test_pricing_clone() {
+    fn pricing_clone() {
         let original = Pricing {
             prompt: 0.001,
             completion: 0.002,
@@ -608,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pricing_equality() {
+    fn pricing_equality() {
         let pricing1 = Pricing {
             prompt: 0.001,
             completion: 0.002,
@@ -647,32 +625,24 @@ mod tests {
     }
 
     #[test]
-    fn test_supported_parameters() {
+    fn supported_parameters() {
         let params = SupportedParameters {
-            tools: true,
-            tool_choice: false,
             max_tokens: true,
             temperature: true,
             top_p: false,
-            reasoning: true,
-            include_reasoning: false,
             structured_outputs: true,
-            response_format: false,
             stop: true,
-            frequency_penalty: false,
             presence_penalty: true,
-            seed: false,
+            ..Default::default()
         };
 
-        assert!(params.tools);
-        assert!(!params.tool_choice);
         assert!(params.max_tokens);
         assert!(params.temperature);
         assert!(!params.top_p);
     }
 
     #[test]
-    fn test_parameters_debug() {
+    fn parameters_debug() {
         let params = Parameters::default()
             .temperature(0.7)
             .top_p(0.9)
