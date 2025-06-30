@@ -1,3 +1,134 @@
+//! # LLM Tool Calling Framework
+//!
+//!
+//! Type-safe tool calling system for Large Language Models. Enables LLMs to execute external
+//! functions, access APIs, and interact with systems through well-defined interfaces.
+//!
+//! //! ## How LLM call external tools?
+//!
+//! TODO
+//!
+//! ## Core Components
+//!
+//! - [`Tool`] - Trait for defining executable tools
+//! - [`Tools`] - Registry for managing multiple tools  
+//! - [`ToolDefinition`] - Metadata and schema for LLM consumption
+//!
+//! ## Quick Start
+//!
+//! ```rust
+//! use ai_types::llm::Tool;
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//!
+//! #[derive(JsonSchema, Deserialize)]
+//! struct MathArgs {
+//!     /// Operation: "add", "subtract", "multiply", "divide"
+//!     operation: String,
+//!     /// First number
+//!     a: f64,
+//!     /// Second number  
+//!     b: f64,
+//! }
+//!
+//! struct Calculator;
+//!
+//! impl Tool for Calculator {
+//!     const NAME: &str = "calculator";
+//!     const DESCRIPTION: &str = "Performs basic math operations";
+//!     type Arguments = MathArgs;
+//!
+//!     async fn call(&mut self, args: Self::Arguments) -> ai_types::Result {
+//!         let result = match args.operation.as_str() {
+//!             "add" => args.a + args.b,
+//!             "subtract" => args.a - args.b,
+//!             "multiply" => args.a * args.b,
+//!             "divide" if args.b != 0.0 => args.a / args.b,
+//!             "divide" => return Err(anyhow::Error::msg("Division by zero")),
+//!             _ => return Err(anyhow::Error::msg("Unknown operation")),
+//!         };
+//!         Ok(result.to_string())
+//!     }
+//! }
+//! ```
+//!
+//! ## Schema Design Best Practices
+//!
+//! ### 1. Use Clear Documentation Comments
+//! Doc comments automatically become schema descriptions:
+//!
+//! ```rust
+//! #[derive(JsonSchema, Deserialize)]
+//! struct WeatherArgs {
+//!     /// City name (e.g., "London", "Tokyo", "New York")
+//!     city: String,
+//!     /// Temperature unit: "celsius" or "fahrenheit"
+//!     #[serde(default = "default_celsius")]
+//!     unit: String,
+//! }
+//! ```
+//!
+//! ### 2. Prefer Enums Over Strings
+//! Enums provide clear constraints for LLMs:
+//!
+//! ```rust
+//! #[derive(JsonSchema, Deserialize)]
+//! enum Priority { Low, Medium, High, Critical }
+//!
+//! #[derive(JsonSchema, Deserialize)]  
+//! struct TaskArgs {
+//!     /// Task description
+//!     description: String,
+//!     /// Task priority level
+//!     priority: Priority,
+//! }
+//! ```
+//!
+//! ### 3. Add Validation Constraints
+//! Use schemars attributes for validation:
+//!
+//! ```rust
+//! #[derive(JsonSchema, Deserialize)]
+//! struct UserArgs {
+//!     /// Valid email address
+//!     #[schemars(regex = "^[^@]+@[^@]+\\.[^@]+$")]
+//!     email: String,
+//!     /// Age between 13 and 120
+//!     #[schemars(range(min = 13, max = 120))]
+//!     age: u8,
+//!     /// Bio text, max 500 characters
+//!     #[schemars(length(max = 500))]
+//!     bio: Option<String>,
+//! }
+//! ```
+//!
+//! ### 4. Structure Complex Data
+//! Break down complex parameters into nested types:
+//!
+//! ```rust
+//! #[derive(JsonSchema, Deserialize)]
+//! struct Address {
+//!     street: String,
+//!     city: String,
+//!     /// Two-letter country code (e.g., "US", "GB", "JP")
+//!     country: String,
+//! }
+//!
+//! #[derive(JsonSchema, Deserialize)]
+//! struct CreateUserArgs {
+//!     name: String,
+//!     address: Address,
+//!     /// List of user interests
+//!     #[schemars(length(max = 10))]
+//!     interests: Vec<String>,
+//! }
+//! ```
+//!
+
+// Re-export procedural macros
+#[cfg(feature = "derive")]
+pub use ai_types_derive::tool;
+
 use crate::Result;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -72,7 +203,11 @@ pub trait Tool: Send + 'static {
 ///
 /// Panics if the value cannot be serialized to JSON.
 pub fn json<T: Serialize>(value: &T) -> String {
-    serde_json::to_string_pretty(value).expect("Failed to serialize to JSON")
+    let value = serde_json::to_value(value).expect("Failed to convert value to JSON");
+
+    value
+        .as_str()
+        .map_or_else(|| format!("{value:#}"), ToString::to_string)
 }
 
 trait ToolImpl: Send {

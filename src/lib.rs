@@ -23,6 +23,7 @@
 //! | Capability | Trait | Description |
 //! |------------|-------|-------------|
 //! | **Language Models** | [`LanguageModel`] | Text generation, conversations, structured output |
+//! | **Text Streaming** | [`TextStream`] | Unified interface for streaming text responses |
 //! | **Embeddings** | [`EmbeddingModel`] | Convert text to vectors for semantic search |
 //! | **Image Generation** | [`ImageGenerator`] | Create images with progressive quality improvement |
 //! | **Text-to-Speech** | [`AudioGenerator`] | Generate speech audio from text |
@@ -46,12 +47,7 @@
 //!     let request = Request::new(messages);
 //!     let mut response = model.respond(request);
 //!     
-//!     let mut full_response = String::new();
-//!     while let Some(chunk) = response.next().await {
-//!         full_response.push_str(&chunk?);
-//!     }
-//!     
-//!     Ok(full_response)
+//!     Ok(response.await?)
 //! }
 //! ```
 //!
@@ -90,6 +86,8 @@
 //!     Ok(response)
 //! }
 //! ```
+//!
+//! See [`llm::tool`] for more details on using tools with language models.
 //!
 //! ### Semantic Search with Embeddings
 //!
@@ -139,8 +137,13 @@
 //!
 //!
 
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/lexoliu/ai-types/main/logo.svg",
+    html_favicon_url = "https://raw.githubusercontent.com/lexoliu/ai-types/main/logo.svg"
+)]
 #![no_std]
 extern crate alloc;
+
 /// Audio generation and transcription.
 ///
 /// Contains [`AudioGenerator`] and [`AudioTranscriber`] traits.
@@ -167,7 +170,7 @@ pub use embedding::EmbeddingModel;
 #[doc(inline)]
 pub use image::ImageGenerator;
 #[doc(inline)]
-pub use llm::LanguageModel;
+pub use llm::{LanguageModel, TextStream};
 #[doc(inline)]
 pub use moderation::Moderation;
 
@@ -177,3 +180,7 @@ pub use moderation::Moderation;
 pub type Result<T = String> = anyhow::Result<T>;
 
 pub use anyhow::Error;
+
+// Re-export procedural macros
+#[cfg(feature = "derive")]
+pub use crate::llm::tool::tool;

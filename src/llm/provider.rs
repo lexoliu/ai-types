@@ -51,9 +51,8 @@ mod tests {
     use core::convert::Infallible;
 
     use super::*;
-    use crate::llm::Message;
+    use crate::llm::{Message, TextStream, stream::text_stream};
     use alloc::{string::ToString, vec};
-    use futures_core::Stream;
     use futures_lite::StreamExt;
 
     struct MockModel {
@@ -62,18 +61,16 @@ mod tests {
 
     impl LanguageModel for MockModel {
         type Error = Infallible;
-        fn respond(
-            &self,
-            _request: crate::llm::Request,
-        ) -> impl Stream<Item = Result<String, Self::Error>> + Send + Unpin {
-            futures_lite::stream::iter(Some(Ok("Mock response".to_string())))
+        fn respond(&self, _request: crate::llm::Request) -> impl TextStream<Error = Self::Error> {
+            text_stream(futures_lite::stream::iter(Some(Ok(
+                "Mock response".to_string()
+            ))))
         }
 
-        fn complete(
-            &self,
-            _prefix: &str,
-        ) -> impl Stream<Item = Result<String, Self::Error>> + Send + Unpin {
-            futures_lite::stream::iter(Some(Ok("Mock completion".to_string())))
+        fn complete(&self, _prefix: &str) -> impl TextStream<Error = Self::Error> {
+            text_stream(futures_lite::stream::iter(Some(Ok(
+                "Mock completion".to_string()
+            ))))
         }
 
         fn profile(&self) -> crate::llm::model::Profile {

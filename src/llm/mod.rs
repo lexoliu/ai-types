@@ -6,6 +6,7 @@
 //! ## Core Components
 //!
 //! - **[`LanguageModel`]** - The main trait for text generation and conversation
+//! - **[`TextStream`]** - Unified streaming interface for text responses with dual Stream/Future support
 //! - **[`Request`]** - Encapsulates messages, tools, and parameters for model calls
 //! - **[`Message`]** - Represents individual messages in a conversation
 //! - **[`Tool`]** - Function calling interface for extending model capabilities
@@ -132,6 +133,68 @@
 //!
 //! ## Advanced Features
 //!
+//! ### Working with Text Streams
+//!
+//! The [`TextStream`] trait provides a unified interface for handling streaming text responses.
+//! It implements both `Stream<Item = Result<String, Error>>` for chunk-by-chunk processing
+//! and `IntoFuture<Output = Result<String, Error>>` for collecting complete responses.
+//!
+//! ```rust
+//! use ai_types::llm::{LanguageModel, TextStream, Request, Message};
+//! use futures_lite::StreamExt;
+//!
+//! // Process text as it streams in (useful for real-time display)
+//! async fn stream_chat_response(model: impl LanguageModel) -> ai_types::Result {
+//!     let request = Request::new([Message::user("Tell me a story about robots")]);
+//!     let mut stream = model.respond(request);
+//!     
+//!     let mut complete_story = String::new();
+//!     while let Some(chunk) = stream.next().await {
+//!         let text = chunk?;
+//!         print!("{}", text); // Display each chunk as it arrives
+//!         complete_story.push_str(&text);
+//!     }
+//!     
+//!     Ok(complete_story)
+//! }
+//!
+//! // Collect complete response using IntoFuture (simpler for batch processing)
+//! async fn get_complete_response(model: impl LanguageModel) -> ai_types::Result {
+//!     let request = Request::new([Message::user("Explain machine learning")]);
+//!     let stream = model.respond(request);
+//!     
+//!     // TextStream implements IntoFuture, so you can await it directly
+//!     let explanation = stream.await?;
+//!     Ok(explanation)
+//! }
+//!
+//! // Generic function that works with any TextStream implementation
+//! async fn process_any_stream<S: TextStream>(stream: S) -> Result<String, S::Error> {
+//!     // Can either iterate through chunks...
+//!     let mut result = String::new();
+//!     let mut stream = stream;
+//!     while let Some(chunk) = stream.next().await {
+//!         result.push_str(&chunk?);
+//!     }
+//!     Ok(result)
+//!     
+//!     // ...or collect everything at once
+//!     // stream.await
+//! }
+//!
+//! // Convert any Stream<Item = Result<String, E>> into a TextStream
+//! use futures_lite::stream;
+//!
+//! async fn custom_text_stream() {
+//!     let chunks = vec!["Hello, ", "streaming ", "world!"];
+//!     let chunk_stream = stream::iter(chunks).map(|s| Ok::<String, std::io::Error>(s.to_string()));
+//!     
+//!     let text_stream = ai_types::llm::stream::text_stream(chunk_stream);
+//!     let complete_text = text_stream.await.unwrap();
+//!     assert_eq!(complete_text, "Hello, streaming world!");
+//! }
+//! ```
+//!
 //! ### Text Summarization
 //!
 //! ```rust
@@ -203,13 +266,18 @@ pub mod message;
 /// Model profiles and capabilities.
 pub mod model;
 mod provider;
+/// Text streaming utilities and the [`TextStream`] trait.
+///
+/// This module provides the [`TextStream`] trait which unifies streaming text responses
+/// from language models. `TextStream` implements both `Stream` for chunk-by-chunk processing
+/// and `IntoFuture` for collecting complete responses.
+pub mod stream;
+pub use stream::TextStream;
 /// Tool system for function calling.
 pub mod tool;
 use crate::llm::{model::Parameters, tool::Tools};
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::future::Future;
-use futures_core::Stream;
-use futures_lite::StreamExt;
 pub use message::{Annotation, Message, Role, UrlAnnotation};
 pub use provider::LanguageModelProvider;
 use schemars::{JsonSchema, schema_for};
@@ -392,10 +460,7 @@ pub trait LanguageModel: Sized + Send + Sync + 'static {
     type Error: core::error::Error + Send + Sync + 'static;
 
     /// Generates streaming response to conversation.
-    fn respond(
-        &self,
-        request: Request,
-    ) -> impl Stream<Item = Result<String, Self::Error>> + Send + Unpin;
+    fn respond(&self, request: Request) -> impl TextStream<Error = Self::Error>;
 
     /// Generates structured output conforming to JSON schema.
     fn generate<T: JsonSchema + DeserializeOwned>(
@@ -406,16 +471,10 @@ pub trait LanguageModel: Sized + Send + Sync + 'static {
     }
 
     /// Completes given text prefix.
-    fn complete(
-        &self,
-        prefix: &str,
-    ) -> impl Stream<Item = Result<String, Self::Error>> + Send + Unpin;
+    fn complete(&self, prefix: &str) -> impl TextStream<Error = Self::Error>;
 
     /// Summarizes text.
-    fn summarize(
-        &self,
-        text: &str,
-    ) -> impl Stream<Item = Result<String, Self::Error>> + Send + Unpin {
+    fn summarize(&self, text: &str) -> impl TextStream<Error = Self::Error> {
         summarize(self, text)
     }
 
@@ -438,7 +497,7 @@ macro_rules! impl_language_model {
         $(
             impl<T: LanguageModel> LanguageModel for $name<T> {
                 type Error = T::Error;
-                fn respond(&self, request: Request) -> impl Stream<Item = Result<String, Self::Error>> + Send + Unpin{
+                fn respond(&self, request: Request) -> impl TextStream<Error = T::Error> {
                     T::respond(self, request)
                 }
 
@@ -449,11 +508,11 @@ macro_rules! impl_language_model {
                     T::generate(self, request)
                 }
 
-                fn complete(&self, prefix: &str) -> impl Stream<Item = Result<String,Self::Error>> + Send + Unpin {
+                fn complete(&self, prefix: &str) -> impl TextStream<Error = T::Error> {
                     T::complete(self, prefix)
                 }
 
-                fn summarize(&self, text: &str) -> impl Stream<Item = Result<String,Self::Error>> + Send + Unpin {
+                fn summarize(&self, text: &str) -> impl TextStream<Error = T::Error> {
                     T::summarize(self, text)
                 }
 
@@ -499,10 +558,7 @@ Generate the JSON response now:"#
     );
 
     request.messages.push(Message::system(prompt));
-    let response: String = model
-        .respond(request)
-        .try_fold(String::new(), |state, new| Ok(state + &new))
-        .await?;
+    let response: String = model.respond(request).await?;
 
     let value: T = serde_json::from_str(&response)?;
 
@@ -512,7 +568,7 @@ Generate the JSON response now:"#
 fn summarize<'a, M: LanguageModel>(
     model: &'a M,
     text: &str,
-) -> impl Stream<Item = Result<String, M::Error>> + Send + Unpin + 'a {
+) -> impl TextStream<Error = M::Error> + 'a {
     let messages = Request::oneshot("Summarize text:", text);
     model.respond(messages)
 }

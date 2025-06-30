@@ -23,20 +23,27 @@ maintenance = { status = "actively-developed" }
 
 [package.metadata.docs.rs]
 all-features = true
-rustdoc-args = ["--cfg", "docsrs", "--html-logo-url", "https://raw.githubusercontent.com/lexoliu/ai-types/main/logo.svg"]
-
+rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
+ai-types-derive = { version = "0.0.1", path = "./ai-types-derive", optional = true }
 anyhow = { version = "1.0", default-features = false }
 futures-core = { version = "0.3.31", default-features = false}
-futures-lite = { version = "2.6", default-features = false }
-schemars = { version = "1.0", default-features = false, features = ["derive"] }
-serde = { version = "1.0", default-features = false, features = ["derive"] }
+pin-project-lite = "0.2.16"
+schemars = { version = "1.0", default-features = false}
+serde = { version = "1.0", default-features = false}
 serde_json = { version = "1.0", default-features = false }
 url = { version = "2.5", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread"] }
 tokio-test = "0.4"
+schemars = { version = "1.0" }
+serde = { version = "1.0", features = ["derive"] }
+futures-lite = { version = "2.6"}
+
+[features]
+default = ["derive"]
+derive = ["ai-types-derive"]
 
 [lints]
 rust.missing_docs = "warn"

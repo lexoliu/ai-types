@@ -1,5 +1,5 @@
 <div align="center">
-<img src="logo.svg" alt="ai-types logo" width="120" height="120">
+<img src="logo.svg" alt="ai-types logo" width="150" height="150">
 
 # ai-types
 
@@ -33,8 +33,8 @@ Unified trait abstractions for AI models in Rust. Switch between OpenAI, Anthrop
 
 - 🎯 **Provider Agnostic** - One interface, multiple providers
 - ⚡ **Async Native** - Built with `async`/`await` and streaming
-- � **No-std Compatible** - Works in embedded and WASM environments
-- �🛠️ **Function Calling** - Structured tool integration with JSON schemas
+- 😊 **No-std Compatible** - Works in embedded and WASM environments
+- 🛠️ **Function Calling** - Structured tool integration with JSON schemas
 - 📸 **Multimodal** - Text, images, embeddings, and audio support
 - 🔒 **Type Safe** - Leverage Rust's type system for AI applications
 
@@ -43,6 +43,7 @@ Unified trait abstractions for AI models in Rust. Switch between OpenAI, Anthrop
 | Capability | Trait | Description |
 |------------|-------|-------------|
 | **Language Models** | `LanguageModel` | Text generation, conversations, streaming |
+| **Text Streaming** | `TextStream` | Unified interface for streaming text responses |
 | **Embeddings** | `EmbeddingModel` | Convert text to vectors for semantic search |
 | **Image Generation** | `ImageGenerator` | Create images with progressive quality |
 | **Text-to-Speech** | `AudioGenerator` | Generate speech audio from text |
@@ -77,6 +78,54 @@ async fn chat_example(model: impl LanguageModel) -> ai_types::Result {
     }
     
     Ok(full_response)
+}
+```
+
+### Working with Text Streams
+
+The `TextStream` trait provides a unified interface for streaming text responses from language models. It implements both `Stream` for chunk-by-chunk processing and `IntoFuture` for collecting the complete response.
+
+```rust
+use ai_types::{TextStream, LanguageModel, llm::{Request, Message}};
+use futures_lite::StreamExt;
+
+// Process text as it streams in
+async fn process_streaming_response(model: impl LanguageModel) -> ai_types::Result {
+    let request = Request::new([Message::user("Write a poem about Rust")]);
+    let mut stream = model.respond(request);
+    
+    let mut full_poem = String::new();
+    while let Some(chunk) = stream.next().await {
+        let text = chunk?;
+        print!("{}", text); // Display each chunk as it arrives
+        full_poem.push_str(&text);
+    }
+    
+    Ok(full_poem)
+}
+
+// Collect complete response using IntoFuture
+async fn get_complete_response(model: impl LanguageModel) -> ai_types::Result {
+    let request = Request::new([Message::user("Explain quantum computing")]);
+    let stream = model.respond(request);
+    
+    // TextStream implements IntoFuture, so you can await it directly
+    let complete_explanation = stream.await?;
+    Ok(complete_explanation)
+}
+
+// Generic function that works with any TextStream
+async fn stream_to_completion<S: TextStream>(stream: S) -> Result<String, S::Error> {
+    // Either collect manually...
+    let mut result = String::new();
+    let mut stream = stream;
+    while let Some(chunk) = stream.next().await {
+        result.push_str(&chunk?);
+    }
+    Ok(result)
+    
+    // ...or use the built-in IntoFuture implementation
+    // stream.await
 }
 ```
 
