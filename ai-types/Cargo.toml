@@ -25,7 +25,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-ai-types-derive = { version = "0.0.1", path = "../ai-types-derive", optional = true }
+ai-types-derive = { version = "0.1.0", path = "../ai-types-derive", optional = true }
 anyhow = { version = "1.0", default-features = false }
 futures-core = { version = "0.3.31", default-features = false}
 pin-project-lite = "0.2.16"
