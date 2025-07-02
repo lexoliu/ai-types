@@ -133,7 +133,7 @@ impl Parse for ToolArgs {
         let description = description
             .ok_or_else(|| syn::Error::new(input.span(), "description attribute is required"))?;
 
-        Ok(ToolArgs {
+        Ok(Self {
             description,
             rename,
         })
@@ -363,7 +363,7 @@ fn analyze_function_args(
         _ => {
             let mut attributes = Vec::new();
 
-            for arg in inputs.iter() {
+            for arg in inputs {
                 if let FnArg::Typed(pat_type) = arg {
                     let pat = &pat_type.pat;
                     let ty = &pat_type.ty;
