@@ -13,6 +13,7 @@ categories = ["development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true
+doctest = false
 
 [dependencies]
 proc-macro2 = "1.0"

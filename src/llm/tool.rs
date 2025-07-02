@@ -58,6 +58,9 @@
 //! Doc comments automatically become schema descriptions:
 //!
 //! ```rust
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//!
 //! #[derive(JsonSchema, Deserialize)]
 //! struct WeatherArgs {
 //!     /// City name (e.g., "London", "Tokyo", "New York")
@@ -66,12 +69,17 @@
 //!     #[serde(default = "default_celsius")]
 //!     unit: String,
 //! }
+//!
+//! fn default_celsius() -> String { "celsius".to_string() }
 //! ```
 //!
 //! ### 2. Prefer Enums Over Strings
 //! Enums provide clear constraints for LLMs:
 //!
 //! ```rust
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//!
 //! #[derive(JsonSchema, Deserialize)]
 //! enum Priority { Low, Medium, High, Critical }
 //!
@@ -88,10 +96,13 @@
 //! Use schemars attributes for validation:
 //!
 //! ```rust
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//!
 //! #[derive(JsonSchema, Deserialize)]
 //! struct UserArgs {
 //!     /// Valid email address
-//!     #[schemars(regex = "^[^@]+@[^@]+\\.[^@]+$")]
+//!     #[schemars(regex(pattern = "^[^@]+@[^@]+\\.[^@]+$"))]
 //!     email: String,
 //!     /// Age between 13 and 120
 //!     #[schemars(range(min = 13, max = 120))]
@@ -106,6 +117,9 @@
 //! Break down complex parameters into nested types:
 //!
 //! ```rust
+//! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//!
 //! #[derive(JsonSchema, Deserialize)]
 //! struct Address {
 //!     street: String,
