@@ -261,23 +261,21 @@
 //!         )
 //!    );
 //! ```
+/// Assistant module for managing assistant-related functionality.
+pub mod assistant;
 /// Message types and conversation handling.
 pub mod message;
 /// Model profiles and capabilities.
 pub mod model;
 mod provider;
-/// Text streaming utilities and the [`TextStream`] trait.
-///
-/// This module provides the [`TextStream`] trait which unifies streaming text responses
-/// from language models. `TextStream` implements both `Stream` for chunk-by-chunk processing
-/// and `IntoFuture` for collecting complete responses.
-pub mod stream;
-pub use stream::TextStream;
 /// Tool system for function calling.
 pub mod tool;
 use crate::llm::{model::Parameters, tool::Tools};
-use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc};
+use async_stream::try_stream;
 use core::future::Future;
+use futures_core::Stream;
+use futures_lite::{StreamExt, pin};
 pub use message::{Annotation, Message, Role, UrlAnnotation};
 pub use provider::LanguageModelProvider;
 use schemars::{JsonSchema, schema_for};
@@ -293,165 +291,6 @@ fn oneshot(system: impl Into<String>, user: impl Into<String>) -> [Message; 2] {
     [Message::system(system.into()), Message::user(user.into())]
 }
 
-/// A request to a language model.
-///
-/// Contains the conversation messages, available tools, and generation parameters.
-/// This is the primary input structure for language model interactions.
-///
-/// # Examples
-///
-/// ```rust
-/// use ai_types::llm::{Request, Message, model::Parameters};
-///
-/// // Simple request with messages
-/// let messages = [
-///     Message::system("You are a helpful assistant"),
-///     Message::user("Hello!")
-/// ];
-/// let request = Request::new(messages);
-///
-/// // Request with custom parameters - create new messages
-/// let other_messages = [Message::user("Another message")];
-/// let request = Request::new(other_messages)
-///     .with_parameters(Parameters::default().temperature(0.7));
-/// ```
-#[derive(Debug, Default)]
-pub struct Request {
-    messages: Vec<Message>,
-    tools: Tools,
-    parameters: Parameters,
-}
-
-impl Request {
-    /// Return available tools that the model can call.
-    #[must_use]
-    pub const fn tools(&self) -> &Tools {
-        &self.tools
-    }
-
-    /// Return parameters controlling model behavior and generation.
-    #[must_use]
-    pub const fn parameters(&self) -> &Parameters {
-        &self.parameters
-    }
-
-    /// Return the conversation messages to send to the model.
-    #[must_use]
-    pub const fn messages(&self) -> &[Message] {
-        self.messages.as_slice()
-    }
-}
-
-impl Request {
-    /// Creates a new request with the given messages.
-    ///
-    /// The request is initialized with default tools and parameters.
-    ///
-    /// # Arguments
-    ///
-    /// * `messages` - The conversation messages (can be `Vec<Message>`, array, etc.)
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use ai_types::llm::{Request, Message};
-    ///
-    /// let messages = [Message::user("Hello, world!")];
-    /// let request = Request::new(messages);
-    /// ```
-    pub fn new(messages: impl Into<Vec<Message>>) -> Self {
-        Self {
-            messages: messages.into(),
-            tools: Tools::default(),
-            parameters: Parameters::default(),
-        }
-    }
-
-    /// Creates a request for a simple system/user conversation.
-    ///
-    /// This is a convenience method that creates a two-message conversation
-    /// with a system prompt and user message.
-    ///
-    /// # Arguments
-    ///
-    /// * `system` - The system message content
-    /// * `user` - The user message content
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use ai_types::llm::Request;
-    ///
-    /// let request = Request::oneshot(
-    ///     "You are a helpful assistant",
-    ///     "What is the capital of France?"
-    /// );
-    /// ```
-    pub fn oneshot(system: impl Into<String>, user: impl Into<String>) -> Self {
-        Self::new(oneshot(system, user))
-    }
-
-    /// Sets the generation parameters for this request.
-    ///
-    /// # Arguments
-    ///
-    /// * `parameters` - The model parameters to use
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use ai_types::llm::{Request, Message, model::Parameters};
-    ///
-    /// let request = Request::new([Message::user("Hello")])
-    ///     .with_parameters(Parameters::default().temperature(0.7));
-    /// ```
-    #[must_use]
-    pub fn with_parameters(mut self, parameters: Parameters) -> Self {
-        self.parameters = parameters;
-        self
-    }
-
-    /// Adds a tool that the model can use.
-    ///
-    /// # Arguments
-    ///
-    /// * `tool` - The tool to add to this request
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use ai_types::llm::{Request, Message, Tool};
-    /// use schemars::JsonSchema;
-    /// use serde::Deserialize;
-    ///
-    /// #[derive(JsonSchema, Deserialize)]
-    /// struct MyToolArgs {
-    ///     input: String,
-    /// }
-    ///
-    /// struct MyTool;
-    ///
-    /// impl Tool for MyTool {
-    ///     const NAME: &str = "my_tool";
-    ///     const DESCRIPTION: &str = "A test tool";
-    ///     type Arguments = MyToolArgs;
-    ///     
-    ///     async fn call(&mut self, args: Self::Arguments) -> ai_types::Result {
-    ///         Ok(format!("Processed: {}", args.input))
-    ///     }
-    /// }
-    ///
-    /// let tool = MyTool;
-    /// let request = Request::new([Message::user("Hello")])
-    ///     .with_tool(tool);
-    /// ```
-    #[must_use]
-    pub fn with_tool(mut self, tool: impl Tool) -> Self {
-        self.tools.register(tool);
-        self
-    }
-}
-
 /// Language models for text generation and conversation.
 ///
 /// See the [module documentation](crate::llm) for examples and usage patterns.
@@ -460,21 +299,28 @@ pub trait LanguageModel: Sized + Send + Sync + 'static {
     type Error: core::error::Error + Send + Sync + 'static;
 
     /// Generates streaming response to conversation.
-    fn respond(&self, request: Request) -> impl TextStream<Error = Self::Error>;
+    fn respond(
+        &self,
+        messages: &[Message],
+        tools: &mut Tools,
+        parameters: &Parameters,
+    ) -> impl Stream<Item = Result<String, Self::Error>> + Send;
 
     /// Generates structured output conforming to JSON schema.
     fn generate<T: JsonSchema + DeserializeOwned>(
         &self,
-        request: Request,
+        messages: &[Message],
+        tools: &mut Tools,
+        parameters: &Parameters,
     ) -> impl Future<Output = crate::Result<T>> + Send {
-        generate(self, request)
+        generate(self, messages, tools, parameters)
     }
 
     /// Completes given text prefix.
-    fn complete(&self, prefix: &str) -> impl TextStream<Error = Self::Error>;
+    fn complete(&self, prefix: &str) -> impl Stream<Item = Result<String, Self::Error>> + Send;
 
     /// Summarizes text.
-    fn summarize(&self, text: &str) -> impl TextStream<Error = Self::Error> {
+    fn summarize(&self, text: &str) -> impl Stream<Item = Result<String, Self::Error>> + Send {
         summarize(self, text)
     }
 
@@ -497,22 +343,36 @@ macro_rules! impl_language_model {
         $(
             impl<T: LanguageModel> LanguageModel for $name<T> {
                 type Error = T::Error;
-                fn respond(&self, request: Request) -> impl TextStream<Error = T::Error> {
-                    T::respond(self, request)
+
+                fn respond(
+                    &self,
+                    messages: &[Message],
+                    tools: &mut Tools,
+                    parameters: &Parameters,
+                ) -> impl Stream<Item = Result<String, Self::Error>> + Send {
+                    T::respond(self, messages, tools, parameters)
                 }
 
                 fn generate<U: JsonSchema + DeserializeOwned>(
                     &self,
-                    request: Request,
+                    messages: &[Message],
+                    tools: &mut Tools,
+                    parameters: &Parameters,
                 ) -> impl Future<Output = crate::Result<U>> + Send {
-                    T::generate(self, request)
+                    T::generate(self, messages, tools, parameters)
                 }
 
-                fn complete(&self, prefix: &str) -> impl TextStream<Error = T::Error> {
+                fn complete(
+                    &self,
+                    prefix: &str,
+                ) -> impl Stream<Item = Result<String, Self::Error>> + Send {
                     T::complete(self, prefix)
                 }
 
-                fn summarize(&self, text: &str) -> impl TextStream<Error = T::Error> {
+                fn summarize(
+                    &self,
+                    text: &str,
+                ) -> impl Stream<Item = Result<String, Self::Error>> + Send {
                     T::summarize(self, text)
                 }
 
@@ -531,46 +391,58 @@ macro_rules! impl_language_model {
     };
 }
 
+mod prompts;
+
 impl_language_model!(Arc, Box);
 
+/// Collects all chunks from a stream of `Result<String, Err>` into a single `String`.
+///
+/// # Errors
+///
+/// Returns an error if any chunk in the stream is an `Err`.
+pub async fn try_collect<S, Err>(stream: S) -> Result<String, Err>
+where
+    S: Stream<Item = Result<String, Err>>,
+{
+    pin!(stream);
+
+    stream
+        .try_fold(String::new(), |acc, chunk| Ok(acc + &chunk))
+        .await
+}
 async fn generate<T: JsonSchema + DeserializeOwned, M: LanguageModel>(
     model: &M,
-    mut request: Request,
+    messages: &[Message],
+    tools: &mut Tools,
+    parameters: &Parameters,
 ) -> crate::Result<T> {
     let schema = json(&schema_for!(T));
 
-    let prompt = format!(
-        r#"You must respond with valid JSON that strictly conforms to the following JSON schema:
-
-{schema}
-
-Requirements:
-- Your response must be ONLY valid JSON, no additional text, explanations, or markdown
-- The JSON must exactly match the schema structure and types
-- All required fields must be present
-- Use appropriate data types (strings, numbers, booleans, arrays, objects)
-- Ensure proper JSON syntax with correct quotes, brackets, and commas
-- Do not include any text before or after the JSON
-
-Example format: {{"field1": "value1", "field2": 123}}
-
-Generate the JSON response now:"#
-    );
-
-    request.messages.push(Message::system(prompt));
-    let response: String = model.respond(request).await?;
+    let prompt = prompts::generate(&schema);
+    let mut messages = messages.to_vec();
+    messages.push(Message::system(prompt));
+    let stream = model.respond(&messages, tools, parameters);
+    let response = try_collect(stream).await?;
 
     let value: T = serde_json::from_str(&response)?;
 
     Ok(value)
 }
 
-fn summarize<'a, M: LanguageModel>(
-    model: &'a M,
+fn summarize<M: LanguageModel>(
+    model: &M,
     text: &str,
-) -> impl TextStream<Error = M::Error> + 'a {
-    let messages = Request::oneshot("Summarize text:", text);
-    model.respond(messages)
+) -> impl Stream<Item = Result<String, M::Error>> + Send {
+    try_stream! {
+        let messages = oneshot("Summarize text:", text);
+        let mut tools = Tools::new();
+        let parameters = Parameters::default();
+        let stream=model.respond(&messages, &mut tools, &parameters);
+        pin!(stream);
+        while let Some(chunk) = stream.try_next().await? {
+            yield chunk;
+        }
+    }
 }
 
 async fn categorize<T: JsonSchema + DeserializeOwned, M: LanguageModel>(
@@ -578,6 +450,10 @@ async fn categorize<T: JsonSchema + DeserializeOwned, M: LanguageModel>(
     text: &str,
 ) -> crate::Result<T> {
     model
-        .generate(Request::oneshot("Categorize text by provided schema", text))
+        .generate(
+            &oneshot("Categorize text by provided schema", text),
+            &mut Tools::new(),
+            &Parameters::default(),
+        )
         .await
 }

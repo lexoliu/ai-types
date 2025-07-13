@@ -193,7 +193,7 @@ use serde::{Serialize, de::DeserializeOwned};
 ///     }
 /// }
 /// ```
-pub trait Tool: Send + 'static {
+pub trait Tool: Send + Sync + 'static {
     /// Tool name. Must be unique.
     const NAME: &str;
     /// Tool description for the language model.
@@ -224,7 +224,7 @@ pub fn json<T: Serialize>(value: &T) -> String {
         .map_or_else(|| format!("{value:#}"), ToString::to_string)
 }
 
-trait ToolImpl: Send {
+trait ToolImpl: Send + Sync {
     fn call(&mut self, args: String) -> Pin<Box<dyn Future<Output = Result> + Send + '_>>;
     fn definition(&self) -> ToolDefinition;
 }

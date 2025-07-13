@@ -170,7 +170,7 @@ pub use embedding::EmbeddingModel;
 #[doc(inline)]
 pub use image::ImageGenerator;
 #[doc(inline)]
-pub use llm::{LanguageModel, TextStream};
+pub use llm::LanguageModel;
 #[doc(inline)]
 pub use moderation::Moderation;
 

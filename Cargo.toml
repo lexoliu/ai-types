@@ -57,7 +57,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 ai-types-derive = { workspace = true, optional = true}
 anyhow = { version = "1.0", default-features = false }
+async-stream = "0.3.6"
 futures-core = { version = "0.3.31", default-features = false}
+futures-lite = { version = "2.6"}
 pin-project-lite = "0.2.16"
 schemars = { version = "1.0", default-features = false}
 serde = { version = "1.0", default-features = false}
