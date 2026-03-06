@@ -19,7 +19,7 @@ use crate::{
     constant::{ANTHROPIC_VERSION, CLAUDE_BASE_URL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL},
     error::ClaudeError,
     request::{
-        CacheControlPayload, MessagesRequest, ParameterSnapshot, convert_tools,
+        MessagesRequest, ParameterSnapshot, apply_cache_strategy, convert_tools,
         filter_tool_definitions, to_claude_messages, tool_choice_payload,
     },
     response::{StreamState, parse_event, should_skip_event},
@@ -94,7 +94,7 @@ impl LanguageModel for Claude {
     ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         let cfg = self.config();
         let (core_messages, parameters, tool_definitions) = request.into_parts();
-        let (system_prompt, claude_messages) = to_claude_messages(&core_messages);
+        let (mut system_prompt, mut claude_messages) = to_claude_messages(&core_messages);
         let snapshot = ParameterSnapshot::from(&parameters);
         let filtered_tool_definitions =
             filter_tool_definitions(tool_definitions, &snapshot.tool_choice);
@@ -103,7 +103,7 @@ impl LanguageModel for Claude {
             _ => None,
         };
         let has_tools = !filtered_tool_definitions.is_empty();
-        let claude_tools = has_tools.then(|| convert_tools(&filtered_tool_definitions));
+        let mut claude_tools = has_tools.then(|| convert_tools(&filtered_tool_definitions));
         let claude_tool_choice = tool_choice_payload(&snapshot.tool_choice, has_tools);
 
         let max_tokens = snapshot.max_tokens.unwrap_or(cfg.default_max_tokens);
@@ -123,6 +123,23 @@ impl LanguageModel for Claude {
                 return;
             }
 
+            let top_level_cache_control = if let Some(cache) = snapshot.cache {
+                match apply_cache_strategy(
+                    &mut system_prompt,
+                    &mut claude_messages,
+                    &mut claude_tools,
+                    cache,
+                ) {
+                    Ok(control) => control,
+                    Err(error) => {
+                        yield Err(ClaudeError::Api(error));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
             // Build and send request
             let request_body = MessagesRequest {
                 model: cfg.model.clone(),
@@ -136,7 +153,7 @@ impl LanguageModel for Claude {
                 stop_sequences: snapshot.stop_sequences.clone(),
                 tools: claude_tools,
                 tool_choice: claude_tool_choice,
-                cache_control: snapshot.cache.map(CacheControlPayload::from),
+                cache_control: top_level_cache_control,
             };
 
             debug!("Claude request: {:?}", request_body);
@@ -229,7 +246,7 @@ impl LanguageModel for Claude {
                     tracing::debug!("API did not return context_length: {e}");
                     // Fallback to models database
                     aither_models::lookup(&cfg.model)
-                        .map(|info| info.context_window)
+                        .and_then(aither_models::ModelEntry::max_input_tokens)
                         .unwrap_or_else(|| {
                             panic!(
                                 "Claude model '{}' missing context metadata from provider and aither-models",

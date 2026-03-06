@@ -33,6 +33,7 @@
 mod agent;
 pub mod ask_user;
 mod bash_agent;
+mod browser_backend;
 mod builder;
 mod compression;
 mod config;
@@ -73,14 +74,13 @@ pub use aither_sandbox as sandbox;
 // Public API
 pub use agent::{Agent, CompactResult};
 pub use bash_agent::BashAgentBuilder;
+pub use browser_backend::{BrowserBackend, BrowserBackendError, StaticCdpBrowser};
 pub use builder::AgentBuilder;
 pub use compression::{
     CompressionLevel, ContextStrategy, PreserveConfig, PreservedContent, SmartCompressionConfig,
 };
-pub use config::{
-    AgentConfig, AgentKind, ContextAssemblerConfig, ContextBlock, ContextBlockPriority,
-};
-pub use context::{Context, ContextCheckpoint, ConversationMemory, MemoryCheckpoint};
+pub use config::{AgentConfig, AgentKind, ContextAssemblerConfig};
+pub use context::{Context, ContextCheckpoint};
 pub use error::AgentError;
 pub use event::AgentEvent;
 pub use hook::{

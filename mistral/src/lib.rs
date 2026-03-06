@@ -357,7 +357,13 @@ impl LanguageModel for Mistral {
                 .clone()
                 .unwrap_or_else(|| "mistral-local".to_string());
             let context_length = aither_models::lookup(&name)
-                .map_or(32_768, |model| model.context_window);
+                .and_then(aither_models::ModelEntry::max_input_tokens)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Mistral model '{}' missing context metadata in aither-models",
+                        name
+                    )
+                });
 
             Profile::new(
                 name.clone(),

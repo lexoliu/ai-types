@@ -1,56 +1,34 @@
 //! Unified context manager for agent conversation state.
 //!
-//! The [`Context`] struct owns the entire context window state: system blocks
-//! (stable cacheable prefix) and recent conversation messages (including
-//! reminders and handoff summaries).
-//!
-//! # Design principles
-//!
-//! - **No custom trait**: only `T: Serialize` is required for `insert_system`.
-//! - **Immediate serialization**: `insert_system` serializes `T` to XML and stores the string.
-//!   No trait objects, no `Arc`, no `dyn`.
-//! - **Identity = snake_case struct name**: derived from `std::any::type_name::<T>()`.
-//! - **Explicit cache lifecycle**: system blocks form a stable cacheable prefix;
-//!   everything else (conversation, reminders, handoff) lives in `recent`.
-//!
-//! # Message layout
-//!
-//! ```text
-//! [System: <base_system>…<persona>…<memory>…]  ← system_blocks (CACHEABLE prefix)
-//! [Messages: handoff, reminders, user/assistant/tool interleaved]  ← recent
-//! ```
+//! The [`Context`] struct owns the entire context window state: persistent
+//! system blocks (stable cacheable prefix), ephemeral reminders, compaction
+//! handoff, and recent conversation messages.
 
 use indexmap::IndexMap;
-use serde::{Deserialize, Serialize, ser::SerializeMap};
+use serde::{Deserialize, Serialize};
 
 use aither_core::llm::Message;
 
-/// The entire context window state. Fully serializable for session persistence.
-///
-/// `system_blocks` is an [`IndexMap`] to preserve insertion order, producing a
-/// deterministic rendering and stable cache prefix.
-///
-/// `recent` contains all conversation messages, including system reminders
-/// and handoff summaries. These are interleaved naturally with the conversation.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// The entire context window state. Fully serializable for persistence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Context {
-    /// Persistent system blocks, keyed by snake_case type name.
-    /// Survive compaction. Concatenated into one system message (cacheable prefix).
+    /// Persistent system blocks keyed by snake_case type name.
+    ///
+    /// These survive compaction and are rendered as a single cacheable system
+    /// prefix message.
     system_blocks: IndexMap<String, String>,
 
-    /// All conversation messages: user, assistant, tool, system reminders, handoff.
-    /// Everything that is NOT part of the stable system prefix lives here.
-    recent: Vec<Message>,
-}
+    /// Ephemeral reminder blocks rendered as separate system messages after the
+    /// stable system prefix.
+    reminders: Vec<String>,
 
-// Custom Serialize so we can emit system_blocks as a map.
-impl Serialize for Context {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(2))?;
-        map.serialize_entry("system_blocks", &self.system_blocks)?;
-        map.serialize_entry("recent", &self.recent)?;
-        map.end()
-    }
+    /// Compaction handoff document from previous context compaction.
+    ///
+    /// This is rendered after reminders and before recent conversation.
+    handoff: Option<String>,
+
+    /// Recent conversation messages.
+    recent: Vec<Message>,
 }
 
 impl Context {
@@ -62,22 +40,16 @@ impl Context {
 
     // ── System blocks (stable, cacheable prefix) ──────────────────────
 
-    /// Insert or replace a system block.
+    /// Inserts or replaces a persistent system block.
     ///
-    /// Identity is derived from the snake_case of `T`'s struct name.
-    /// The value is serialized to XML immediately.
-    ///
-    /// Replacing a block whose content has changed invalidates the cached
-    /// prefix — this is expected and intentional (the content actually changed).
+    /// Identity is derived from the snake_case type name of `T`.
     pub fn insert_system<T: Serialize>(&mut self, value: &T) {
         let tag = snake_case_type_name::<T>();
         let xml = serialize_xml(&tag, value);
         self.system_blocks.insert(tag, xml);
     }
 
-    /// Insert or replace a system block with an explicit tag name.
-    ///
-    /// Use this when you need a tag that differs from the struct name.
+    /// Inserts or replaces a persistent system block with an explicit tag.
     pub fn insert_system_named(&mut self, tag: impl Into<String>, content: impl Into<String>) {
         let tag = tag.into();
         let content = content.into();
@@ -85,90 +57,122 @@ impl Context {
         self.system_blocks.insert(tag, xml);
     }
 
-    /// Remove a system block by type.
+    /// Removes a persistent system block by type.
     pub fn remove_system<T>(&mut self) {
         let tag = snake_case_type_name::<T>();
         self.system_blocks.shift_remove(&tag);
     }
 
-    /// Remove a system block by tag name.
+    /// Removes a persistent system block by explicit tag.
     pub fn remove_system_named(&mut self, tag: &str) {
         self.system_blocks.shift_remove(tag);
     }
 
-    /// Returns the number of system blocks.
+    /// Returns the number of persistent system blocks.
     #[must_use]
     pub fn system_block_count(&self) -> usize {
         self.system_blocks.len()
     }
 
-    /// Returns `true` if a system block with the given tag exists.
+    /// Returns whether a persistent system block with `tag` exists.
     #[must_use]
     pub fn has_system_block(&self, tag: &str) -> bool {
         self.system_blocks.contains_key(tag)
     }
 
-    /// Returns a mutable reference to the system blocks map.
-    ///
-    /// Use this for bulk operations on system blocks (e.g., during session restore).
-    #[must_use]
-    pub fn system_blocks_mut(&mut self) -> &mut IndexMap<String, String> {
-        &mut self.system_blocks
-    }
-
-    /// Returns a reference to the system blocks map.
+    /// Returns an immutable view of persistent system blocks.
     #[must_use]
     pub fn system_blocks(&self) -> &IndexMap<String, String> {
         &self.system_blocks
     }
 
-    // ── Conversation messages (recent) ────────────────────────────────
+    /// Returns a mutable view of persistent system blocks.
+    #[must_use]
+    pub fn system_blocks_mut(&mut self) -> &mut IndexMap<String, String> {
+        &mut self.system_blocks
+    }
 
-    /// Append a message to the conversation.
-    ///
-    /// This includes all message types: user, assistant, tool results,
-    /// system reminders, and handoff summaries.
+    // ── Reminders (ephemeral) ─────────────────────────────────────────
+
+    /// Inserts an ephemeral reminder.
+    pub fn insert_reminder<T: Serialize>(&mut self, value: &T) {
+        let tag = snake_case_type_name::<T>();
+        let xml = serialize_xml(&tag, value);
+        self.reminders.push(xml);
+    }
+
+    /// Clears all ephemeral reminders.
+    pub fn clear_reminders(&mut self) {
+        self.reminders.clear();
+    }
+
+    /// Returns current reminders.
+    #[must_use]
+    pub fn reminders(&self) -> &[String] {
+        &self.reminders
+    }
+
+    // ── Handoff ───────────────────────────────────────────────────────
+
+    /// Sets or replaces the compaction handoff document.
+    pub fn set_handoff(&mut self, handoff: impl Into<String>) {
+        self.handoff = Some(handoff.into());
+    }
+
+    /// Clears the compaction handoff document.
+    pub fn clear_handoff(&mut self) {
+        self.handoff = None;
+    }
+
+    /// Returns the current compaction handoff document.
+    #[must_use]
+    pub fn handoff(&self) -> Option<&str> {
+        self.handoff.as_deref()
+    }
+
+    // ── Recent conversation ───────────────────────────────────────────
+
+    /// Appends a message to recent conversation.
     pub fn push(&mut self, message: Message) {
         self.recent.push(message);
     }
 
-    /// Extend the conversation with multiple messages.
+    /// Extends recent conversation with multiple messages.
     pub fn extend(&mut self, messages: impl IntoIterator<Item = Message>) {
         self.recent.extend(messages);
     }
 
-    /// Returns the number of recent messages.
+    /// Returns number of recent conversation messages.
     #[must_use]
     pub fn len_recent(&self) -> usize {
         self.recent.len()
     }
 
-    /// Returns the recent messages.
+    /// Returns recent conversation messages.
     #[must_use]
     pub fn recent(&self) -> &[Message] {
         &self.recent
     }
 
-    /// Returns a mutable reference to the recent messages.
+    /// Returns mutable recent conversation messages.
     #[must_use]
     pub fn recent_mut(&mut self) -> &mut Vec<Message> {
         &mut self.recent
     }
 
-    /// Returns the last message.
+    /// Returns the latest recent message.
     #[must_use]
     pub fn last(&self) -> Option<&Message> {
         self.recent.last()
     }
 
-    /// Returns `true` if there are no conversation messages.
+    /// Returns whether recent conversation is empty.
     #[must_use]
     pub fn is_conversation_empty(&self) -> bool {
         self.recent.is_empty()
     }
 
-    /// Drains the oldest recent messages, keeping only the specified count.
-    /// Returns the drained (older) messages.
+    /// Drains oldest recent messages while keeping the latest `keep` messages.
     pub fn drain_oldest(&mut self, keep: usize) -> Vec<Message> {
         if keep >= self.recent.len() {
             return Vec::new();
@@ -176,29 +180,27 @@ impl Context {
         self.recent.drain(..self.recent.len() - keep).collect()
     }
 
-    /// Returns all conversation messages (alias for `recent()` as a `Vec`).
-    ///
-    /// This is provided for backward compatibility with code that called
-    /// `ConversationMemory::all()`.
+    /// Returns recent conversation messages cloned.
     #[must_use]
     pub fn conversation_messages(&self) -> Vec<Message> {
         self.recent.clone()
     }
 
-    // ── Build messages for LLM request ────────────────────────────────
+    // ── Message assembly ───────────────────────────────────────────────
 
-    /// Build the full message array for the LLM request.
+    /// Builds the full LLM message list.
     ///
     /// Layout:
-    /// 1. System blocks → one system message (cacheable prefix)
-    /// 2. Recent conversation messages (including reminders, handoff, etc.)
+    /// 1. Persistent system blocks (single cacheable prefix)
+    /// 2. Ephemeral reminders (one system message each)
+    /// 3. Compaction handoff (optional system message)
+    /// 4. Recent conversation
     #[must_use]
     pub fn build_messages(&self) -> Vec<Message> {
         let mut messages = Vec::new();
 
-        // 1. System blocks → one system message (cacheable prefix)
         if !self.system_blocks.is_empty() {
-            let system_xml: String = self
+            let system_xml = self
                 .system_blocks
                 .values()
                 .cloned()
@@ -207,26 +209,39 @@ impl Context {
             messages.push(Message::system(system_xml));
         }
 
-        // 2. Recent conversation (includes reminders, handoff, everything)
-        messages.extend(self.recent.iter().cloned());
+        for reminder in &self.reminders {
+            messages.push(Message::system(reminder));
+        }
 
+        if let Some(handoff) = &self.handoff {
+            messages.push(Message::system(handoff));
+        }
+
+        messages.extend(self.recent.iter().cloned());
         messages
     }
 
     // ── Lifecycle ─────────────────────────────────────────────────────
 
-    /// Clear all conversation history (keep system blocks).
-    pub fn clear_conversation(&mut self) {
+    /// Clears only recent conversation messages.
+    pub fn clear_recent(&mut self) {
         self.recent.clear();
     }
 
-    /// Clear everything.
+    /// Clears all non-persistent context: reminders, handoff, recent conversation.
+    pub fn clear_history(&mut self) {
+        self.reminders.clear();
+        self.handoff = None;
+        self.recent.clear();
+    }
+
+    /// Clears everything, including persistent system blocks.
     pub fn clear_all(&mut self) {
         self.system_blocks.clear();
-        self.recent.clear();
+        self.clear_history();
     }
 
-    /// Creates a fork (clone) of this context.
+    /// Clones the context.
     #[must_use]
     pub fn fork(&self) -> Self {
         self.clone()
@@ -236,234 +251,65 @@ impl Context {
     #[must_use]
     pub fn checkpoint(&self) -> ContextCheckpoint {
         ContextCheckpoint {
+            reminders: self.reminders.clone(),
+            handoff: self.handoff.clone(),
             recent: self.recent.clone(),
         }
     }
 
-    /// Restores conversation state from a checkpoint.
-    /// System blocks are NOT restored (they are managed separately).
+    /// Restores reminders, handoff, and recent conversation from checkpoint.
     pub fn restore(&mut self, checkpoint: ContextCheckpoint) {
+        self.reminders = checkpoint.reminders;
+        self.handoff = checkpoint.handoff;
         self.recent = checkpoint.recent;
     }
 }
 
-/// A snapshot of conversation state that can be restored.
+/// A snapshot of non-persistent context state that can be restored.
 #[derive(Debug, Clone)]
 pub struct ContextCheckpoint {
+    reminders: Vec<String>,
+    handoff: Option<String>,
     recent: Vec<Message>,
 }
 
 impl ContextCheckpoint {
-    /// Returns the total number of messages in this checkpoint.
+    /// Returns the number of recent messages in this checkpoint.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub fn len_recent(&self) -> usize {
         self.recent.len()
     }
 
-    /// Returns `true` if this checkpoint is empty.
+    /// Returns whether this checkpoint has no reminders, no handoff, and no recent messages.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.recent.is_empty()
-    }
-}
-
-// ── Backward compatibility: ConversationMemory facade ─────────────────
-
-/// Conversation memory (legacy facade).
-///
-/// This type is preserved for backward compatibility. New code should
-/// use [`Context`] directly.
-#[derive(Debug, Clone, Default)]
-pub struct ConversationMemory {
-    /// Compressed summaries of earlier conversation.
-    summaries: Vec<Message>,
-    /// Recent messages kept verbatim.
-    recent: Vec<Message>,
-}
-
-impl ConversationMemory {
-    /// Creates a new empty conversation memory.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Adds a new message to the recent conversation history.
-    pub fn push(&mut self, message: Message) {
-        self.recent.push(message);
-    }
-
-    /// Extends the recent conversation history with multiple messages.
-    pub fn extend(&mut self, messages: impl IntoIterator<Item = Message>) {
-        for message in messages {
-            self.push(message);
-        }
-    }
-
-    /// Adds a summary message to the long-term summaries.
-    pub fn push_summary(&mut self, summary: Message) {
-        self.summaries.push(summary);
-    }
-
-    /// Returns the number of recent messages stored.
-    #[must_use]
-    pub const fn len_recent(&self) -> usize {
-        self.recent.len()
-    }
-
-    /// Returns the number of summary messages stored.
-    #[must_use]
-    pub const fn len_summaries(&self) -> usize {
-        self.summaries.len()
-    }
-
-    /// Returns the total number of messages (summaries + recent).
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.summaries.len() + self.recent.len()
-    }
-
-    /// Returns all messages, combining summaries and recent messages.
-    #[must_use]
-    pub fn all(&self) -> Vec<Message> {
-        self.summaries
-            .iter()
-            .cloned()
-            .chain(self.recent.iter().cloned())
-            .collect()
-    }
-
-    /// Returns only the recent messages.
-    #[must_use]
-    pub fn recent(&self) -> &[Message] {
-        &self.recent
-    }
-
-    /// Returns only the summary messages.
-    #[must_use]
-    pub fn summaries(&self) -> &[Message] {
-        &self.summaries
-    }
-
-    /// Returns the last message, prioritizing recent over summaries.
-    #[must_use]
-    pub fn last(&self) -> Option<&Message> {
-        self.recent.last().or_else(|| self.summaries.last())
-    }
-
-    /// Checks if the memory is empty.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.summaries.is_empty() && self.recent.is_empty()
-    }
-
-    /// Drains the oldest messages from recent history.
-    pub fn drain_oldest(&mut self, keep: usize) -> Vec<Message> {
-        if keep >= self.recent.len() {
-            return Vec::new();
-        }
-        self.recent.drain(..self.recent.len() - keep).collect()
-    }
-
-    /// Clears all messages from memory.
-    pub fn clear(&mut self) {
-        self.summaries.clear();
-        self.recent.clear();
-    }
-
-    /// Creates a fork (clone) of this memory.
-    #[must_use]
-    pub fn fork(&self) -> Self {
-        self.clone()
-    }
-
-    /// Creates a checkpoint that can be restored later.
-    #[must_use]
-    pub fn checkpoint(&self) -> MemoryCheckpoint {
-        MemoryCheckpoint {
-            summaries: self.summaries.clone(),
-            recent: self.recent.clone(),
-        }
-    }
-
-    /// Restores from a checkpoint.
-    pub fn restore(&mut self, checkpoint: MemoryCheckpoint) {
-        self.summaries = checkpoint.summaries;
-        self.recent = checkpoint.recent;
-    }
-}
-
-/// A snapshot of conversation memory that can be restored.
-#[derive(Debug, Clone)]
-pub struct MemoryCheckpoint {
-    summaries: Vec<Message>,
-    recent: Vec<Message>,
-}
-
-impl MemoryCheckpoint {
-    /// Returns the total number of messages in this checkpoint.
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.summaries.len() + self.recent.len()
-    }
-
-    /// Returns `true` if this checkpoint is empty.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.summaries.is_empty() && self.recent.is_empty()
+        self.reminders.is_empty() && self.handoff.is_none() && self.recent.is_empty()
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-/// Extracts the short struct name from `std::any::type_name::<T>()` and converts
-/// it to snake_case.
-///
-/// For example:
-/// - `my_crate::Memory` → `"memory"`
-/// - `my_crate::ProfilePersona` → `"profile_persona"`
-/// - `my_crate::nested::BrowserContext` → `"browser_context"`
 fn snake_case_type_name<T>() -> String {
     let full = std::any::type_name::<T>();
     let short = full.rsplit("::").next().unwrap_or(full);
     heck::AsSnakeCase(short).to_string()
 }
 
-/// Serializes a value to XML with the given root element tag.
-///
-/// Uses quick-xml's serde integration. The resulting XML looks like:
-/// ```xml
-/// <tag>
-///   <field1>value1</field1>
-///   <field2>value2</field2>
-/// </tag>
-/// ```
-///
-/// For structs with `#[serde(rename = "$text")]`, the content is inlined:
-/// ```xml
-/// <tag>content here</tag>
-/// ```
 fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> String {
-    let mut buf = String::new();
-    let result = quick_xml::se::Serializer::with_root(&mut buf, Some(tag))
-        .and_then(|ser| value.serialize(ser).map(|_| ()));
-    match result {
-        Ok(()) => buf,
-        Err(e) => {
-            tracing::warn!(tag, error = %e, "XML serialization failed, using fallback");
-            format!("<{tag}>serialization error: {e}</{tag}>")
-        }
-    }
+    let mut buffer = String::new();
+    let serializer = quick_xml::se::Serializer::with_root(&mut buffer, Some(tag))
+        .unwrap_or_else(|error| panic!("failed to create XML serializer for tag '{tag}': {error}"));
+
+    value
+        .serialize(serializer)
+        .unwrap_or_else(|error| panic!("failed to serialize XML for tag '{tag}': {error}"));
+
+    buffer
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_snake_case_type_name() {
-        assert_eq!(snake_case_type_name::<Context>(), "context");
-    }
 
     #[derive(Serialize)]
     struct Memory {
@@ -472,7 +318,7 @@ mod tests {
     }
 
     #[derive(Serialize)]
-    struct ProfilePersona {
+    struct Reminder {
         #[serde(rename = "$text")]
         content: String,
     }
@@ -484,23 +330,32 @@ mod tests {
     }
 
     #[test]
-    fn test_serialize_xml_text_content() {
-        let m = Memory {
-            content: "hello world".to_string(),
-        };
-        let xml = serialize_xml("memory", &m);
+    fn snake_case_type_name_uses_short_struct_name() {
+        assert_eq!(snake_case_type_name::<Memory>(), "memory");
+    }
+
+    #[test]
+    fn serialize_xml_renders_text_content() {
+        let xml = serialize_xml(
+            "memory",
+            &Memory {
+                content: "remember this".to_string(),
+            },
+        );
         assert!(xml.contains("<memory>"));
-        assert!(xml.contains("hello world"));
+        assert!(xml.contains("remember this"));
         assert!(xml.contains("</memory>"));
     }
 
     #[test]
-    fn test_serialize_xml_struct_fields() {
-        let w = Workspace {
-            sandbox: "/tmp/sandbox".to_string(),
-            cwd: "/home/user".to_string(),
-        };
-        let xml = serialize_xml("workspace", &w);
+    fn serialize_xml_renders_struct_fields() {
+        let xml = serialize_xml(
+            "workspace",
+            &Workspace {
+                sandbox: "/tmp/sandbox".to_string(),
+                cwd: "/home/user".to_string(),
+            },
+        );
         assert!(xml.contains("<workspace>"));
         assert!(xml.contains("<sandbox>"));
         assert!(xml.contains("/tmp/sandbox"));
@@ -508,158 +363,107 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_system() {
-        let mut ctx = Context::new();
-        let m = Memory {
-            content: "remember this".to_string(),
-        };
-        ctx.insert_system(&m);
-        assert!(ctx.has_system_block("memory"));
-        assert_eq!(ctx.system_block_count(), 1);
-    }
-
-    #[test]
-    fn test_insert_system_replaces() {
-        let mut ctx = Context::new();
-        ctx.insert_system(&Memory {
+    fn insert_system_replaces_existing_block() {
+        let mut context = Context::new();
+        context.insert_system(&Memory {
             content: "old".to_string(),
         });
-        ctx.insert_system(&Memory {
+        context.insert_system(&Memory {
             content: "new".to_string(),
         });
-        assert_eq!(ctx.system_block_count(), 1);
 
-        let messages = ctx.build_messages();
+        assert_eq!(context.system_block_count(), 1);
+        let messages = context.build_messages();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].content().contains("new"));
         assert!(!messages[0].content().contains("old"));
     }
 
     #[test]
-    fn test_build_messages_layout() {
-        let mut ctx = Context::new();
-
-        // System block
-        ctx.insert_system(&Memory {
-            content: "system".to_string(),
+    fn build_messages_has_expected_layout() {
+        let mut context = Context::new();
+        context.insert_system(&Memory {
+            content: "base".to_string(),
         });
+        context.insert_reminder(&Reminder {
+            content: "todo".to_string(),
+        });
+        context.set_handoff("<handoff>summary</handoff>");
+        context.push(Message::user("hello"));
 
-        // Conversation (reminders and handoff are just pushed as messages)
-        ctx.push(Message::system("handoff summary"));
-        ctx.push(Message::user("hello"));
-        ctx.push(Message::assistant("hi"));
-
-        let messages = ctx.build_messages();
+        let messages = context.build_messages();
         assert_eq!(messages.len(), 4);
-
-        // 1. System blocks (one message)
-        assert!(messages[0].content().contains("system"));
-        // 2-4. Conversation (handoff + user + assistant)
-        assert!(messages[1].content().contains("handoff summary"));
-        assert!(messages[2].content().contains("hello"));
-        assert!(messages[3].content().contains("hi"));
+        assert!(messages[0].content().contains("base"));
+        assert!(messages[1].content().contains("todo"));
+        assert!(messages[2].content().contains("handoff"));
+        assert!(messages[3].content().contains("hello"));
     }
 
     #[test]
-    fn test_clear_conversation() {
-        let mut ctx = Context::new();
-        ctx.insert_system(&Memory {
+    fn clear_history_preserves_system_blocks() {
+        let mut context = Context::new();
+        context.insert_system(&Memory {
             content: "persist".to_string(),
         });
-        ctx.push(Message::user("hello"));
-        ctx.push(Message::system("reminder"));
+        context.insert_reminder(&Reminder {
+            content: "ephemeral".to_string(),
+        });
+        context.set_handoff("<handoff>summary</handoff>");
+        context.push(Message::assistant("recent"));
 
-        ctx.clear_conversation();
+        context.clear_history();
 
-        assert_eq!(ctx.len_recent(), 0);
-        // System blocks survive
-        assert_eq!(ctx.system_block_count(), 1);
+        assert_eq!(context.system_block_count(), 1);
+        assert!(context.reminders().is_empty());
+        assert!(context.handoff().is_none());
+        assert_eq!(context.len_recent(), 0);
     }
 
     #[test]
-    fn test_checkpoint_restore() {
-        let mut ctx = Context::new();
-        ctx.push(Message::user("hello"));
-        ctx.push(Message::assistant("hi"));
+    fn checkpoint_restore_roundtrip() {
+        let mut context = Context::new();
+        context.insert_reminder(&Reminder {
+            content: "before".to_string(),
+        });
+        context.set_handoff("<handoff>before</handoff>");
+        context.push(Message::user("first"));
 
-        let cp = ctx.checkpoint();
+        let checkpoint = context.checkpoint();
 
-        ctx.push(Message::user("more"));
-        assert_eq!(ctx.len_recent(), 3);
+        context.clear_history();
+        context.insert_reminder(&Reminder {
+            content: "after".to_string(),
+        });
+        context.push(Message::user("second"));
 
-        ctx.restore(cp);
-        assert_eq!(ctx.len_recent(), 2);
+        context.restore(checkpoint);
+
+        assert_eq!(context.reminders().len(), 1);
+        assert!(context.handoff().is_some());
+        assert_eq!(context.len_recent(), 1);
+        assert_eq!(context.recent()[0].content(), "first");
     }
 
     #[test]
-    fn test_push_and_all() {
-        let mut memory = ConversationMemory::new();
-        memory.push(Message::user("Hello"));
-        memory.push(Message::assistant("Hi there!"));
+    fn serde_roundtrip_preserves_message_layout() {
+        let mut context = Context::new();
+        context.insert_system(&Memory {
+            content: "persist".to_string(),
+        });
+        context.insert_reminder(&Reminder {
+            content: "ephemeral".to_string(),
+        });
+        context.set_handoff("<handoff>summary</handoff>");
+        context.push(Message::user("hello"));
+        context.push(Message::assistant("world"));
 
-        let messages = memory.all();
-        assert_eq!(messages.len(), 2);
-    }
+        let expected_messages = context.build_messages();
+        let encoded = serde_json::to_string(&context)
+            .unwrap_or_else(|error| panic!("failed to serialize context: {error}"));
+        let decoded: Context = serde_json::from_str(&encoded)
+            .unwrap_or_else(|error| panic!("failed to deserialize context: {error}"));
+        let actual_messages = decoded.build_messages();
 
-    #[test]
-    fn test_push_summary() {
-        let mut memory = ConversationMemory::new();
-        memory.push_summary(Message::system("Summary of earlier conversation."));
-        memory.push(Message::user("New message"));
-
-        let messages = memory.all();
-        assert_eq!(messages.len(), 2);
-        assert!(messages[0].content().contains("Summary"));
-    }
-
-    #[test]
-    fn test_drain_oldest() {
-        let mut memory = ConversationMemory::new();
-        for i in 0..10 {
-            memory.push(Message::user(format!("Message {i}")));
-        }
-
-        let drained = memory.drain_oldest(3);
-        assert_eq!(drained.len(), 7);
-        assert_eq!(memory.len_recent(), 3);
-    }
-
-    #[test]
-    fn test_memory_checkpoint_restore() {
-        let mut memory = ConversationMemory::new();
-        memory.push(Message::user("Hello"));
-        memory.push(Message::assistant("Hi!"));
-
-        let checkpoint = memory.checkpoint();
-
-        memory.push(Message::user("More messages"));
-        memory.push(Message::user("Even more"));
-
-        assert_eq!(memory.len(), 4);
-
-        memory.restore(checkpoint);
-        assert_eq!(memory.len(), 2);
-    }
-
-    #[test]
-    fn test_fork() {
-        let mut memory = ConversationMemory::new();
-        memory.push(Message::user("Hello"));
-
-        let fork = memory.fork();
-        memory.push(Message::assistant("Hi!"));
-
-        assert_eq!(memory.len(), 2);
-        assert_eq!(fork.len(), 1);
-    }
-
-    #[test]
-    fn test_clear() {
-        let mut memory = ConversationMemory::new();
-        memory.push_summary(Message::system("Summary"));
-        memory.push(Message::user("Hello"));
-
-        memory.clear();
-        assert!(memory.is_empty());
+        assert_eq!(actual_messages, expected_messages);
     }
 }

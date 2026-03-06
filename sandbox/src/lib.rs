@@ -9,12 +9,12 @@
 //! # Setting Up the Bash Tool
 //!
 //! ```rust,ignore
-//! use aither_sandbox::{BashTool, ToolRegistryBuilder, permission::AllowAll};
+//! use aither_sandbox::{BashTool, ToolRegistryBuilder, permission::NoopPermissionHandler};
 //! use std::sync::Arc;
 //!
 //! // Creates a random four-word working directory (e.g., amber-forest-thunder-pearl/)
 //! // with outputs/ subdirectory and IPC command wrapper scripts
-//! let tool = BashTool::new_in(std::env::temp_dir(), AllowAll, executor).await?;
+//! let tool = BashTool::new_in(std::env::temp_dir(), NoopPermissionHandler, executor).await?;
 //! let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
 //! let tool = tool.with_registry(registry);
 //!
@@ -89,7 +89,7 @@ pub use job_registry::{JobInfo, JobRegistry, JobStatus};
 pub use output::{Content, OutputEntry, OutputFormat, OutputStore, PendingUrl};
 pub use permission::{BashMode, PermissionHandler};
 pub use shell_session::{
-    ContainerExec, ContainerExecOutcome, ListSshTool, OpenSshArgs, OpenSshTool, ShellBackend,
-    ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile, SshServer,
-    SshSessionAuthorizer, bootstrap_ssh_runtime,
+    ContainerExec, ContainerExecHandle, ContainerExecOutcome, ListSshTool, OpenSshArgs,
+    OpenSshTool, ShellBackend, ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile,
+    SshServer, SshSessionAuthorizer, bootstrap_ssh_runtime,
 };

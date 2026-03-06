@@ -11,7 +11,7 @@ use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, OutputStore};
 use crate::{
     agent::{Agent, ModelTier},
     compression::ContextStrategy,
-    config::{AgentConfig, AgentKind, ContextBlock},
+    config::{AgentConfig, AgentKind},
     context::Context,
     hook::{HCons, Hook},
     todo::{TodoList, TodoTool},
@@ -52,6 +52,7 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     tools: AgentTools,
     hooks: H,
     config: AgentConfig,
+    context: Context,
     todo_list: Option<TodoList>,
     output_store: Option<Arc<OutputStore>>,
     background_receiver: Option<BackgroundTaskReceiver>,
@@ -83,6 +84,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             tools: AgentTools::new(),
             hooks: (),
             config: AgentConfig::default(),
+            context: Context::default(),
             todo_list: None,
             output_store: None,
             background_receiver: None,
@@ -116,6 +118,7 @@ where
             tools: self.tools,
             hooks: self.hooks,
             config: self.config,
+            context: self.context,
             todo_list: self.todo_list,
             output_store: self.output_store,
             background_receiver: self.background_receiver,
@@ -141,6 +144,7 @@ where
             tools: self.tools,
             hooks: self.hooks,
             config: self.config,
+            context: self.context,
             todo_list: self.todo_list,
             output_store: self.output_store,
             background_receiver: self.background_receiver,
@@ -212,6 +216,7 @@ where
             tools: self.tools,
             hooks: HCons::new(hook, self.hooks),
             config: self.config,
+            context: self.context,
             todo_list: self.todo_list,
             output_store: self.output_store,
             background_receiver: self.background_receiver,
@@ -274,9 +279,15 @@ where
         self
     }
 
-    /// Adds a structured context block.
-    pub fn context_block(mut self, block: ContextBlock) -> Self {
-        self.config.context_blocks.push(block);
+    /// Inserts or replaces a typed persistent system block.
+    pub fn system<T: serde::Serialize>(mut self, value: T) -> Self {
+        self.context.insert_system(&value);
+        self
+    }
+
+    /// Inserts or replaces a persistent system block with an explicit tag.
+    pub fn system_named(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
+        self.context.insert_system_named(tag, content);
         self
     }
 
@@ -420,7 +431,7 @@ where
             tools: self.tools,
             hooks: self.hooks,
             config: self.config,
-            context: Context::default(),
+            context: self.context,
             profile: None,
             fast_profile: None,
             initialized: false,

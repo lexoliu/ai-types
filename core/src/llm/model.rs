@@ -253,6 +253,35 @@ impl Parameters {
         self
     }
 
+    /// Sets Claude prompt caching with automatic top-level cache control.
+    #[must_use]
+    pub const fn claude_prompt_cache_automatic(mut self, ttl: ClaudePromptCacheTtl) -> Self {
+        self.cache.claude = Some(ClaudePromptCache::automatic(ttl));
+        self
+    }
+
+    /// Sets Claude prompt caching with explicit block-level cache breakpoints.
+    #[must_use]
+    pub const fn claude_prompt_cache_explicit(
+        mut self,
+        ttl: ClaudePromptCacheTtl,
+        breakpoints: ClaudeExplicitCacheBreakpoints,
+    ) -> Self {
+        self.cache.claude = Some(ClaudePromptCache::explicit(ttl, breakpoints));
+        self
+    }
+
+    /// Sets Claude prompt caching with automatic and explicit breakpoint modes combined.
+    #[must_use]
+    pub const fn claude_prompt_cache_automatic_with_explicit(
+        mut self,
+        ttl: ClaudePromptCacheTtl,
+        breakpoints: ClaudeExplicitCacheBreakpoints,
+    ) -> Self {
+        self.cache.claude = Some(ClaudePromptCache::automatic_with_explicit(ttl, breakpoints));
+        self
+    }
+
     /// Sets the Gemini cached content resource name.
     #[must_use]
     pub fn gemini_cached_content(mut self, cached_content: impl Into<String>) -> Self {
@@ -375,12 +404,12 @@ pub struct OpenAIPromptCache {
     pub retention: Option<OpenAIPromptCacheRetention>,
 }
 
-/// OpenAI prompt cache retention policies.
+/// `OpenAI` prompt cache retention policies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum OpenAIPromptCacheRetention {
-    /// Keep cache entries in-memory (default OpenAI retention mode).
+    /// Keep cache entries in-memory (default `OpenAI` retention mode).
     InMemory,
     /// Keep cache entries for 24 hours.
     #[cfg_attr(feature = "serde", serde(rename = "24h"))]
@@ -404,13 +433,55 @@ impl OpenAIPromptCacheRetention {
 pub struct ClaudePromptCache {
     /// Requested cache TTL policy.
     pub ttl: ClaudePromptCacheTtl,
+    /// Cache application strategy.
+    pub strategy: ClaudePromptCacheStrategy,
 }
 
 impl ClaudePromptCache {
     /// Build a cache configuration with the chosen TTL.
     #[must_use]
     pub const fn new(ttl: ClaudePromptCacheTtl) -> Self {
-        Self { ttl }
+        Self {
+            ttl,
+            strategy: ClaudePromptCacheStrategy::Automatic,
+        }
+    }
+
+    /// Build an automatic top-level cache configuration.
+    #[must_use]
+    pub const fn automatic(ttl: ClaudePromptCacheTtl) -> Self {
+        Self::new(ttl)
+    }
+
+    /// Build an explicit block-level cache configuration.
+    #[must_use]
+    pub const fn explicit(
+        ttl: ClaudePromptCacheTtl,
+        breakpoints: ClaudeExplicitCacheBreakpoints,
+    ) -> Self {
+        Self {
+            ttl,
+            strategy: ClaudePromptCacheStrategy::Explicit(breakpoints),
+        }
+    }
+
+    /// Build a cache configuration that combines automatic and explicit breakpoints.
+    #[must_use]
+    pub const fn automatic_with_explicit(
+        ttl: ClaudePromptCacheTtl,
+        breakpoints: ClaudeExplicitCacheBreakpoints,
+    ) -> Self {
+        Self {
+            ttl,
+            strategy: ClaudePromptCacheStrategy::AutomaticAndExplicit(breakpoints),
+        }
+    }
+
+    /// Override the cache strategy.
+    #[must_use]
+    pub const fn with_strategy(mut self, strategy: ClaudePromptCacheStrategy) -> Self {
+        self.strategy = strategy;
+        self
     }
 }
 
@@ -433,6 +504,175 @@ impl ClaudePromptCacheTtl {
             Self::FiveMinutes => "5m",
             Self::OneHour => "1h",
         }
+    }
+}
+
+/// Claude prompt cache strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ClaudePromptCacheStrategy {
+    /// Add top-level `cache_control` (automatic caching).
+    #[default]
+    Automatic,
+    /// Place `cache_control` on selected cacheable blocks.
+    Explicit(ClaudeExplicitCacheBreakpoints),
+    /// Use top-level automatic caching and explicit breakpoints together.
+    AutomaticAndExplicit(ClaudeExplicitCacheBreakpoints),
+}
+
+/// Explicit Claude cache breakpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ClaudeExplicitCacheBreakpoint {
+    /// Block target where cache control should be applied.
+    pub target: ClaudeCacheBreakpointTarget,
+    /// Optional TTL override for this breakpoint.
+    ///
+    /// When omitted, request-level `ClaudePromptCache::ttl` is used.
+    pub ttl: Option<ClaudePromptCacheTtl>,
+}
+
+impl ClaudeExplicitCacheBreakpoint {
+    /// Creates a breakpoint for the given target using request-level default TTL.
+    #[must_use]
+    pub const fn new(target: ClaudeCacheBreakpointTarget) -> Self {
+        Self { target, ttl: None }
+    }
+
+    /// Overrides TTL for this breakpoint.
+    #[must_use]
+    pub const fn with_ttl(mut self, ttl: ClaudePromptCacheTtl) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    /// Returns the effective TTL for this breakpoint.
+    #[must_use]
+    pub const fn effective_ttl(self, default_ttl: ClaudePromptCacheTtl) -> ClaudePromptCacheTtl {
+        match self.ttl {
+            Some(ttl) => ttl,
+            None => default_ttl,
+        }
+    }
+}
+
+/// Explicit Claude cache breakpoint placement target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ClaudeCacheBreakpointTarget {
+    /// The last tool definition.
+    LastTool,
+    /// A specific tool definition by index.
+    Tool(usize),
+    /// The last non-empty system text block.
+    LastSystem,
+    /// A specific system text block by index.
+    System(usize),
+    /// The last cacheable content block in messages.
+    LastMessage,
+    /// A specific message content block by message and block indices.
+    Message {
+        /// Message index in `messages`.
+        message_index: usize,
+        /// Content block index within the message.
+        block_index: usize,
+    },
+}
+
+/// Up to four explicit Claude cache breakpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ClaudeExplicitCacheBreakpoints {
+    /// First explicit breakpoint.
+    pub first: ClaudeExplicitCacheBreakpoint,
+    /// Optional second explicit breakpoint.
+    pub second: Option<ClaudeExplicitCacheBreakpoint>,
+    /// Optional third explicit breakpoint.
+    pub third: Option<ClaudeExplicitCacheBreakpoint>,
+    /// Optional fourth explicit breakpoint.
+    pub fourth: Option<ClaudeExplicitCacheBreakpoint>,
+}
+
+impl ClaudeExplicitCacheBreakpoints {
+    /// Creates an explicit breakpoint set with one mandatory breakpoint.
+    #[must_use]
+    pub const fn new(first: ClaudeExplicitCacheBreakpoint) -> Self {
+        Self {
+            first,
+            second: None,
+            third: None,
+            fourth: None,
+        }
+    }
+
+    /// Sets the second breakpoint.
+    #[must_use]
+    pub const fn with_second(mut self, second: ClaudeExplicitCacheBreakpoint) -> Self {
+        self.second = Some(second);
+        self
+    }
+
+    /// Sets the third breakpoint.
+    #[must_use]
+    pub const fn with_third(mut self, third: ClaudeExplicitCacheBreakpoint) -> Self {
+        self.third = Some(third);
+        self
+    }
+
+    /// Sets the fourth breakpoint.
+    #[must_use]
+    pub const fn with_fourth(mut self, fourth: ClaudeExplicitCacheBreakpoint) -> Self {
+        self.fourth = Some(fourth);
+        self
+    }
+
+    /// Returns all configured breakpoints in declared order.
+    pub fn iter(self) -> impl Iterator<Item = ClaudeExplicitCacheBreakpoint> {
+        [Some(self.first), self.second, self.third, self.fourth]
+            .into_iter()
+            .flatten()
+    }
+
+    /// Number of configured breakpoints.
+    #[must_use]
+    pub const fn count(&self) -> usize {
+        1 + self.second.is_some() as usize
+            + self.third.is_some() as usize
+            + self.fourth.is_some() as usize
+    }
+
+    /// Returns true when all four breakpoint slots are in use.
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        self.fourth.is_some()
+    }
+
+    /// Cache only the last cacheable message content block.
+    #[must_use]
+    pub const fn messages_only() -> Self {
+        Self::new(ClaudeExplicitCacheBreakpoint::new(
+            ClaudeCacheBreakpointTarget::LastMessage,
+        ))
+    }
+
+    /// Cache tool definitions, system blocks, and message blocks.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self::new(ClaudeExplicitCacheBreakpoint::new(
+            ClaudeCacheBreakpointTarget::LastTool,
+        ))
+        .with_second(ClaudeExplicitCacheBreakpoint::new(
+            ClaudeCacheBreakpointTarget::LastSystem,
+        ))
+        .with_third(ClaudeExplicitCacheBreakpoint::new(
+            ClaudeCacheBreakpointTarget::LastMessage,
+        ))
+    }
+}
+
+impl Default for ClaudeExplicitCacheBreakpoints {
+    fn default() -> Self {
+        Self::messages_only()
     }
 }
 
@@ -693,6 +933,7 @@ impl Profile {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum Ability {
     /// The model can use external tools/functions.
     ToolUse,
@@ -700,6 +941,8 @@ pub enum Ability {
     Vision,
     /// The model can process and understand audio.
     Audio,
+    /// The model can generate audio output.
+    AudioOutput,
     /// The model can process and understand video.
     Video,
     /// The model can perform web searches natively.
@@ -712,59 +955,12 @@ pub enum Ability {
     Reasoning,
     /// The model can generate images.
     ImageGeneration,
-}
-
-/// Model performance/cost tier classification.
-///
-/// Used to categorize models by their general performance characteristics
-/// and typical cost levels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum ModelTier {
-    /// Flagship models - highest capability, highest cost (e.g., GPT-4, Claude Opus)
-    Flagship,
-    /// Balanced models - good capability/cost ratio (e.g., GPT-4o, Claude Sonnet)
-    Balanced,
-    /// Fast models - optimized for speed and cost (e.g., GPT-4o-mini, Claude Haiku)
-    Fast,
-}
-
-/// Static metadata about a known model.
-///
-/// This struct contains pre-defined information about popular models,
-/// used as fallback when provider APIs don't expose model metadata.
-#[derive(Debug, Clone)]
-pub struct ModelInfo {
-    /// Canonical model ID (e.g., "gpt-4o", "claude-3-5-sonnet")
-    pub id: &'static str,
-    /// Human-readable name (e.g., "GPT-4o", "Claude 3.5 Sonnet")
-    pub name: &'static str,
-    /// Provider name (e.g., "openai", "anthropic", "google")
-    pub provider: &'static str,
-    /// Context window size in tokens
-    pub context_window: u32,
-    /// Maximum output tokens (if known)
-    pub max_output_tokens: Option<u32>,
-    /// Model tier classifications (a model can belong to multiple tiers)
-    pub tiers: &'static [ModelTier],
-    /// Model capabilities
-    pub abilities: &'static [Ability],
-    /// Whether this model is outdated (superseded by a newer version)
-    pub outdated: bool,
-}
-
-impl ModelInfo {
-    /// Check if this model belongs to a specific tier.
-    #[must_use]
-    pub fn has_tier(&self, tier: ModelTier) -> bool {
-        self.tiers.contains(&tier)
-    }
-
-    /// Get the primary (first) tier for this model.
-    #[must_use]
-    pub const fn primary_tier(&self) -> Option<ModelTier> {
-        self.tiers.first().copied()
-    }
+    /// The model supports computer use / desktop interaction.
+    ComputerUse,
+    /// The model supports prompt caching.
+    PromptCaching,
+    /// The model supports assistant prefill (pre-filling assistant responses).
+    AssistantPrefill,
 }
 
 #[cfg(test)]
@@ -1084,5 +1280,66 @@ mod tests {
     fn claude_prompt_cache_ttl_string_values_match_api() {
         assert_eq!(ClaudePromptCacheTtl::FiveMinutes.as_str(), "5m");
         assert_eq!(ClaudePromptCacheTtl::OneHour.as_str(), "1h");
+    }
+
+    #[test]
+    fn claude_cache_default_strategy_is_automatic() {
+        let cache = ClaudePromptCache::new(ClaudePromptCacheTtl::FiveMinutes);
+        assert_eq!(cache.strategy, ClaudePromptCacheStrategy::Automatic);
+    }
+
+    #[test]
+    fn claude_explicit_breakpoints_default_to_messages_only() {
+        let breakpoints = ClaudeExplicitCacheBreakpoints::default();
+        assert_eq!(breakpoints.count(), 1);
+        assert_eq!(
+            breakpoints.first.target,
+            ClaudeCacheBreakpointTarget::LastMessage
+        );
+        assert!(breakpoints.second.is_none());
+    }
+
+    #[test]
+    fn claude_prompt_cache_explicit_builder_preserves_breakpoints() {
+        let breakpoints = ClaudeExplicitCacheBreakpoints::all();
+        let params = Parameters::default()
+            .claude_prompt_cache_explicit(ClaudePromptCacheTtl::OneHour, breakpoints);
+        let cache = params
+            .cache
+            .claude
+            .expect("claude cache should be set by explicit builder");
+        assert_eq!(cache.ttl, ClaudePromptCacheTtl::OneHour);
+        assert_eq!(
+            cache.strategy,
+            ClaudePromptCacheStrategy::Explicit(breakpoints)
+        );
+    }
+
+    #[test]
+    fn claude_explicit_breakpoint_supports_per_block_ttl_override() {
+        let breakpoint = ClaudeExplicitCacheBreakpoint::new(ClaudeCacheBreakpointTarget::Tool(0))
+            .with_ttl(ClaudePromptCacheTtl::OneHour);
+        assert_eq!(breakpoint.ttl, Some(ClaudePromptCacheTtl::OneHour));
+        assert_eq!(
+            breakpoint.effective_ttl(ClaudePromptCacheTtl::FiveMinutes),
+            ClaudePromptCacheTtl::OneHour
+        );
+    }
+
+    #[test]
+    fn claude_prompt_cache_automatic_with_explicit_builder_preserves_breakpoints() {
+        let breakpoints = ClaudeExplicitCacheBreakpoints::messages_only();
+        let params = Parameters::default().claude_prompt_cache_automatic_with_explicit(
+            ClaudePromptCacheTtl::FiveMinutes,
+            breakpoints,
+        );
+        let cache = params
+            .cache
+            .claude
+            .expect("claude cache should be set by combined builder");
+        assert_eq!(
+            cache.strategy,
+            ClaudePromptCacheStrategy::AutomaticAndExplicit(breakpoints)
+        );
     }
 }

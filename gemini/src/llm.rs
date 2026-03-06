@@ -66,7 +66,7 @@ impl LanguageModel for Gemini {
                     tracing::debug!("API did not return context_length: {e}");
                     // Fallback to models database
                     aither_models::lookup(&model_name)
-                        .map(|info| info.context_window)
+                        .and_then(aither_models::ModelEntry::max_input_tokens)
                         .unwrap_or_else(|| {
                             panic!(
                                 "Gemini model '{}' missing context metadata from provider and aither-models",

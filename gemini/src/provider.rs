@@ -74,8 +74,8 @@ impl LanguageModelProvider for GeminiProvider {
                     let context_length = model
                         .input_token_limit
                         .and_then(|value| u32::try_from(value).ok())
-                        .or_else(|| lookup_model_info(&model_id).map(|info| info.context_window))
-                        .or_else(|| lookup_model_info(&model.name).map(|info| info.context_window));
+                        .or_else(|| lookup_model_info(&model_id).and_then(aither_models::ModelEntry::max_input_tokens))
+                        .or_else(|| lookup_model_info(&model.name).and_then(aither_models::ModelEntry::max_input_tokens));
                     let Some(context_length) = context_length else {
                         tracing::warn!(
                             model = %model.name,

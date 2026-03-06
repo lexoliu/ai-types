@@ -450,7 +450,7 @@ impl LanguageModel for OpenAI {
                     tracing::debug!("API did not return context_length: {e}");
                     // Fallback to models database
                     aither_models::lookup(&cfg.chat_model)
-                        .map(|info| info.context_window)
+                        .and_then(aither_models::ModelEntry::max_input_tokens)
                         .unwrap_or_else(|| {
                             panic!(
                                 "OpenAI model '{}' missing context metadata from provider and aither-models",

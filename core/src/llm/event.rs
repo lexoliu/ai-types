@@ -118,7 +118,7 @@ impl Usage {
             *self.cost_usd.get_or_insert(0.0) += v;
         }
         if self.stop_reason.is_none() {
-            self.stop_reason = other.stop_reason.clone();
+            self.stop_reason.clone_from(&other.stop_reason);
         }
     }
 }

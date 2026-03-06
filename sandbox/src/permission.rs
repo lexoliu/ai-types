@@ -113,17 +113,33 @@ impl PermissionHandler for DenyUnsafe {
     }
 }
 
-/// A permission handler that allows everything (for testing).
+/// A no-op permission handler that allows every execution mode and domain.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct AllowAll;
+pub struct NoopPermissionHandler;
 
-impl PermissionHandler for AllowAll {
+impl PermissionHandler for NoopPermissionHandler {
     async fn check(&self, _mode: BashMode, _script: &str) -> Result<bool, PermissionError> {
         Ok(true)
     }
 
     async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
         true
+    }
+}
+
+/// Backward-compatible permission handler alias.
+///
+/// Prefer [`NoopPermissionHandler`] for new code.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllowAll;
+
+impl PermissionHandler for AllowAll {
+    async fn check(&self, mode: BashMode, script: &str) -> Result<bool, PermissionError> {
+        NoopPermissionHandler.check(mode, script).await
+    }
+
+    async fn check_domain(&self, domain: &str, port: u16) -> bool {
+        NoopPermissionHandler.check_domain(domain, port).await
     }
 }
 

@@ -44,6 +44,24 @@ pub struct CompactResult {
     pub summary: String,
 }
 
+#[derive(serde::Serialize)]
+struct SystemReminder {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+#[derive(serde::Serialize)]
+struct Plan {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
+#[derive(serde::Serialize)]
+struct Todo {
+    #[serde(rename = "$text")]
+    content: String,
+}
+
 /// Which model tier to use for the agent's main reasoning loop.
 ///
 /// This allows creating agents that use different capability levels:
@@ -720,7 +738,7 @@ where
 
     /// Clears the conversation history.
     pub fn clear_history(&mut self) {
-        self.context.clear_conversation();
+        self.context.clear_history();
     }
 
     /// Compacts the conversation by generating a structured handoff and starting fresh.
@@ -746,13 +764,9 @@ where
             transcript.write_compact_marker().await;
         }
 
-        self.context.clear_conversation();
-        // Push the handoff summary as a system message in the conversation.
-        // This preserves it as part of the conversation flow.
-        self.context.push(Message::system(&summary));
-        self.context.push(Message::system(
-            "Session continues from compacted context. Continue without asking the user to repeat details. Recover missing details from files, TODO.md/PLAN.md, or transcript when needed.",
-        ));
+        self.context.clear_recent();
+        self.context.clear_reminders();
+        self.context.set_handoff(summary.clone());
 
         Ok(Some(CompactResult {
             messages_compacted,
@@ -932,13 +946,6 @@ where
         if !tool_hints.is_empty() {
             self.context.insert_system_named("tool_hints", &tool_hints);
         }
-
-        // Insert application-provided context blocks (sorted by priority).
-        let mut blocks = self.config.context_blocks.clone();
-        blocks.sort_by_key(|b| b.priority.rank());
-        for block in blocks {
-            self.context.insert_system_named(&block.tag, &block.content);
-        }
     }
 
     /// Builds the message list for an LLM request.
@@ -946,64 +953,45 @@ where
     /// Uses `context.build_messages()` for the stable system prefix + conversation,
     /// then prepends per-turn ephemeral context (todo, working docs, background
     /// jobs, context usage) as system messages inserted before conversation messages.
-    async fn build_request_messages(&self) -> Vec<Message> {
-        // Collect per-turn ephemeral messages that should appear between
-        // the system prefix and the conversation.
-        let mut ephemeral = Vec::new();
+    async fn build_request_messages(&mut self) -> Vec<Message> {
+        self.context.clear_reminders();
 
         if let Some(todo_ctx) = self.format_todo_context() {
-            ephemeral.push(Message::system(todo_ctx));
+            self.context
+                .insert_reminder(&SystemReminder { content: todo_ctx });
         }
 
         if let Some(sandbox_dir) = self.sandbox_dir.as_deref() {
             let docs = working_docs::read_snapshot(sandbox_dir).await;
             if let Some(plan_md) = docs.plan_md {
-                ephemeral.push(Message::system(render_plan_context(&plan_md)));
+                self.context.insert_reminder(&Plan { content: plan_md });
             }
             if let Some(todo_md) = docs.todo_md {
-                ephemeral.push(Message::system(render_working_todo_context(&todo_md)));
+                self.context.insert_reminder(&Todo { content: todo_md });
             }
         }
 
         if let Some(job_registry) = &self.job_registry {
             let running = job_registry.format_running_jobs().await;
             if !running.is_empty() {
-                ephemeral.push(Message::system(format!(
-                    "<system-reminder>\nRunning background terminals:\n{running}Read redirected output files via bash (head/tail/grep/cat). Use input_terminal for stdin and kill_terminal to stop when needed.\n</system-reminder>"
-                )));
+                self.context.insert_reminder(&SystemReminder {
+                    content: format!(
+                        "Running background terminals:\n{running}Read redirected output files via bash (head/tail/grep/cat). Use input_terminal for stdin and kill_terminal to stop when needed."
+                    ),
+                });
             }
         }
 
         // Context usage estimation uses conversation messages
-        let conversation = self.context.conversation_messages();
-        let usage = self.estimate_usage_for_messages(&conversation);
+        let usage = self.estimate_usage_for_messages(self.context.recent());
 
         if let Some(handoff_ctx) = self.format_handoff_context(usage) {
-            ephemeral.push(Message::system(handoff_ctx));
+            self.context.insert_reminder(&SystemReminder {
+                content: handoff_ctx,
+            });
         }
 
-        // Build: system_blocks prefix + ephemeral + conversation
-        let mut messages = Vec::new();
-
-        // System blocks → one system message (cacheable prefix)
-        if self.context.system_block_count() > 0 {
-            let system_xml: String = self
-                .context
-                .system_blocks()
-                .values()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n");
-            messages.push(Message::system(system_xml));
-        }
-
-        // Ephemeral per-turn context (todo, docs, jobs, handoff warning)
-        messages.extend(ephemeral);
-
-        // Conversation messages (includes reminders, handoff, user/assistant/tool)
-        messages.extend(conversation);
-
-        messages
+        self.context.build_messages()
     }
 
     /// Estimates current context usage using the active and fast model windows.
@@ -1047,12 +1035,11 @@ where
             return None;
         }
 
-        let mut note = String::from("<system-reminder>\n");
+        let mut note = String::new();
         note.push_str(&self.config.context_assembler.handoff_instruction);
         if let Some(path) = &self.config.transcript_path {
             note.push_str(&format!(" Transcript source: {path}."));
         }
-        note.push_str("\n</system-reminder>");
         Some(note)
     }
 
@@ -1323,7 +1310,7 @@ where
 
         let items_json = format_todo_items_json(&items);
         Some(format!(
-            "<system-reminder>\nCurrent todo list (do not mention this explicitly to the user):\n\n{items_json}\n</system-reminder>"
+            "Current todo list (do not mention this explicitly to the user):\n\n{items_json}"
         ))
     }
 
@@ -1429,14 +1416,6 @@ where
 /// Formats todo items into the JSON-ish list used in system reminders.
 fn format_todo_items_json(items: &[TodoItem]) -> String {
     serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
-}
-
-fn render_plan_context(content: &str) -> String {
-    format!("<plan>\n{content}</plan>")
-}
-
-fn render_working_todo_context(content: &str) -> String {
-    format!("<todo>\n{content}</todo>")
 }
 
 fn first_paragraph(text: &str) -> String {

@@ -44,10 +44,7 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::hook::Hook;
-use crate::{
-    Agent, AgentBuilder,
-    config::{AgentKind, ContextBlock, ContextBlockPriority},
-};
+use crate::{Agent, AgentBuilder, config::AgentKind};
 use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool};
 use aither_sandbox::{
     BashTool, BashToolFactory, BashToolFactoryReceiver, ContainerExec, ListSshTool, OpenSshTool,
@@ -412,9 +409,15 @@ where
         self
     }
 
-    /// Adds a structured context block.
-    pub fn context_block(mut self, block: ContextBlock) -> Self {
-        self.inner = self.inner.context_block(block);
+    /// Inserts or replaces a typed persistent system block.
+    pub fn system<T: serde::Serialize>(mut self, value: T) -> Self {
+        self.inner = self.inner.system(value);
+        self
+    }
+
+    /// Inserts or replaces a persistent system block with an explicit tag.
+    pub fn system_named(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
+        self.inner = self.inner.system_named(tag, content);
         self
     }
 
@@ -439,10 +442,7 @@ where
             availability.ssh,
             runtime_kind,
         );
-        self.inner = self.inner.context_block(
-            ContextBlock::new("shell_runtime", shell_context)
-                .with_priority(ContextBlockPriority::High),
-        );
+        self.inner = self.inner.system_named("shell_runtime", shell_context);
 
         let host_runtime_context = if host_profile == "container" {
             format!(

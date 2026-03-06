@@ -45,6 +45,16 @@ pub struct Usage {
     /// Number of input tokens read from cache.
     #[serde(default)]
     pub cache_read_input_tokens: Option<u32>,
+    /// Detailed cache creation token counts by TTL.
+    #[serde(default)]
+    pub cache_creation: Option<CacheCreation>,
+}
+
+impl Usage {
+    fn cache_write_tokens(&self) -> Option<u32> {
+        self.cache_creation_input_tokens
+            .or_else(|| self.cache_creation.as_ref().and_then(CacheCreation::total))
+    }
 }
 
 /// Content block start event data.
@@ -151,6 +161,43 @@ pub struct DeltaUsage {
     /// Number of input tokens read from cache.
     #[serde(default)]
     pub cache_read_input_tokens: Option<u32>,
+    /// Detailed cache creation token counts by TTL.
+    #[serde(default)]
+    pub cache_creation: Option<CacheCreation>,
+}
+
+impl DeltaUsage {
+    fn cache_write_tokens(&self) -> Option<u32> {
+        self.cache_creation_input_tokens
+            .or_else(|| self.cache_creation.as_ref().and_then(CacheCreation::total))
+    }
+}
+
+/// Detailed cache creation token counts by TTL.
+#[derive(Debug, Deserialize)]
+pub struct CacheCreation {
+    /// Tokens created with 5-minute TTL.
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: Option<u32>,
+    /// Tokens created with 1-hour TTL.
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: Option<u32>,
+}
+
+impl CacheCreation {
+    fn total(&self) -> Option<u32> {
+        let mut total = 0u32;
+        let mut has_any = false;
+        if let Some(value) = self.ephemeral_5m_input_tokens {
+            total = total.saturating_add(value);
+            has_any = true;
+        }
+        if let Some(value) = self.ephemeral_1h_input_tokens {
+            total = total.saturating_add(value);
+            has_any = true;
+        }
+        has_any.then_some(total)
+    }
 }
 
 /// Parsed tool call from a completed `tool_use` block.
@@ -175,6 +222,8 @@ pub struct StreamState {
     pub stop_reason: Option<String>,
     /// Prompt/input token usage.
     pub prompt_tokens: Option<u32>,
+    /// Uncached input tokens (`usage.input_tokens` from Claude).
+    pub uncached_input_tokens: Option<u32>,
     /// Completion/output token usage.
     pub completion_tokens: Option<u32>,
     /// Prompt cache read token usage.
@@ -242,6 +291,20 @@ impl StreamState {
             stop_reason: self.stop_reason.clone(),
         }))
     }
+
+    fn refresh_prompt_tokens(&mut self) {
+        let mut total = self.uncached_input_tokens.unwrap_or(0);
+        let mut has_any = self.uncached_input_tokens.is_some();
+        if let Some(cache_read) = self.cache_read_tokens {
+            total = total.saturating_add(cache_read);
+            has_any = true;
+        }
+        if let Some(cache_write) = self.cache_write_tokens {
+            total = total.saturating_add(cache_write);
+            has_any = true;
+        }
+        self.prompt_tokens = has_any.then_some(total);
+    }
 }
 
 /// Parse a single SSE event into LLM events.
@@ -259,10 +322,11 @@ pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<Vec<LLMEven
             // Store message metadata if needed
             let ev: MessageStartEvent = serde_json::from_str(data)?;
             if let Some(usage) = ev.message.usage {
-                state.prompt_tokens = Some(usage.input_tokens);
+                state.uncached_input_tokens = Some(usage.input_tokens);
                 state.completion_tokens = Some(usage.output_tokens);
-                state.cache_write_tokens = usage.cache_creation_input_tokens;
+                state.cache_write_tokens = usage.cache_write_tokens();
                 state.cache_read_tokens = usage.cache_read_input_tokens;
+                state.refresh_prompt_tokens();
             }
         }
         "content_block_start" => {
@@ -350,12 +414,13 @@ pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<Vec<LLMEven
                 if let Some(output_tokens) = usage.output_tokens {
                     state.completion_tokens = Some(output_tokens);
                 }
-                if let Some(cache_write_tokens) = usage.cache_creation_input_tokens {
+                if let Some(cache_write_tokens) = usage.cache_write_tokens() {
                     state.cache_write_tokens = Some(cache_write_tokens);
                 }
                 if let Some(cache_read_tokens) = usage.cache_read_input_tokens {
                     state.cache_read_tokens = Some(cache_read_tokens);
                 }
+                state.refresh_prompt_tokens();
             }
         }
         "message_stop" => {
@@ -438,5 +503,24 @@ mod tests {
         state.prompt_tokens = Some(1);
         assert!(state.maybe_usage_event().is_some());
         assert!(state.maybe_usage_event().is_none());
+    }
+
+    #[test]
+    fn cache_creation_total_sums_5m_and_1h_tokens() {
+        let cache_creation = CacheCreation {
+            ephemeral_5m_input_tokens: Some(20),
+            ephemeral_1h_input_tokens: Some(30),
+        };
+        assert_eq!(cache_creation.total(), Some(50));
+    }
+
+    #[test]
+    fn refresh_prompt_tokens_adds_uncached_and_cache_tokens() {
+        let mut state = StreamState::new();
+        state.uncached_input_tokens = Some(40);
+        state.cache_read_tokens = Some(30);
+        state.cache_write_tokens = Some(10);
+        state.refresh_prompt_tokens();
+        assert_eq!(state.prompt_tokens, Some(80));
     }
 }

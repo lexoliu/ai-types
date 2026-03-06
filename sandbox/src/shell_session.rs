@@ -51,6 +51,62 @@ pub(crate) trait ContainerExecObject: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>>;
 }
 
+/// Backend-agnostic container executor handle.
+///
+/// This wraps any [`ContainerExec`] implementation into a cloneable concrete
+/// type that can be passed around without exposing runtime-specific concrete
+/// executor types.
+#[derive(Clone)]
+pub struct ContainerExecHandle {
+    inner: Arc<dyn ContainerExecObject>,
+}
+
+impl std::fmt::Debug for ContainerExecHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContainerExecHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ContainerExecHandle {
+    /// Creates a new handle from a concrete container executor implementation.
+    #[must_use]
+    pub fn new<T>(inner: Arc<T>) -> Self
+    where
+        T: ContainerExec + 'static,
+    {
+        Self { inner }
+    }
+}
+
+impl ContainerExec for ContainerExecHandle {
+    fn exec(
+        &self,
+        container_id: &str,
+        script: &str,
+        working_dir: &str,
+        kill_rx: Receiver<()>,
+        stdin_blocked_notice: Option<Sender<String>>,
+    ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let container_id = container_id.to_string();
+        let script = script.to_string();
+        let working_dir = working_dir.to_string();
+
+        async move {
+            inner
+                .exec_boxed(
+                    &container_id,
+                    &script,
+                    &working_dir,
+                    kill_rx,
+                    stdin_blocked_notice,
+                )
+                .await
+        }
+    }
+}
+
 impl<T: ContainerExec> ContainerExecObject for T {
     fn exec_boxed<'a>(
         &'a self,

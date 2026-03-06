@@ -107,7 +107,7 @@ impl LanguageModel for Copilot {
         async move {
             // Try to get context window from models database
             let context_length = aither_models::lookup(&cfg.model)
-                .map(|info| info.context_window)
+                .and_then(aither_models::ModelEntry::max_input_tokens)
                 .unwrap_or_else(|| {
                     const DEFAULT_CONTEXT_LENGTH: u32 = 8192;
                     tracing::warn!(
