@@ -6,7 +6,7 @@ use aither_core::llm::{Tool, ToolOutput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::job_registry::JobRegistry;
+use crate::job_registry::{JobRegistry, JobStatus};
 
 #[derive(Debug, Clone)]
 pub struct KillTerminalTool {
@@ -106,6 +106,82 @@ impl Tool for InputTerminalTool {
         ToolOutput::json(&serde_json::json!({
             "ok": true,
             "task_id": task_id,
+        }))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadTerminalDeltaTool {
+    registry: JobRegistry,
+}
+
+impl ReadTerminalDeltaTool {
+    #[must_use]
+    pub const fn new(registry: JobRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReadTerminalDeltaArgs {
+    /// Task identifier returned by bash when the task is backgrounded.
+    pub task_id: String,
+    /// Read only bytes after this cursor offset.
+    #[serde(default)]
+    pub cursor: usize,
+    /// Maximum bytes to return in this call.
+    #[serde(default = "default_max_bytes")]
+    pub max_bytes: usize,
+}
+
+const fn default_max_bytes() -> usize {
+    32 * 1024
+}
+
+fn job_status_payload(status: &JobStatus) -> serde_json::Value {
+    match status {
+        JobStatus::Running => serde_json::json!({ "kind": "running" }),
+        JobStatus::Completed { exit_code } => {
+            serde_json::json!({ "kind": "completed", "exit_code": exit_code })
+        }
+        JobStatus::Failed { error } => {
+            serde_json::json!({ "kind": "failed", "error": error })
+        }
+        JobStatus::Killed => serde_json::json!({ "kind": "killed" }),
+    }
+}
+
+impl Tool for ReadTerminalDeltaTool {
+    fn name(&self) -> Cow<'static, str> {
+        "read_terminal_delta".into()
+    }
+
+    type Arguments = ReadTerminalDeltaArgs;
+
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+        let task_id = args.task_id.trim();
+        if task_id.is_empty() {
+            return Err(anyhow::anyhow!("task_id must not be empty"));
+        }
+        if args.max_bytes == 0 {
+            return Err(anyhow::anyhow!("max_bytes must be greater than 0"));
+        }
+
+        let delta = self
+            .registry
+            .read_terminal_delta(task_id, args.cursor, args.max_bytes)
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        ToolOutput::json(&serde_json::json!({
+            "ok": true,
+            "task_id": delta.task_id,
+            "cursor": delta.cursor,
+            "total_bytes": delta.total_bytes,
+            "bytes_read": delta.bytes.len(),
+            "has_more": delta.cursor < delta.total_bytes,
+            "delta": String::from_utf8_lossy(&delta.bytes),
+            "status": job_status_payload(&delta.status),
         }))
     }
 }

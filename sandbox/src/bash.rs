@@ -409,7 +409,7 @@ impl<P, E: Clone, State: Clone> Clone for BashTool<P, E, State> {
 }
 
 impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
-    /// Injects the shared runtime registry used by `bash/open_ssh/list_ssh`.
+    /// Injects the shared runtime registry used by `bash` execution mode resolution.
     #[must_use]
     pub fn with_shell_sessions(mut self, sessions: ShellSessionRegistry) -> Self {
         self.shell_sessions = sessions;

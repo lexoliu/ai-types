@@ -976,7 +976,7 @@ where
             if !running.is_empty() {
                 self.context.insert_reminder(&SystemReminder {
                     content: format!(
-                        "Running background terminals:\n{running}Read redirected output files via bash (head/tail/grep/cat). Use input_terminal for stdin and kill_terminal to stop when needed."
+                        "Running background terminals:\n{running}Use read_terminal_delta for incremental output, read redirected output files via bash (head/tail/grep/cat) when needed, input_terminal for stdin, and kill_terminal to stop tasks."
                     ),
                 });
             }
@@ -1343,7 +1343,7 @@ where
             .unwrap_or("(missing output file)");
 
         Some(format!(
-            "<system-reminder>\nA bash command is running in background (task_id={task_id}).\nCurrent output snapshot (first max_lines):\n{output_preview}\nFull redirected output file: {output_file}\nRead the file via bash when needed. If the command waits for stdin, use input_terminal. Use kill_terminal to stop it.\n</system-reminder>"
+            "<system-reminder>\nA bash command is running in background (task_id={task_id}).\nCurrent output snapshot (first max_lines):\n{output_preview}\nFull redirected output file: {output_file}\nUse read_terminal_delta for incremental reads, read the stored file via bash when needed, use input_terminal for stdin, and kill_terminal to stop it.\n</system-reminder>"
         ))
     }
 

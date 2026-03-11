@@ -85,11 +85,11 @@ pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerRuntimeKind, MountAccess, MountRoot,
     MountRootError, MountSpec, RuntimePreference,
 };
-pub use job_registry::{JobInfo, JobRegistry, JobStatus};
+pub use job_registry::{JobInfo, JobRegistry, JobStatus, TerminalDelta};
 pub use output::{Content, OutputEntry, OutputFormat, OutputStore, PendingUrl};
 pub use permission::{BashMode, PermissionHandler};
 pub use shell_session::{
-    ContainerExec, ContainerExecHandle, ContainerExecOutcome, ListSshTool, OpenSshArgs,
-    OpenSshTool, ShellBackend, ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile,
-    SshServer, SshSessionAuthorizer, bootstrap_ssh_runtime,
+    ContainerExec, ContainerExecHandle, ContainerExecOutcome, ShellBackend,
+    ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile, SshServer,
+    SshSessionAuthorizer, bootstrap_ssh_runtime,
 };

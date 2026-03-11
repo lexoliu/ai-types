@@ -4,7 +4,10 @@ mod ask;
 mod terminal;
 
 pub use ask::AskCommand;
-pub use terminal::{InputTerminalArgs, InputTerminalTool, KillTerminalArgs, KillTerminalTool};
+pub use terminal::{
+    InputTerminalArgs, InputTerminalTool, KillTerminalArgs, KillTerminalTool,
+    ReadTerminalDeltaArgs, ReadTerminalDeltaTool,
+};
 
 use leash::IpcRouter;
 

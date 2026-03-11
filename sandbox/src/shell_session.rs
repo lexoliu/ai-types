@@ -1,12 +1,10 @@
 use std::{
-    borrow::Cow,
     collections::HashSet,
     future::Future,
     pin::Pin,
     sync::{Arc, OnceLock, RwLock},
 };
 
-use aither_core::llm::{Tool, ToolOutput};
 use async_channel::{Receiver, Sender};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -329,78 +327,6 @@ impl ShellSessionRegistry {
 
     pub fn ssh_authorizer(&self) -> Option<Arc<dyn SshSessionAuthorizer>> {
         self.ssh_authorizer.read().ok()?.clone()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ListSshTool {
-    registry: ShellSessionRegistry,
-}
-
-impl ListSshTool {
-    #[must_use]
-    pub const fn new(registry: ShellSessionRegistry) -> Self {
-        Self { registry }
-    }
-}
-
-impl Tool for ListSshTool {
-    fn name(&self) -> Cow<'static, str> {
-        "list_ssh".into()
-    }
-
-    type Arguments = ();
-
-    async fn call(&self, _args: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        let payload = serde_json::json!({
-            "servers": self.registry.list_ssh_servers(),
-        });
-        Ok(ToolOutput::text(payload.to_string()))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct OpenSshArgs {
-    pub ssh_server_id: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct OpenSshTool {
-    registry: ShellSessionRegistry,
-}
-
-impl OpenSshTool {
-    #[must_use]
-    pub const fn new(registry: ShellSessionRegistry) -> Self {
-        Self { registry }
-    }
-}
-
-impl Tool for OpenSshTool {
-    fn name(&self) -> Cow<'static, str> {
-        "open_ssh".into()
-    }
-
-    type Arguments = OpenSshArgs;
-
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        self.registry
-            .ensure_ssh_available()
-            .map_err(anyhow::Error::msg)?;
-        let server = self
-            .registry
-            .resolve_ssh_server(&args.ssh_server_id)
-            .map_err(anyhow::Error::msg)?;
-        let runtime =
-            bootstrap_ssh_runtime(&server.target, &self.registry.ssh_authorizer()).await?;
-        let payload = serde_json::json!({
-            "ssh_server_id": server.id(),
-            "target": server.target,
-            "runtime": match runtime {
-                SshRuntimeProfile::Leash { .. } => "leash",
-            }
-        });
-        Ok(ToolOutput::text(payload.to_string()))
     }
 }
 

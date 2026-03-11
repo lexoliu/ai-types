@@ -51,6 +51,21 @@ pub enum JobStatus {
     Killed,
 }
 
+/// Incremental read result for a background terminal buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalDelta {
+    /// Stable task identifier exposed to the model.
+    pub task_id: String,
+    /// Cursor the caller should pass on the next read.
+    pub cursor: usize,
+    /// Total bytes currently buffered for this task.
+    pub total_bytes: usize,
+    /// Newly read bytes from the terminal buffer.
+    pub bytes: Vec<u8>,
+    /// Current task status at the time of the read.
+    pub status: JobStatus,
+}
+
 /// Sender used by the registry to push bytes into a running process stdin.
 pub type TerminalInputSender = Sender<Vec<u8>>;
 
@@ -142,6 +157,12 @@ enum JobCommand {
     TerminalOutput {
         pid: u32,
         reply: Sender<Option<(Vec<u8>, Vec<u8>)>>,
+    },
+    ReadTerminalDelta {
+        task_id: String,
+        cursor: usize,
+        max_bytes: usize,
+        reply: Sender<Result<TerminalDelta, String>>,
     },
     TerminalStreamsClosed {
         pid: u32,
@@ -321,6 +342,29 @@ impl JobRegistry {
         self.tx
             .send(JobCommand::TerminalOutput {
                 pid,
+                reply: reply_tx,
+            })
+            .await
+            .expect("job registry service unavailable");
+        reply_rx
+            .recv()
+            .await
+            .expect("job registry response dropped")
+    }
+
+    /// Returns terminal output added since the provided cursor.
+    pub async fn read_terminal_delta(
+        &self,
+        task_id: &str,
+        cursor: usize,
+        max_bytes: usize,
+    ) -> Result<TerminalDelta, String> {
+        let (reply_tx, reply_rx) = async_channel::bounded(1);
+        self.tx
+            .send(JobCommand::ReadTerminalDelta {
+                task_id: task_id.to_string(),
+                cursor,
+                max_bytes,
                 reply: reply_tx,
             })
             .await
@@ -724,6 +768,23 @@ impl JobRegistryService {
                         .map(|job| (job.stdout_buffer.clone(), job.stderr_buffer.clone()));
                     let _ = reply.send(output).await;
                 }
+                JobCommand::ReadTerminalDelta {
+                    task_id,
+                    cursor,
+                    max_bytes,
+                    reply,
+                } => {
+                    let result = if let Some(pid) = find_pid_by_task_id(&jobs, &task_id) {
+                        if let Some(job) = jobs.get(&pid) {
+                            read_terminal_delta(job, cursor, max_bytes)
+                        } else {
+                            Err(format!("unknown task_id: {task_id}"))
+                        }
+                    } else {
+                        Err(format!("unknown task_id: {task_id}"))
+                    };
+                    let _ = reply.send(result).await;
+                }
                 JobCommand::TerminalStreamsClosed { pid, reply } => {
                     let closed = jobs
                         .get(&pid)
@@ -946,6 +1007,28 @@ fn format_running_jobs(jobs: &HashMap<u32, JobState>) -> String {
     output
 }
 
+fn read_terminal_delta(
+    job: &JobState,
+    cursor: usize,
+    max_bytes: usize,
+) -> Result<TerminalDelta, String> {
+    let total_bytes = job.terminal_buffer.len();
+    if cursor > total_bytes {
+        return Err(format!(
+            "cursor {cursor} exceeds terminal buffer size {total_bytes} for task {}",
+            job.info.task_id
+        ));
+    }
+    let end = total_bytes.min(cursor.saturating_add(max_bytes));
+    Ok(TerminalDelta {
+        task_id: job.info.task_id.clone(),
+        cursor: end,
+        total_bytes,
+        bytes: job.terminal_buffer[cursor..end].to_vec(),
+        status: job.info.status.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,6 +1127,44 @@ mod tests {
             String::from_utf8_lossy(&redirected),
             "line1\nline2\nline3\n"
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_terminal_delta_reads_incrementally() {
+        let (registry, service) = job_registry_channel();
+        TokioGlobal
+            .spawn(async move { service.serve().await })
+            .detach();
+
+        registry
+            .register(
+                202,
+                "task-delta",
+                "exec-delta",
+                "tail -f log",
+                BashMode::Network,
+                None,
+            )
+            .await;
+        registry.append_stdout(202, b"hello ".to_vec()).await;
+        registry.append_stderr(202, b"world".to_vec()).await;
+
+        let first = registry
+            .read_terminal_delta("task-delta", 0, 6)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&first.bytes), "hello ");
+        assert_eq!(first.cursor, 6);
+        assert_eq!(first.total_bytes, 11);
+        assert!(matches!(first.status, JobStatus::Running));
+
+        let second = registry
+            .read_terminal_delta("task-delta", first.cursor, 32)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&second.bytes), "world");
+        assert_eq!(second.cursor, 11);
+        assert_eq!(second.total_bytes, 11);
     }
 
     #[tokio::test]

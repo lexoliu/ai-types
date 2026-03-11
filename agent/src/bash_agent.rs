@@ -45,11 +45,11 @@ use serde::de::DeserializeOwned;
 
 use crate::hook::Hook;
 use crate::{Agent, AgentBuilder, config::AgentKind};
-use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool};
+use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool, ReadTerminalDeltaTool};
 use aither_sandbox::{
-    BashTool, BashToolFactory, BashToolFactoryReceiver, ContainerExec, ListSshTool, OpenSshTool,
-    PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, SshServer,
-    SshSessionAuthorizer, ToolRegistryBuilder, Unconfigured, bash_tool_factory_channel,
+    BashTool, BashToolFactory, BashToolFactoryReceiver, ContainerExec, PermissionHandler,
+    ShellRuntimeAvailability, ShellSessionRegistry, SshServer, SshSessionAuthorizer,
+    ToolRegistryBuilder, Unconfigured, bash_tool_factory_channel,
 };
 
 /// System prompt template for bash-centric agents.
@@ -135,8 +135,8 @@ where
 {
     /// Creates a new bash-centric agent builder.
     ///
-    /// Creates the agent with native tools (`open_ssh`, `list_ssh`, `kill_terminal`,
-    /// `input_terminal`, `bash`) and IPC commands accessible through
+    /// Creates the agent with native tools (`kill_terminal`, `input_terminal`,
+    /// `read_terminal_delta`, `bash`) and IPC commands accessible through
     /// bash (registered via `.tool()`).
     pub fn new(llm: LLM, mut bash_tool: BashTool<P, E, Unconfigured>) -> Self {
         let (bash_tool_factory, bash_tool_factory_receiver) = bash_tool_factory_channel();
@@ -149,14 +149,12 @@ where
             ssh: false,
         });
 
-        let open_ssh = OpenSshTool::new(shell_sessions.clone());
-        let list_ssh = ListSshTool::new(shell_sessions.clone());
         let job_registry = bash_tool.job_registry();
         let kill_terminal_tool = KillTerminalTool::new(job_registry.clone());
-        let input_terminal_tool = InputTerminalTool::new(job_registry);
+        let input_terminal_tool = InputTerminalTool::new(job_registry.clone());
+        let read_terminal_delta_tool = ReadTerminalDeltaTool::new(job_registry);
         bash_tool = bash_tool.with_shell_sessions(shell_sessions.clone());
 
-        // SSH management tools are native LLM tool calls (not bash IPC commands).
         let kill_def = ToolDefinition::new(&kill_terminal_tool);
         tool_descriptions.push((
             kill_def.name().to_string(),
@@ -167,12 +165,16 @@ where
             input_def.name().to_string(),
             short_description(input_def.description()),
         ));
+        let read_delta_def = ToolDefinition::new(&read_terminal_delta_tool);
+        tool_descriptions.push((
+            read_delta_def.name().to_string(),
+            short_description(read_delta_def.description()),
+        ));
 
         let inner = AgentBuilder::new(llm)
-            .tool(open_ssh)
-            .tool(list_ssh)
             .tool(kill_terminal_tool)
-            .tool(input_terminal_tool);
+            .tool(input_terminal_tool)
+            .tool(read_terminal_delta_tool);
 
         Self {
             inner,
@@ -444,15 +446,16 @@ where
         );
         self.inner = self.inner.system_named("shell_runtime", shell_context);
 
+        let ssh_context = describe_ssh_servers(&self.shell_sessions.list_ssh_servers());
         let host_runtime_context = if host_profile == "container" {
             format!(
-                "Linux container runtime. Default mode has network enabled. You may install dependencies freely. SSH available: {}.",
-                availability.ssh
+                "Linux container runtime. Default mode has network enabled. You may install dependencies freely. SSH available: {}. {}",
+                availability.ssh, ssh_context
             )
         } else {
             format!(
-                "User machine runtime in sandbox. Default mode has network enabled. Use unsafe for host-level side effects. SSH available: {}.",
-                availability.ssh
+                "User machine runtime in sandbox. Default mode has network enabled. Use unsafe for host-level side effects. SSH available: {}. {}",
+                availability.ssh, ssh_context
             )
         };
 
@@ -701,7 +704,7 @@ where
 
     /// Builds the agent.
     ///
-    /// The returned agent only has the `bash` tool.
+    /// The returned agent exposes `bash` plus native terminal control tools.
     /// All registered IPC tools are accessible as bash commands.
     pub fn build(self) -> Agent<LLM, LLM, LLM, H> {
         // Build registry
@@ -727,6 +730,19 @@ fn short_description(description: &str) -> String {
         .unwrap_or(description)
         .trim()
         .to_string()
+}
+
+fn describe_ssh_servers(servers: &[SshServer]) -> String {
+    if servers.is_empty() {
+        "No SSH servers are configured.".to_string()
+    } else {
+        let listings = servers
+            .iter()
+            .map(|server| format!("{} ({})", server.id(), server.target))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Configured SSH servers: {listings}.")
+    }
 }
 
 /// Returns (`os_name`, `os_version`) for the current system.
