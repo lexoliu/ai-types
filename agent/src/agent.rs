@@ -1309,13 +1309,13 @@ where
     /// 2. Lets the fast LLM decide which URLs to reference in the summary
     /// 3. Only writes files for URLs actually referenced in the summary
     async fn maybe_compress(&mut self) -> Result<(), AgentError> {
+        self.ensure_initialized().await;
         let snapshot = self.assemble_context_window().await;
 
         match &self.config.context {
             ContextStrategy::Unlimited => Ok(()),
             ContextStrategy::Smart(config) => {
-                // Use effective_trigger which reserves context for compaction process.
-                if snapshot.metrics.usage_fraction >= config.effective_trigger() {
+                if snapshot.phase == ContextWindowPhase::CompressionDue {
                     let preserve_recent = config.preserve_recent;
                     if self.context.len_recent() > preserve_recent {
                         let _ = self.compact(None).await?;
@@ -1579,6 +1579,34 @@ mod tests {
 
             assert_eq!(snapshot.phase, ContextWindowPhase::HandoffActive);
             assert!(snapshot.metrics.has_handoff);
+        });
+    }
+
+    #[test]
+    fn handoff_due_does_not_trigger_automatic_compaction() {
+        futures_lite::future::block_on(async {
+            let mut config = AgentConfig::default();
+            config.system_prompt = Some("x".repeat(120));
+            config.context = ContextStrategy::Smart(SmartCompressionConfig {
+                trigger_threshold: 0.2,
+                emergency_threshold: 0.9,
+                preserve_recent: 0,
+                preserve: PreserveConfig::default(),
+                level: CompressionLevel::Standard,
+            });
+            config.context_assembler.handoff_threshold = 0.1;
+
+            let mut agent = Agent::with_config(MockLlm { context_length: 100 }, config);
+            agent.push_message(Message::user("hello"));
+
+            let before_recent = agent.context().len_recent();
+            agent
+                .maybe_compress()
+                .await
+                .unwrap_or_else(|error| panic!("handoff_due must not compact automatically: {error}"));
+
+            assert_eq!(agent.context().len_recent(), before_recent);
+            assert!(agent.context().handoff().is_none());
         });
     }
 }
