@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use aither_core::llm::Message;
 
+#[derive(Serialize)]
+struct TextBlock<'a> {
+    #[serde(rename = "$text")]
+    content: &'a str,
+}
+
 /// The entire context window state. Fully serializable for persistence.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Context {
@@ -53,7 +59,7 @@ impl Context {
     pub fn insert_system_named(&mut self, tag: impl Into<String>, content: impl Into<String>) {
         let tag = tag.into();
         let content = content.into();
-        let xml = format!("<{tag}>\n{content}\n</{tag}>");
+        let xml = serialize_xml(&tag, &TextBlock { content: &content });
         self.system_blocks.insert(tag, xml);
     }
 
@@ -116,7 +122,8 @@ impl Context {
 
     /// Sets or replaces the compaction handoff document.
     pub fn set_handoff(&mut self, handoff: impl Into<String>) {
-        self.handoff = Some(handoff.into());
+        let handoff = handoff.into();
+        self.handoff = Some(serialize_xml("handoff", &TextBlock { content: &handoff }));
     }
 
     /// Clears the compaction handoff document.
@@ -295,7 +302,7 @@ fn snake_case_type_name<T>() -> String {
     heck::AsSnakeCase(short).to_string()
 }
 
-fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> String {
+pub(crate) fn serialize_xml<T: Serialize>(tag: &str, value: &T) -> String {
     let mut buffer = String::new();
     let serializer = quick_xml::se::Serializer::with_root(&mut buffer, Some(tag))
         .unwrap_or_else(|error| panic!("failed to create XML serializer for tag '{tag}': {error}"));
@@ -388,7 +395,7 @@ mod tests {
         context.insert_reminder(&Reminder {
             content: "todo".to_string(),
         });
-        context.set_handoff("<handoff>summary</handoff>");
+        context.set_handoff("summary");
         context.push(Message::user("hello"));
 
         let messages = context.build_messages();
@@ -408,7 +415,7 @@ mod tests {
         context.insert_reminder(&Reminder {
             content: "ephemeral".to_string(),
         });
-        context.set_handoff("<handoff>summary</handoff>");
+        context.set_handoff("summary");
         context.push(Message::assistant("recent"));
 
         context.clear_history();
@@ -425,7 +432,7 @@ mod tests {
         context.insert_reminder(&Reminder {
             content: "before".to_string(),
         });
-        context.set_handoff("<handoff>before</handoff>");
+        context.set_handoff("before");
         context.push(Message::user("first"));
 
         let checkpoint = context.checkpoint();
@@ -453,7 +460,7 @@ mod tests {
         context.insert_reminder(&Reminder {
             content: "ephemeral".to_string(),
         });
-        context.set_handoff("<handoff>summary</handoff>");
+        context.set_handoff("summary");
         context.push(Message::user("hello"));
         context.push(Message::assistant("world"));
 

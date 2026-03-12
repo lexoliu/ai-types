@@ -18,7 +18,7 @@ use futures_lite::StreamExt;
 use crate::{
     compression::{ContextStrategy, estimate_context_usage},
     config::{AgentConfig, AgentKind},
-    context::Context,
+    context::{Context, serialize_xml},
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
     event::AgentEvent,
@@ -90,6 +90,21 @@ struct NextTaskReminderTemplate<'a> {
 #[template(path = "all_tasks_complete_reminder.txt", escape = "none")]
 struct AllTasksCompleteReminderTemplate<'a> {
     completed_task: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct BackgroundBashResultXml {
+    #[serde(rename = "@task_id")]
+    task_id: String,
+    script: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stderr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 /// Which model tier to use for the agent's main reasoning loop.
@@ -374,7 +389,7 @@ where
                                 }
                                 Ok(Event::ToolCall(call)) => tool_calls.push(call),
                                 Ok(Event::BuiltInToolResult { tool, result }) => {
-                                    let formatted = format!("[{tool}] {result}");
+                                    let formatted = format_builtin_tool_result(&tool, &result);
                                     yield AgentEvent::Text(formatted.clone());
                                     text_chunks.push(formatted);
                                 }
@@ -410,7 +425,7 @@ where
                                 }
                                 Ok(Event::ToolCall(call)) => tool_calls.push(call),
                                 Ok(Event::BuiltInToolResult { tool, result }) => {
-                                    let formatted = format!("[{tool}] {result}");
+                                    let formatted = format_builtin_tool_result(&tool, &result);
                                     yield AgentEvent::Text(formatted.clone());
                                     text_chunks.push(formatted);
                                 }
@@ -446,7 +461,7 @@ where
                                 }
                                 Ok(Event::ToolCall(call)) => tool_calls.push(call),
                                 Ok(Event::BuiltInToolResult { tool, result }) => {
-                                    let formatted = format!("[{tool}] {result}");
+                                    let formatted = format_builtin_tool_result(&tool, &result);
                                     yield AgentEvent::Text(formatted.clone());
                                     text_chunks.push(formatted);
                                 }
@@ -582,7 +597,7 @@ where
                                 }
                             }
                             PostToolAction::Keep => result
-                                .map_err(|e| format!("Error: {e}")),
+                                .map_err(|e| ["Error: ", e.to_string().as_str()].concat()),
                         };
 
                         Ok((call.id.clone(), call.name.clone(), tool_result))
@@ -808,7 +823,7 @@ where
     /// Generates a structured handoff summary using the current tier model.
     async fn generate_handoff_summary(&self, focus: Option<&str>) -> Result<String, AgentError> {
         let focus_instruction = match focus.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(f) => format!("Focus the handoff on: {f}"),
+            Some(f) => ["Focus the handoff on: ", f].concat(),
             None => "No additional focus hint was provided.".to_string(),
         };
 
@@ -835,7 +850,7 @@ where
                     match event {
                         Ok(Event::Text(text)) => chunks.push(text),
                         Ok(Event::BuiltInToolResult { tool, result }) => {
-                            chunks.push(format!("[{tool}] {result}"));
+                            chunks.push(format_builtin_tool_result(&tool, &result));
                         }
                         Ok(_) => {}
                         Err(e) => return Err(AgentError::Llm(e.to_string())),
@@ -849,7 +864,7 @@ where
                     match event {
                         Ok(Event::Text(text)) => chunks.push(text),
                         Ok(Event::BuiltInToolResult { tool, result }) => {
-                            chunks.push(format!("[{tool}] {result}"));
+                            chunks.push(format_builtin_tool_result(&tool, &result));
                         }
                         Ok(_) => {}
                         Err(e) => return Err(AgentError::Llm(e.to_string())),
@@ -863,7 +878,7 @@ where
                     match event {
                         Ok(Event::Text(text)) => chunks.push(text),
                         Ok(Event::BuiltInToolResult { tool, result }) => {
-                            chunks.push(format!("[{tool}] {result}"));
+                            chunks.push(format_builtin_tool_result(&tool, &result));
                         }
                         Ok(_) => {}
                         Err(e) => return Err(AgentError::Llm(e.to_string())),
@@ -892,9 +907,9 @@ where
             return false;
         }
 
-        self.context.push(Message::system(
-            "<system-reminder>tasks.md still has unchecked items. Continue working through the checklist. If user input is required, call ask_user and then proceed.</system-reminder>",
-        ));
+        self.context.insert_reminder(&SystemReminder {
+            content: "tasks.md still has unchecked items. Continue working through the checklist. If user input is required, call ask_user and then proceed.".to_string(),
+        });
         true
     }
 
@@ -1136,7 +1151,7 @@ where
         let mut note = String::new();
         note.push_str(&self.config.context_assembler.handoff_instruction);
         if let Some(path) = &self.config.transcript_path {
-            note.push_str(&format!(" Transcript source: {path}."));
+            note.push_str([" Transcript source: ", path, "."].concat().as_str());
         }
         Some(note)
     }
@@ -1150,7 +1165,7 @@ where
             if desc.is_empty() {
                 continue;
             }
-            lines.push(format!("{}: {}", def.name(), desc));
+            lines.push([def.name().as_ref(), ": ", desc.as_str()].concat());
         }
 
         lines.join("\n")
@@ -1193,7 +1208,7 @@ where
                             Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
                             Ok(Event::ToolCall(call)) => tool_calls.push(call),
                             Ok(Event::BuiltInToolResult { tool, result }) => {
-                                let formatted = format!("[{tool}] {result}");
+                                let formatted = format_builtin_tool_result(&tool, &result);
                                 events.push(Ok(AgentEvent::Text(formatted.clone())));
                                 text_chunks.push(formatted);
                             }
@@ -1218,7 +1233,7 @@ where
                             Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
                             Ok(Event::ToolCall(call)) => tool_calls.push(call),
                             Ok(Event::BuiltInToolResult { tool, result }) => {
-                                let formatted = format!("[{tool}] {result}");
+                                let formatted = format_builtin_tool_result(&tool, &result);
                                 events.push(Ok(AgentEvent::Text(formatted.clone())));
                                 text_chunks.push(formatted);
                             }
@@ -1243,7 +1258,7 @@ where
                             Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
                             Ok(Event::ToolCall(call)) => tool_calls.push(call),
                             Ok(Event::BuiltInToolResult { tool, result }) => {
-                                let formatted = format!("[{tool}] {result}");
+                                let formatted = format_builtin_tool_result(&tool, &result);
                                 events.push(Ok(AgentEvent::Text(formatted.clone())));
                                 text_chunks.push(formatted);
                             }
@@ -1289,7 +1304,7 @@ where
                         .call(&call.name, &args_json)
                         .await
                         .map(|output| output.as_str().unwrap_or("").to_string())
-                        .map_err(|e| format!("Error: {e}"));
+                        .map_err(|e| ["Error: ", e.to_string().as_str()].concat());
                     (call.id.clone(), call.name.clone(), result)
                 }
             });
@@ -1440,43 +1455,35 @@ where
 
     /// Formats a completed background task result as a system message.
     fn format_background_task_result(&self, task: &aither_sandbox::CompletedTask) -> String {
-        let mut msg = format!(
-            "<background-bash-result task_id=\"{}\">\nScript: {}\n",
-            task.task_id,
-            truncate_script(&task.script, 100)
-        );
+        let mut xml = BackgroundBashResultXml {
+            task_id: task.task_id.clone(),
+            script: truncate_script(&task.script, 100).to_string(),
+            exit_code: None,
+            output: None,
+            stderr: None,
+            error: None,
+        };
 
         match &task.result {
             Ok(result) => {
-                msg.push_str(&format!("Exit code: {}\n", result.exit_code));
-                // Format stdout
-                let stdout_str = result.stdout.to_string();
-                if !stdout_str.is_empty() {
-                    msg.push_str("Output:\n");
-                    msg.push_str(&stdout_str);
-                    if !stdout_str.ends_with('\n') {
-                        msg.push('\n');
-                    }
+                xml.exit_code = Some(result.exit_code);
+                let stdout = result.stdout.to_string();
+                if !stdout.is_empty() {
+                    xml.output = Some(stdout);
                 }
-                // Format stderr if present
-                if let Some(ref stderr) = result.stderr {
-                    let stderr_str = stderr.to_string();
-                    if !stderr_str.is_empty() {
-                        msg.push_str("Stderr:\n");
-                        msg.push_str(&stderr_str);
-                        if !stderr_str.ends_with('\n') {
-                            msg.push('\n');
-                        }
+                if let Some(stderr) = &result.stderr {
+                    let stderr = stderr.to_string();
+                    if !stderr.is_empty() {
+                        xml.stderr = Some(stderr);
                     }
                 }
             }
-            Err(e) => {
-                msg.push_str(&format!("Error: {e}\n"));
+            Err(error) => {
+                xml.error = Some(error.to_string());
             }
         }
 
-        msg.push_str("</background-bash-result>");
-        msg
+        serialize_xml("background-bash-result", &xml)
     }
 
     /// Generates a reminder about the next task after a task was completed.
@@ -1510,6 +1517,10 @@ where
 /// Formats todo items into the JSON-ish list used in system reminders.
 fn format_todo_items_json(items: &[TodoItem]) -> String {
     serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn format_builtin_tool_result(tool: &str, result: &str) -> String {
+    ["[", tool, "] ", result].concat()
 }
 
 fn first_paragraph(text: &str) -> String {
@@ -1617,9 +1628,7 @@ mod tests {
             let mut agent = Agent::new(MockLlm {
                 context_length: 1_000,
             });
-            agent
-                .context_mut()
-                .set_handoff("<handoff>resume here</handoff>");
+            agent.context_mut().set_handoff("resume here");
 
             let snapshot = agent.snapshot_context_window().await;
 
