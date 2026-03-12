@@ -11,6 +11,7 @@ use aither_core::{
     LanguageModel,
     llm::{Event, LLMRequest, Message, model::Profile as ModelProfile},
 };
+use askama::Template;
 use futures_core::Stream;
 use futures_lite::StreamExt;
 
@@ -55,6 +56,40 @@ struct SystemReminder {
 struct Tasks {
     #[serde(rename = "$text")]
     content: String,
+}
+
+#[derive(Template)]
+#[template(path = "todo_reminder.txt", escape = "none")]
+struct TodoReminderTemplate<'a> {
+    items_json: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "todo_context.txt", escape = "none")]
+struct TodoContextTemplate<'a> {
+    items_json: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "background_started_reminder.txt", escape = "none")]
+struct BackgroundStartedReminderTemplate<'a> {
+    task_id: &'a str,
+    output_preview: &'a str,
+    output_file: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "next_task_reminder.txt", escape = "none")]
+struct NextTaskReminderTemplate<'a> {
+    completed_task: &'a str,
+    next_task: &'a str,
+    active_form: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "all_tasks_complete_reminder.txt", escape = "none")]
+struct AllTasksCompleteReminderTemplate<'a> {
+    completed_task: &'a str,
 }
 
 /// Which model tier to use for the agent's main reasoning loop.
@@ -1343,9 +1378,11 @@ where
             return None;
         }
         let items_json = format_todo_items_json(&items);
-        Some(format!(
-            "<system-reminder>\nYour todo list has changed. DO NOT mention this explicitly to the user. Here are the latest contents of your todo list:\n\n{items_json}. Continue on with the tasks at hand if applicable.\n</system-reminder>"
-        ))
+        TodoReminderTemplate {
+            items_json: &items_json,
+        }
+        .render()
+        .ok()
     }
 
     /// Formats the current todo list for context injection before each request.
@@ -1357,9 +1394,11 @@ where
         }
 
         let items_json = format_todo_items_json(&items);
-        Some(format!(
-            "Current todo list (do not mention this explicitly to the user):\n\n{items_json}"
-        ))
+        TodoContextTemplate {
+            items_json: &items_json,
+        }
+        .render()
+        .ok()
     }
 
     /// Formats a reminder when `bash` has been auto-promoted to background.
@@ -1390,9 +1429,13 @@ where
             .and_then(serde_json::Value::as_str)
             .unwrap_or("(missing output file)");
 
-        Some(format!(
-            "<system-reminder>\nA bash command is running in background (task_id={task_id}).\nCurrent output snapshot (first max_lines):\n{output_preview}\nFull redirected output file: {output_file}\nUse read_terminal_delta for incremental reads, read the stored file via bash when needed, use input_terminal for stdin, and kill_terminal to stop it.\n</system-reminder>"
-        ))
+        BackgroundStartedReminderTemplate {
+            task_id,
+            output_preview,
+            output_file,
+        }
+        .render()
+        .ok()
     }
 
     /// Formats a completed background task result as a system message.
@@ -1447,14 +1490,17 @@ where
             .find(|item| matches!(item.status, TodoStatus::Pending | TodoStatus::InProgress));
 
         if let Some(task) = next_task {
-            Some(format!(
-                "<system-reminder>\nTask \"{}\" completed. Next task: {} ({})\n</system-reminder>",
-                completed_task, task.content, task.active_form
-            ))
+            NextTaskReminderTemplate {
+                completed_task,
+                next_task: &task.content,
+                active_form: &task.active_form,
+            }
+            .render()
+            .ok()
         } else if items.iter().all(|i| i.status == TodoStatus::Completed) {
-            Some(format!(
-                "<system-reminder>\nTask \"{completed_task}\" completed. All tasks in the todo list are now complete!\n</system-reminder>"
-            ))
+            AllTasksCompleteReminderTemplate { completed_task }
+                .render()
+                .ok()
         } else {
             None
         }
