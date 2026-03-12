@@ -270,6 +270,14 @@ impl Context {
         self.handoff = checkpoint.handoff;
         self.recent = checkpoint.recent;
     }
+
+    /// Restores runtime-managed state from another serialized context while
+    /// preserving the current persistent system blocks.
+    pub fn restore_runtime_state(&mut self, restored: Self) {
+        self.reminders = restored.reminders;
+        self.handoff = restored.handoff;
+        self.recent = restored.recent;
+    }
 }
 
 /// A snapshot of non-persistent context state that can be restored.
@@ -449,6 +457,33 @@ mod tests {
         assert!(context.handoff().is_some());
         assert_eq!(context.len_recent(), 1);
         assert_eq!(context.recent()[0].content(), "first");
+    }
+
+    #[test]
+    fn restore_runtime_state_preserves_system_blocks() {
+        let mut current = Context::new();
+        current.insert_system(&Memory {
+            content: "fresh".to_string(),
+        });
+
+        let mut restored = Context::new();
+        restored.insert_system(&Memory {
+            content: "stale".to_string(),
+        });
+        restored.insert_reminder(&Reminder {
+            content: "ephemeral".to_string(),
+        });
+        restored.set_handoff("summary");
+        restored.push(Message::user("hello"));
+
+        current.restore_runtime_state(restored);
+
+        let messages = current.build_messages();
+        assert!(messages[0].content().contains("fresh"));
+        assert!(!messages[0].content().contains("stale"));
+        assert_eq!(current.reminders().len(), 1);
+        assert!(current.handoff().is_some());
+        assert_eq!(current.len_recent(), 1);
     }
 
     #[test]

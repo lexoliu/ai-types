@@ -940,7 +940,8 @@ where
 
     /// Restore the full agent context from a serialized snapshot.
     pub fn restore_context_json(&mut self, context_json: &str) -> Result<(), serde_json::Error> {
-        self.context = serde_json::from_str(context_json)?;
+        let restored: Context = serde_json::from_str(context_json)?;
+        self.context.restore_runtime_state(restored);
         Ok(())
     }
 
