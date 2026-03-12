@@ -162,7 +162,7 @@ impl TodoList {
 /// Manage an in-memory structured task list for tracking progress on complex work.
 ///
 /// This tool only updates runtime task state shown in UI/context.
-/// It does NOT create or edit TODO.md files on disk.
+/// It does NOT create or edit tasks.md on disk.
 ///
 /// Use proactively when tasks require 3+ steps, involve multiple files,
 /// or need careful organization. Updates replace the entire list.

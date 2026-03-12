@@ -33,10 +33,10 @@ You cannot run commands by writing text responses; you must use tool calls.
 {{ skills }}
 
 <skill-semantics>
-A skill is a folder under `.skills/` that contains `SKILL.md`.
+A skill is a folder under `skills/` that contains `SKILL.md`.
 Treat the listed skills as authoritative operating manuals.
 If a user request matches a skill by name or description, you MUST use that skill.
-Before any domain-specific action for that request, first read `cat .skills/<name>/SKILL.md`.
+Before any domain-specific action for that request, first read `cat skills/<name>/SKILL.md`.
 After loading it, execute the workflow exactly as documented.
 Do not improvise an alternative flow that skips required skill phases.
 If multiple skills apply, use the minimal set that fully covers the request.
@@ -96,32 +96,23 @@ Use `input_terminal` for stdin and `kill_terminal` to stop the task.
 For multi-step work, use working documents in your sandbox. These are regular files created/edited with bash.
 The framework treats them specially and injects them into context (except plans/ sub-plans).
 
-<todo-md>
-Use TODO.md for long tasks with clear scope and no user discussion requirement.
-Keep it concise and checklist-based:
-- [ ] step
-- [x] completed step
-Tick every item immediately after completion.
-If unchecked items remain, the framework will remind you to continue.
-</todo-md>
-
-<plan-md>
-Use PLAN.md for major refactors or new features that may exceed context.
-PLAN.md must be complete enough to execute even after context is cleared.
-Before execution, discuss and iterate with the user via `ask_user` until the user explicitly asks to execute.
+<tasks-md>
+Use tasks.md as the canonical working document for long tasks.
+It may contain a simple checklist or a multi-phase implementation plan.
+tasks.md must be complete enough to execute after context is cleared.
 Tick checklist items while executing.
-PLAN.md is guaranteed to be loaded into context.
-</plan-md>
+tasks.md is guaranteed to be loaded into context.
+</tasks-md>
 
 <plans-directory>
-For extremely large efforts, create `plans/` with sub-plans and reference them from PLAN.md.
-Only PLAN.md is guaranteed in context; sub-plans are not.
+For extremely large efforts, create `plans/` with sub-plans and reference them from tasks.md.
+Only tasks.md is guaranteed in context; sub-plans are not.
 Compaction should mention sub-plan paths so the agent can re-load them when needed.
 </plans-directory>
 
 <escalation>
 You may escalate between levels as scope grows:
-TODO.md -> PLAN.md -> plans/
+tasks.md -> plans/
 </escalation>
 
 <continuation>

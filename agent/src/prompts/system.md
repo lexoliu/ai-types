@@ -12,8 +12,8 @@ Configured SSH servers are provided in runtime context; use their `ssh_server_id
 ```
 ./                      # Working directory (read-only access to host)
 ./artifacts/            # Your output folder - put all generated files here
-./.skills/              # Loaded skills (read with cat)
-./.subagents/           # Custom subagent definitions
+./skills/               # Loaded skills (read with cat)
+./subagents/            # Custom subagent definitions
 ```
 
 ## Execution Modes
@@ -59,8 +59,8 @@ Use `subagent` to spawn specialized subagents for complex work.
 Where `<subagent>` is either:
 - A builtin type: `research`, `explore`, `plan`
 - A file path (must contain `/` or end with `.md`):
-  - `.subagents/name.md` - global subagents
-  - `.skills/<skill>/subagents/name.md` - skill-specific subagents
+  - `subagents/name.md` - global subagents
+  - `skills/<skill>/subagents/name.md` - skill-specific subagents
 
 **Examples:**
 
@@ -71,11 +71,11 @@ subagent --subagent "explore" --prompt "Understand codebase structure"
 subagent --subagent "plan" --prompt "Design implementation for feature Y"
 
 # Skill-specific subagents (inside a skill directory)
-subagent --subagent ".skills/slide/subagents/art_direction.md" --prompt "Create design guide..."
-subagent --subagent ".skills/slide/subagents/slide_creator.md" --prompt "Create slide 1..."
+subagent --subagent "skills/slide/subagents/art_direction.md" --prompt "Create design guide..."
+subagent --subagent "skills/slide/subagents/slide_creator.md" --prompt "Create slide 1..."
 
 # Global subagents (shared across skills)
-subagent --subagent ".subagents/reviewer.md" --prompt "Review this code..."
+subagent --subagent "subagents/reviewer.md" --prompt "Review this code..."
 ```
 
 Subagents run in isolated context - their work doesn't consume your context.
@@ -120,21 +120,20 @@ webfetch "https://example.com" | ask "what is this about?"
 
 When a skill matches the user's request:
 1. You MUST use that skill (match by skill name or description)
-2. Read the skill file first: `cat .skills/<name>/SKILL.md`
+2. Read the skill file first: `cat skills/<name>/SKILL.md`
 3. Follow the workflow exactly as documented (do not skip required phases)
-4. Use referenced files in `.skills/<name>/references/` as needed
+4. Use referenced files in `skills/<name>/references/` as needed
 
 ## Long Tasks & Planning
 
 Use markdown working documents in sandbox for long tasks:
 
-- `TODO.md`: for clear multi-step tasks without user discussion. Keep concise checklist items and tick them immediately.
-- `PLAN.md`: for large work that may exceed context. It must contain enough detail to execute after context reset. Discuss with user via `ask_user` before execution.
-- `plans/`: for massive work. `PLAN.md` references sub-plans under `plans/`.
+- `tasks.md`: the canonical task and plan document. Use it for checklists, phased plans, and execution notes that must survive context resets.
+- `plans/`: for massive work. `tasks.md` references sub-plans under `plans/`.
 
 Rules:
-- `PLAN.md` and `TODO.md` are guaranteed in context by the framework.
+- `tasks.md` is guaranteed in context by the framework.
 - Sub-plans in `plans/` are not guaranteed; re-read them when needed.
 - If blocked by user decisions, call `ask_user` and continue.
-- If scope grows, escalate TODO -> PLAN -> plans.
-- After compaction, recover by re-reading transcript and working docs.
+- If scope grows, deepen `tasks.md` and then fan out into `plans/`.
+- After compaction, recover by re-reading transcript and `tasks.md`.

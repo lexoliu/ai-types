@@ -1,7 +1,7 @@
 //! Working document utilities for long-task execution.
 //!
-//! TODO.md and PLAN.md are regular markdown files in the sandbox that the
-//! framework treats specially by loading into context and supervising progress.
+//! `tasks.md` is a regular markdown file in the sandbox that the framework
+//! treats specially by loading into context and supervising progress.
 
 use std::path::Path;
 
@@ -10,33 +10,26 @@ use async_fs as fs;
 /// Snapshot of working documents currently present in the sandbox.
 #[derive(Debug, Clone, Default)]
 pub struct WorkingDocsSnapshot {
-    pub todo_md: Option<String>,
-    pub plan_md: Option<String>,
+    pub tasks_md: Option<String>,
 }
 
 impl WorkingDocsSnapshot {
-    /// Returns true when either TODO.md or PLAN.md has unchecked markdown tasks.
+    /// Returns true when `tasks.md` has unchecked markdown tasks.
     #[must_use]
     pub fn has_unchecked_items(&self) -> bool {
-        self.todo_md
+        self.tasks_md
             .as_deref()
             .is_some_and(has_unchecked_markdown_tasks)
-            || self
-                .plan_md
-                .as_deref()
-                .is_some_and(has_unchecked_markdown_tasks)
     }
 }
 
-/// Reads TODO.md and PLAN.md from the given sandbox directory.
+/// Reads `tasks.md` from the given sandbox directory.
 pub async fn read_snapshot(sandbox_dir: &Path) -> WorkingDocsSnapshot {
-    let todo_path = sandbox_dir.join("TODO.md");
-    let plan_path = sandbox_dir.join("PLAN.md");
+    let tasks_path = sandbox_dir.join("tasks.md");
 
-    let todo_md = read_file_if_exists(&todo_path).await;
-    let plan_md = read_file_if_exists(&plan_path).await;
+    let tasks_md = read_file_if_exists(&tasks_path).await;
 
-    WorkingDocsSnapshot { todo_md, plan_md }
+    WorkingDocsSnapshot { tasks_md }
 }
 
 /// Detects unfinished markdown checklist items (`- [ ]`).

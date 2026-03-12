@@ -51,13 +51,7 @@ struct SystemReminder {
 }
 
 #[derive(serde::Serialize)]
-struct Plan {
-    #[serde(rename = "$text")]
-    content: String,
-}
-
-#[derive(serde::Serialize)]
-struct Todo {
+struct Tasks {
     #[serde(rename = "$text")]
     content: String,
 }
@@ -171,7 +165,7 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Optional readable transcript for long-context recovery.
     pub(crate) transcript: Option<Transcript>,
 
-    /// Optional sandbox directory for working-doc supervision (TODO.md/PLAN.md).
+    /// Optional sandbox directory for working-doc supervision (`tasks.md`).
     pub(crate) sandbox_dir: Option<PathBuf>,
 }
 
@@ -863,7 +857,7 @@ where
         }
 
         self.context.push(Message::system(
-            "<system-reminder>TODO.md or PLAN.md still has unchecked items. Continue working through the checklist. If user input is required, call ask_user and then proceed.</system-reminder>",
+            "<system-reminder>tasks.md still has unchecked items. Continue working through the checklist. If user input is required, call ask_user and then proceed.</system-reminder>",
         ));
         true
     }
@@ -963,11 +957,8 @@ where
 
         if let Some(sandbox_dir) = self.sandbox_dir.as_deref() {
             let docs = working_docs::read_snapshot(sandbox_dir).await;
-            if let Some(plan_md) = docs.plan_md {
-                self.context.insert_reminder(&Plan { content: plan_md });
-            }
-            if let Some(todo_md) = docs.todo_md {
-                self.context.insert_reminder(&Todo { content: todo_md });
+            if let Some(tasks_md) = docs.tasks_md {
+                self.context.insert_reminder(&Tasks { content: tasks_md });
             }
         }
 

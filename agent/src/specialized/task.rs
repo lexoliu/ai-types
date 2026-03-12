@@ -102,7 +102,7 @@ impl<LLM: Clone> SubagentType<LLM> {
 /// Choose the subagent type that best matches the task requirements.
 ///
 /// You can also load custom subagents from `.md` files by specifying a path
-/// (e.g., `./custom-agent.md` or `.subagents/researcher.md`).
+/// (e.g., `./custom-agent.md` or `subagents/researcher.md`).
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
 pub struct SubagentArgs {
     /// Subagent type name (e.g., "explore", "plan") or path to a subagent file.
@@ -174,7 +174,7 @@ impl<LLM: Clone> SubagentTool<LLM> {
 
     /// Sets the base directory for resolving relative paths.
     ///
-    /// Paths like `.subagents/...` and `.skills/...` will be resolved
+    /// Paths like `subagents/...` and `skills/...` will be resolved
     /// relative to this directory.
     #[must_use]
     pub fn with_base_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
@@ -236,8 +236,8 @@ impl<LLM: Clone> SubagentTool<LLM> {
             .unwrap_or_else(|| PathBuf::from(Path::new(".")));
         vec![
             SubagentFileMount::new(PathBuf::from("."), base.clone()),
-            SubagentFileMount::new(PathBuf::from(".subagents"), base.join(".subagents")),
-            SubagentFileMount::new(PathBuf::from(".skills"), base.join(".skills")),
+            SubagentFileMount::new(PathBuf::from("subagents"), base.join("subagents")),
+            SubagentFileMount::new(PathBuf::from("skills"), base.join("skills")),
         ]
     }
 
@@ -546,10 +546,10 @@ mod tests {
 
         let tool = SubagentTool::new(()).with_file_mounts([
             SubagentFileMount::new(".", root.join("workspace")),
-            SubagentFileMount::new(".skills", skills_root.clone()),
+            SubagentFileMount::new("skills", skills_root.clone()),
         ]);
         let resolved = tool
-            .resolve_subagent_path(Path::new(".skills/slide/SKILL.md"))
+            .resolve_subagent_path(Path::new("skills/slide/SKILL.md"))
             .await
             .expect("resolve mounted skill path");
         assert_eq!(resolved, skill_file);
@@ -561,7 +561,7 @@ mod tests {
     async fn rejects_parent_traversal_paths() {
         let root = unique_temp_dir("mount-traversal");
         let tool = SubagentTool::new(())
-            .with_file_mounts([SubagentFileMount::new(".skills", root.join("skills"))]);
+            .with_file_mounts([SubagentFileMount::new("skills", root.join("skills"))]);
 
         let error = tool
             .resolve_subagent_path(Path::new("../outside.md"))
@@ -583,15 +583,15 @@ mod tests {
         let skills_root = root.join("skills");
         std::fs::create_dir_all(&skills_root).expect("create skills root");
         let tool = SubagentTool::new(())
-            .with_file_mounts([SubagentFileMount::new(".skills", skills_root.clone())]);
+            .with_file_mounts([SubagentFileMount::new("skills", skills_root.clone())]);
 
         let error = tool
-            .resolve_subagent_path(Path::new(".skills/missing.md"))
+            .resolve_subagent_path(Path::new("skills/missing.md"))
             .await
             .expect_err("missing file should fail");
         let message = error.to_string();
         assert!(
-            message.contains(".skills/missing.md"),
+            message.contains("skills/missing.md"),
             "missing virtual path in error: {message}"
         );
         assert!(
@@ -607,7 +607,7 @@ mod tests {
         let root = unique_temp_dir("absolute-workspace-skills");
         let workspace_root = root.join("workspace");
         let skills_root = root.join("skills");
-        let session_skills_file = workspace_root.join(".skills/slide/subagents/art_direction.md");
+        let session_skills_file = workspace_root.join("skills/slide/subagents/art_direction.md");
         let mounted_skill_file = skills_root.join("slide/subagents/art_direction.md");
         std::fs::create_dir_all(session_skills_file.parent().expect("session skill parent"))
             .expect("create session skill parent");
@@ -619,13 +619,13 @@ mod tests {
             .with_base_dir(workspace_root.clone())
             .with_file_mounts([
                 SubagentFileMount::new(".", workspace_root.clone()),
-                SubagentFileMount::new(".skills", skills_root.clone()),
+                SubagentFileMount::new("skills", skills_root.clone()),
             ]);
 
         let resolved = tool
             .resolve_subagent_path(&session_skills_file)
             .await
-            .expect("resolve absolute workspace .skills path");
+            .expect("resolve absolute workspace skills path");
         assert_eq!(resolved, mounted_skill_file);
 
         let _ = std::fs::remove_dir_all(root);

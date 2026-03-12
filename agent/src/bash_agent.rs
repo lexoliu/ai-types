@@ -87,7 +87,7 @@ pub struct SubagentInfo {
     pub name: String,
     /// Short description.
     pub description: String,
-    /// Relative path within .subagents folder.
+    /// Relative path within the `subagents` folder.
     pub path: String,
 }
 
@@ -536,8 +536,8 @@ where
     /// Loads skills from a filesystem path.
     ///
     /// Creates the directory if it does not exist and always creates a
-    /// read-only `.skills` symlink inside the sandbox so the agent can
-    /// `cat .skills/<name>/SKILL.md` at runtime.  The path is also
+    /// read-only `skills` symlink inside the sandbox so the agent can
+    /// `cat skills/<name>/SKILL.md` at runtime. The path is also
     /// registered as a readable (but not writable) sandbox path.
     #[cfg(feature = "skills")]
     async fn load_skills(
@@ -576,14 +576,14 @@ where
         let path = path.as_ref().to_path_buf();
         self.load_skills(&path)
             .await?
-            .attach_readable_symlink(&path, "skills", ".skills")
+            .attach_readable_symlink(&path, "skills", "skills")
             .await
     }
 
     /// Loads skill metadata and grants read-only access to the source
-    /// directory without creating a `.skills` symlink in the sandbox.
+    /// directory without creating a `skills` symlink in the sandbox.
     ///
-    /// Use this when the runtime already mounts `.skills` inside the sandbox.
+    /// Use this when the runtime already mounts `skills` inside the sandbox.
     #[cfg(feature = "skills")]
     pub async fn with_skills_readable_only(
         self,
@@ -610,7 +610,7 @@ where
     /// Subagents are markdown files with YAML frontmatter (name, description).
     /// They can be invoked via: `task --subagent_file <path> --prompt "..."`
     ///
-    /// A symlink `.subagents` is created in the sandbox working directory.
+    /// A symlink `subagents` is created in the sandbox working directory.
     ///
     /// # Example
     ///
@@ -654,14 +654,14 @@ where
         let path = path.as_ref().to_path_buf();
         self.load_subagents(&path)
             .await?
-            .attach_readable_symlink(&path, "subagents", ".subagents")
+            .attach_readable_symlink(&path, "subagents", "subagents")
             .await
     }
 
     /// Loads subagent metadata and grants read-only access to the source
-    /// directory without creating a `.subagents` symlink in the sandbox.
+    /// directory without creating a `subagents` symlink in the sandbox.
     ///
-    /// Use this when the runtime already mounts `.subagents` inside the sandbox.
+    /// Use this when the runtime already mounts `subagents` inside the sandbox.
     pub async fn with_subagents_readable_only(
         self,
         path: impl AsRef<std::path::Path>,
