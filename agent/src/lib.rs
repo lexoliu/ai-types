@@ -87,7 +87,7 @@ pub use error::AgentError;
 pub use event::AgentEvent;
 pub use hook::{
     HCons, Hook, PostToolAction, PreToolAction, StopContext, StopReason, ToolResultContext,
-    ToolUseContext,
+    ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
 };
 pub use stream::AgentStream;
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoTool, TodoWriteArgs};

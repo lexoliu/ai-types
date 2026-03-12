@@ -24,7 +24,7 @@ use crate::{
     event::AgentEvent,
     hook::{
         Hook, PostToolAction, PreToolAction, StopContext, StopReason, ToolResultContext,
-        ToolUseContext,
+        ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
     },
     todo::{TodoItem, TodoList, TodoStatus},
     tools::AgentTools,
@@ -349,7 +349,7 @@ where
             let mut iteration = 0;
             let mut all_text_chunks: Vec<String> = Vec::new();
 
-            let final_text = loop {
+            let (final_text, stop_reason) = loop {
                 iteration += 1;
                 if iteration > self.config.max_iterations {
                     Err(AgentError::MaxIterations {
@@ -506,7 +506,7 @@ where
                     if self.inject_working_doc_continue_reminder().await {
                         continue;
                     }
-                    break response_text;
+                    break (response_text, StopReason::NoToolCalls);
                 }
 
                 // Store assistant response with tool calls in memory
@@ -695,10 +695,22 @@ where
                         self.context.push(Message::system(&result_msg));
                     }
                 }
+
+                let boundary_ctx = TurnBoundaryContext {
+                    assistant_text: &response_text,
+                    turn: iteration,
+                    message_count: self.context.len_recent(),
+                };
+                if self.hooks.on_turn_boundary(&boundary_ctx).await == TurnBoundaryAction::EndTurn
+                {
+                    break (response_text, StopReason::EndTurn);
+                }
             };
 
             // Handle background tasks before completing
-            if let Some(ref receiver) = self.background_receiver {
+            if stop_reason != StopReason::EndTurn
+                && let Some(ref receiver) = self.background_receiver
+            {
                 let completed_tasks = receiver.take_completed();
                 let mut had_completed = !completed_tasks.is_empty();
                 for task in completed_tasks {
@@ -742,7 +754,7 @@ where
             let stop_ctx = StopContext {
                 final_text: &final_text,
                 turns: iteration,
-                reason: StopReason::Complete,
+                reason: stop_reason,
             };
 
             if let Some(reason) = self.hooks.on_stop(&stop_ctx).await {

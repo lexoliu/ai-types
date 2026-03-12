@@ -61,6 +61,21 @@ pub struct StopContext<'a> {
     pub reason: StopReason,
 }
 
+/// Context provided to hooks at a safe iteration boundary.
+///
+/// This boundary happens after the agent has fully processed the last batch of
+/// tool results and updated its internal context, but before it starts the next
+/// model request.
+#[derive(Debug)]
+pub struct TurnBoundaryContext<'a> {
+    /// Assistant text produced before the last tool batch.
+    pub assistant_text: &'a str,
+    /// Current turn number (1-indexed within the agent loop).
+    pub turn: usize,
+    /// Number of recent conversation messages after processing the tool batch.
+    pub message_count: usize,
+}
+
 /// Reason why the agent stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
@@ -94,6 +109,15 @@ pub enum PostToolAction {
     Replace(String),
     /// Abort the agent run entirely with an error.
     Abort(String),
+}
+
+/// Action to take at a safe turn boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnBoundaryAction {
+    /// Continue with the next model request.
+    Continue,
+    /// End the current run cleanly after the processed tool batch.
+    EndTurn,
 }
 
 /// Trait for intercepting agent operations.
@@ -141,6 +165,15 @@ pub trait Hook: Send + Sync {
     /// This is for observation only.
     fn on_text(&self, _text: &str) -> impl std::future::Future<Output = ()> + Send {
         async {}
+    }
+
+    /// Called after a full tool/result cycle is committed into agent memory,
+    /// before the next model request begins.
+    fn on_turn_boundary(
+        &self,
+        _ctx: &TurnBoundaryContext<'_>,
+    ) -> impl std::future::Future<Output = TurnBoundaryAction> + Send {
+        async { TurnBoundaryAction::Continue }
     }
 }
 
@@ -205,6 +238,13 @@ where
     async fn on_text(&self, text: &str) {
         self.head.on_text(text).await;
         self.tail.on_text(text).await;
+    }
+
+    async fn on_turn_boundary(&self, ctx: &TurnBoundaryContext<'_>) -> TurnBoundaryAction {
+        match self.head.on_turn_boundary(ctx).await {
+            TurnBoundaryAction::Continue => self.tail.on_turn_boundary(ctx).await,
+            other => other,
+        }
     }
 }
 
