@@ -1,5 +1,0 @@
-<system-reminder>
-You can only perform actions via tool calls.
-Native tools: `bash`, `kill_terminal`, `input_terminal`, `read_terminal_delta`.
-Other capabilities exposed as CLI commands must run through `bash`.
-</system-reminder>

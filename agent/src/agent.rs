@@ -653,7 +653,9 @@ where
 
                 // If there was a tool error, inject a reminder
                 if has_tool_error {
-                    self.context.push(Message::system(include_str!("prompts/tool_error_reminder.txt")));
+                    self.context.insert_reminder(&SystemReminder {
+                        content: "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain bash, kill_terminal, input_terminal, and read_terminal_delta.".to_string(),
+                    });
                 }
 
                 // If todo tool was called, inject updated todo list
