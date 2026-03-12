@@ -18,6 +18,7 @@ use crate::{
     compression::{ContextStrategy, estimate_context_usage},
     config::{AgentConfig, AgentKind},
     context::Context,
+    context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
     event::AgentEvent,
     hook::{
@@ -874,12 +875,15 @@ where
     }
 
     /// Restore the full agent context from a serialized snapshot.
-    pub fn restore_context_json(
-        &mut self,
-        context_json: &str,
-    ) -> Result<(), serde_json::Error> {
+    pub fn restore_context_json(&mut self, context_json: &str) -> Result<(), serde_json::Error> {
         self.context = serde_json::from_str(context_json)?;
         Ok(())
+    }
+
+    /// Returns a structured snapshot of the currently assembled context window.
+    pub async fn snapshot_context_window(&mut self) -> ContextWindowSnapshot {
+        self.ensure_initialized().await;
+        self.assemble_context_window().await
     }
 
     /// Returns the model profile if available.
@@ -956,12 +960,7 @@ where
         }
     }
 
-    /// Builds the message list for an LLM request.
-    ///
-    /// Uses `context.build_messages()` for the stable system prefix + conversation,
-    /// then prepends per-turn ephemeral context (todo, working docs, background
-    /// jobs, context usage) as system messages inserted before conversation messages.
-    async fn build_request_messages(&mut self) -> Vec<Message> {
+    async fn populate_dynamic_reminders(&mut self) {
         self.context.clear_reminders();
 
         if let Some(todo_ctx) = self.format_todo_context() {
@@ -986,33 +985,92 @@ where
                 });
             }
         }
-
-        // Context usage estimation uses conversation messages
-        let usage = self.estimate_usage_for_messages(self.context.recent());
-
-        if let Some(handoff_ctx) = self.format_handoff_context(usage) {
-            self.context.insert_reminder(&SystemReminder {
-                content: handoff_ctx,
-            });
-        }
-
-        self.context.build_messages()
     }
 
-    /// Estimates current context usage using the active and fast model windows.
-    fn estimate_usage_for_messages(&self, messages: &[Message]) -> f32 {
+    /// Builds the message list for an LLM request.
+    ///
+    /// Uses `context.build_messages()` for the stable system prefix + conversation,
+    /// then prepends per-turn ephemeral context (todo, working docs, background
+    /// jobs, context usage) as system messages inserted before conversation messages.
+    async fn build_request_messages(&mut self) -> Vec<Message> {
+        self.assemble_context_window().await.messages
+    }
+
+    async fn assemble_context_window(&mut self) -> ContextWindowSnapshot {
+        self.populate_dynamic_reminders().await;
+
+        let mut messages = self.context.build_messages();
+        let mut metrics = self.estimate_context_window_metrics(&messages);
+
+        if !metrics.has_handoff
+            && metrics.usage_fraction >= self.config.context_assembler.handoff_threshold
+        {
+            if let Some(handoff_ctx) = self.format_handoff_context(metrics.usage_fraction) {
+                self.context.insert_reminder(&SystemReminder {
+                    content: handoff_ctx,
+                });
+                messages = self.context.build_messages();
+                metrics = self.estimate_context_window_metrics(&messages);
+            }
+        }
+
+        ContextWindowSnapshot {
+            phase: self.classify_context_window_phase(&metrics),
+            metrics,
+            messages,
+        }
+    }
+
+    fn estimate_context_window_metrics(&self, messages: &[Message]) -> ContextWindowMetrics {
+        ContextWindowMetrics {
+            usage_fraction: estimate_context_usage(messages, self.effective_context_window()),
+            selected_model_context_window: self
+                .profile
+                .as_ref()
+                .map(|profile| profile.context_length),
+            fast_model_context_window: self
+                .fast_profile
+                .as_ref()
+                .map(|profile| profile.context_length),
+            effective_context_window: self.effective_context_window(),
+            system_block_count: self.context.system_block_count(),
+            reminder_count: self.context.reminders().len(),
+            recent_message_count: self.context.len_recent(),
+            has_handoff: self.context.handoff().is_some(),
+        }
+    }
+
+    fn classify_context_window_phase(&self, metrics: &ContextWindowMetrics) -> ContextWindowPhase {
+        if metrics.has_handoff {
+            return ContextWindowPhase::HandoffActive;
+        }
+
+        if metrics.usage_fraction >= self.config.context_assembler.handoff_threshold {
+            return ContextWindowPhase::HandoffDue;
+        }
+
+        match &self.config.context {
+            ContextStrategy::Unlimited => ContextWindowPhase::Stable,
+            ContextStrategy::Smart(config)
+                if metrics.usage_fraction >= config.effective_trigger()
+                    && metrics.recent_message_count > config.preserve_recent =>
+            {
+                ContextWindowPhase::CompressionDue
+            }
+            ContextStrategy::Smart(_) => ContextWindowPhase::Stable,
+        }
+    }
+
+    fn effective_context_window(&self) -> usize {
         let tier_context = self
             .profile
             .as_ref()
-            .map_or(100_000, |p| p.context_length as usize);
-
+            .map_or(100_000, |profile| profile.context_length as usize);
         let fast_context = self
             .fast_profile
             .as_ref()
-            .map_or(100_000, |p| p.context_length as usize);
-
-        let context_length = tier_context.min(fast_context);
-        estimate_context_usage(messages, context_length)
+            .map_or(100_000, |profile| profile.context_length as usize);
+        tier_context.min(fast_context)
     }
 
     /// Returns the exact request message sequence that would be sent for the next turn.
@@ -1251,28 +1309,13 @@ where
     /// 2. Lets the fast LLM decide which URLs to reference in the summary
     /// 3. Only writes files for URLs actually referenced in the summary
     async fn maybe_compress(&mut self) -> Result<(), AgentError> {
-        // Use the minimum of both context windows (most constrained)
-        // This ensures:
-        // 1. The selected tier doesn't run out of context for reasoning
-        // 2. The fast model can see all content during compression
-        let tier_context = self
-            .profile
-            .as_ref()
-            .map_or(100_000, |p| p.context_length as usize);
-
-        let fast_context = self
-            .fast_profile
-            .as_ref()
-            .map_or(100_000, |p| p.context_length as usize);
-
-        let context_length = tier_context.min(fast_context);
-        let usage = estimate_context_usage(&self.context.conversation_messages(), context_length);
+        let snapshot = self.assemble_context_window().await;
 
         match &self.config.context {
             ContextStrategy::Unlimited => Ok(()),
             ContextStrategy::Smart(config) => {
                 // Use effective_trigger which reserves context for compaction process.
-                if usage >= config.effective_trigger() {
+                if snapshot.metrics.usage_fraction >= config.effective_trigger() {
                     let preserve_recent = config.preserve_recent;
                     if self.context.len_recent() > preserve_recent {
                         let _ = self.compact(None).await?;
@@ -1443,5 +1486,99 @@ fn truncate_script(script: &str, max_chars: usize) -> &str {
     match script.char_indices().nth(max_chars) {
         Some((byte_idx, _)) => &script[..byte_idx],
         None => script, // String is shorter than max_chars
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use futures_core::Stream;
+
+    use crate::compression::{CompressionLevel, PreserveConfig, SmartCompressionConfig};
+
+    #[derive(Debug)]
+    struct MockError;
+
+    impl std::fmt::Display for MockError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("mock error")
+        }
+    }
+
+    impl std::error::Error for MockError {}
+
+    #[derive(Clone)]
+    struct MockLlm {
+        context_length: u32,
+    }
+
+    impl LanguageModel for MockLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            futures_lite::stream::empty()
+        }
+
+        async fn profile(&self) -> ModelProfile {
+            ModelProfile::new(
+                "mock",
+                "test",
+                "mock-model",
+                "mock model",
+                self.context_length,
+            )
+        }
+    }
+
+    #[test]
+    fn snapshot_phase_accounts_for_system_blocks() {
+        futures_lite::future::block_on(async {
+            let mut config = AgentConfig::default();
+            config.system_prompt = Some("x".repeat(120));
+            config.context = ContextStrategy::Smart(SmartCompressionConfig {
+                trigger_threshold: 0.4,
+                emergency_threshold: 0.9,
+                preserve_recent: 0,
+                preserve: PreserveConfig::default(),
+                level: CompressionLevel::Standard,
+            });
+            config.context_assembler.handoff_threshold = 10.0;
+
+            let mut agent = Agent::with_config(
+                MockLlm {
+                    context_length: 100,
+                },
+                config,
+            );
+            agent.push_message(Message::user("hello"));
+
+            let snapshot = agent.snapshot_context_window().await;
+
+            assert_eq!(snapshot.phase, ContextWindowPhase::CompressionDue);
+            assert!(snapshot.metrics.system_block_count > 0);
+            assert!(snapshot.metrics.usage_fraction >= 0.4);
+            assert_eq!(snapshot.metrics.recent_message_count, 1);
+        });
+    }
+
+    #[test]
+    fn snapshot_phase_reports_handoff_active() {
+        futures_lite::future::block_on(async {
+            let mut agent = Agent::new(MockLlm {
+                context_length: 1_000,
+            });
+            agent
+                .context_mut()
+                .set_handoff("<handoff>resume here</handoff>");
+
+            let snapshot = agent.snapshot_context_window().await;
+
+            assert_eq!(snapshot.phase, ContextWindowPhase::HandoffActive);
+            assert!(snapshot.metrics.has_handoff);
+        });
     }
 }
