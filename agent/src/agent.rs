@@ -868,6 +868,20 @@ where
         self.context.conversation_messages()
     }
 
+    /// Serialize the full agent context for restart-safe persistence.
+    pub fn export_context_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&self.context)
+    }
+
+    /// Restore the full agent context from a serialized snapshot.
+    pub fn restore_context_json(
+        &mut self,
+        context_json: &str,
+    ) -> Result<(), serde_json::Error> {
+        self.context = serde_json::from_str(context_json)?;
+        Ok(())
+    }
+
     /// Returns the model profile if available.
     #[must_use]
     pub const fn profile(&self) -> Option<&ModelProfile> {
