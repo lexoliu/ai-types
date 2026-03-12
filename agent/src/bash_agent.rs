@@ -430,13 +430,18 @@ where
         let availability = self.shell_sessions.availability();
         let host_profile = if availability.container {
             "container"
-        } else {
+        } else if availability.local {
             "leash"
-        };
-        let runtime_kind = if host_profile == "container" {
-            "linux_container"
+        } else if availability.ssh {
+            "remote"
         } else {
-            "user_local_machine"
+            panic!("bash agent requires at least one shell backend")
+        };
+        let runtime_kind = match host_profile {
+            "container" => "linux_container",
+            "remote" => "remote_ssh",
+            "leash" => "user_local_machine",
+            _ => unreachable!("validated host profile"),
         };
         let shell_context = format!(
             "<shell_runtime><available_backends local=\"{}\" ssh=\"{}\" /><runtime>{}</runtime></shell_runtime>",
@@ -451,6 +456,11 @@ where
             format!(
                 "Linux container runtime. Default mode has network enabled. You may install dependencies freely. SSH available: {}. {}",
                 availability.ssh, ssh_context
+            )
+        } else if host_profile == "remote" {
+            format!(
+                "Remote SSH runtime. Default mode runs on the configured SSH target with network enabled. Local CLI commands exposed through bash are unavailable unless a local backend also exists. {}",
+                ssh_context
             )
         } else {
             format!(
@@ -735,6 +745,13 @@ fn short_description(description: &str) -> String {
 fn describe_ssh_servers(servers: &[SshServer]) -> String {
     if servers.is_empty() {
         "No SSH servers are configured.".to_string()
+    } else if servers.len() == 1 {
+        let server = &servers[0];
+        format!(
+            "Configured SSH server: {} ({}). When using SSH backend, ssh_server_id may be omitted because only one server is configured.",
+            server.id(),
+            server.target
+        )
     } else {
         let listings = servers
             .iter()

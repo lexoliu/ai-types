@@ -130,11 +130,12 @@ pub struct BashArgs {
     /// Runtime execution mode.
     /// - "default": local runtime execution with network enabled
     /// - "unsafe": direct host execution (leash profile only)
-    /// - "ssh": execute on a preconfigured SSH server (requires `ssh_server_id`)
+    /// - "ssh": execute on a preconfigured SSH server (`ssh_server_id` required when multiple are configured)
     #[serde(default)]
     pub mode: BashExecutionMode,
 
     /// SSH server identifier used when `mode` is `ssh`.
+    /// Optional when exactly one SSH server is configured.
     #[serde(default)]
     pub ssh_server_id: Option<String>,
 
@@ -734,18 +735,39 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
 
         let (backend, mode, ssh_target, ssh_runtime, container_id) = match arguments.mode {
             BashExecutionMode::Default => {
-                let backend = self
-                    .shell_sessions
-                    .resolve_local_backend()
-                    .map_err(anyhow::Error::msg)?;
-                let container_id = if matches!(backend, ShellBackend::Container) {
-                    Some(self.shell_sessions.container_id().ok_or_else(|| {
-                        anyhow::anyhow!("missing container_id for container backend")
-                    })?)
-                } else {
-                    None
-                };
-                (backend, BashMode::Network, None, None, container_id)
+                match self.shell_sessions.resolve_local_backend() {
+                    Ok(backend) => {
+                        let container_id = if matches!(backend, ShellBackend::Container) {
+                            Some(self.shell_sessions.container_id().ok_or_else(|| {
+                                anyhow::anyhow!("missing container_id for container backend")
+                            })?)
+                        } else {
+                            None
+                        };
+                        (backend, BashMode::Network, None, None, container_id)
+                    }
+                    Err(local_error) => {
+                        self.shell_sessions
+                            .ensure_ssh_available()
+                            .map_err(anyhow::Error::msg)?;
+                        let server = self
+                            .shell_sessions
+                            .default_ssh_server()
+                            .map_err(|ssh_error| anyhow::anyhow!("{local_error}; {ssh_error}"))?;
+                        let runtime = bootstrap_ssh_runtime(
+                            &server.target,
+                            &self.shell_sessions.ssh_authorizer(),
+                        )
+                        .await?;
+                        (
+                            ShellBackend::Ssh,
+                            BashMode::Network,
+                            Some(server.target),
+                            Some(runtime),
+                            None,
+                        )
+                    }
+                }
             }
             BashExecutionMode::Unsafe => {
                 let backend = self
@@ -763,14 +785,16 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                 self.shell_sessions
                     .ensure_ssh_available()
                     .map_err(anyhow::Error::msg)?;
-                let server_id = arguments
-                    .ssh_server_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("ssh_server_id is required for ssh mode"))?;
-                let server = self
-                    .shell_sessions
-                    .resolve_ssh_server(server_id)
-                    .map_err(anyhow::Error::msg)?;
+                let server = match arguments.ssh_server_id.as_deref() {
+                    Some(server_id) => self
+                        .shell_sessions
+                        .resolve_ssh_server(server_id)
+                        .map_err(anyhow::Error::msg)?,
+                    None => self
+                        .shell_sessions
+                        .default_ssh_server()
+                        .map_err(anyhow::Error::msg)?,
+                };
                 let runtime =
                     bootstrap_ssh_runtime(&server.target, &self.shell_sessions.ssh_authorizer())
                         .await?;

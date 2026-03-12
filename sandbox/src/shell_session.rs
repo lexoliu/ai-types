@@ -292,6 +292,18 @@ impl ShellSessionRegistry {
             .unwrap_or_default()
     }
 
+    pub fn default_ssh_server(&self) -> Result<SshServer, String> {
+        let servers = self
+            .ssh_servers
+            .read()
+            .map_err(|_| "ssh server lock poisoned".to_string())?;
+        match servers.as_slice() {
+            [] => Err("no ssh servers are configured".to_string()),
+            [server] => Ok(server.clone()),
+            _ => Err("ssh_server_id is required because multiple ssh servers are configured".to_string()),
+        }
+    }
+
     pub fn resolve_ssh_server(&self, server_id: &str) -> Result<SshServer, String> {
         let wanted = server_id.trim();
         if wanted.is_empty() {
@@ -520,7 +532,7 @@ fn normalize_arch(raw: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_remote_probe_output;
+    use super::{ShellRuntimeAvailability, ShellSessionRegistry, SshServer, parse_remote_probe_output};
 
     #[test]
     fn parse_remote_probe_detects_local_bin_leash_path() {
@@ -538,5 +550,55 @@ mod tests {
         let remote = parse_remote_probe_output(stdout).expect("probe output should parse");
         assert!(!remote.leash_found);
         assert!(remote.leash_path.is_empty());
+    }
+
+    #[test]
+    fn default_ssh_server_uses_single_configured_target() {
+        let registry = ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: false,
+            container: false,
+            ssh: true,
+        });
+        registry
+            .set_ssh_servers(vec![SshServer {
+                name: "prod".to_string(),
+                target: "root@example.com".to_string(),
+            }])
+            .expect("ssh server should configure");
+
+        let server = registry
+            .default_ssh_server()
+            .expect("single ssh server should become default");
+        assert_eq!(server.id(), "prod");
+        assert_eq!(server.target, "root@example.com");
+    }
+
+    #[test]
+    fn default_ssh_server_requires_disambiguation_when_multiple_exist() {
+        let registry = ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: false,
+            container: false,
+            ssh: true,
+        });
+        registry
+            .set_ssh_servers(vec![
+                SshServer {
+                    name: "prod".to_string(),
+                    target: "root@example.com".to_string(),
+                },
+                SshServer {
+                    name: "staging".to_string(),
+                    target: "root@staging.example.com".to_string(),
+                },
+            ])
+            .expect("ssh servers should configure");
+
+        let error = registry
+            .default_ssh_server()
+            .expect_err("multiple ssh servers must require explicit selection");
+        assert!(
+            error.contains("ssh_server_id is required"),
+            "unexpected error: {error}"
+        );
     }
 }
