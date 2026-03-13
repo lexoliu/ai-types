@@ -513,35 +513,51 @@ fn flatten_args_to_cli(args: &std::collections::HashMap<String, Value>) -> Vec<S
     }
 
     let mut cli_args = Vec::new();
-    for (key, value) in args {
-        match value {
-            Value::Bool(true) => cli_args.push(format!("--{key}")),
-            Value::Bool(false) => {}
-            Value::String(s) => {
-                cli_args.push(format!("--{key}"));
-                cli_args.push(s.clone());
-            }
-            Value::Number(n) => {
-                cli_args.push(format!("--{key}"));
-                cli_args.push(n.to_string());
-            }
-            Value::Array(arr) => {
-                for item in arr {
-                    cli_args.push(format!("--{key}"));
-                    if let Some(s) = item.as_str() {
-                        cli_args.push(s.to_string());
-                    } else {
-                        cli_args.push(item.to_string());
-                    }
-                }
-            }
-            _ => {
-                cli_args.push(format!("--{key}"));
-                cli_args.push(value.to_string());
-            }
-        }
+    let mut keys = args.keys().map(String::as_str).collect::<Vec<_>>();
+    keys.sort_unstable();
+    for key in keys {
+        let value = args
+            .get(key)
+            .expect("flatten_args_to_cli keys must resolve back into the map");
+        flatten_named_arg_to_cli(&mut cli_args, key, value);
     }
     cli_args
+}
+
+fn push_long_option(cli_args: &mut Vec<String>, key: &str) {
+    let mut option = String::with_capacity(key.len() + 2);
+    option.push_str("--");
+    option.push_str(key);
+    cli_args.push(option);
+}
+
+fn flatten_named_arg_to_cli(cli_args: &mut Vec<String>, key: &str, value: &Value) {
+    match value {
+        Value::Bool(true) => push_long_option(cli_args, key),
+        Value::Bool(false) => {}
+        Value::String(text) => {
+            push_long_option(cli_args, key);
+            cli_args.push(text.clone());
+        }
+        Value::Number(number) => {
+            push_long_option(cli_args, key);
+            cli_args.push(number.to_string());
+        }
+        Value::Array(items) => {
+            for item in items {
+                push_long_option(cli_args, key);
+                if let Some(text) = item.as_str() {
+                    cli_args.push(text.to_string());
+                } else {
+                    cli_args.push(item.to_string());
+                }
+            }
+        }
+        _ => {
+            push_long_option(cli_args, key);
+            cli_args.push(value.to_string());
+        }
+    }
 }
 
 impl IpcCommand for ToolCallCommand {
@@ -807,49 +823,7 @@ where
     }
 
     fn args_to_cli(&self) -> Vec<String> {
-        // Allow raw CLI args passthrough (positional array)
-        if let Some(Value::Array(arr)) = self.args.get("args") {
-            return arr
-                .iter()
-                .filter_map(|v| match v {
-                    Value::String(s) => Some(s.clone()),
-                    Value::Number(n) => Some(n.to_string()),
-                    Value::Bool(b) => Some(b.to_string()),
-                    _ => None,
-                })
-                .collect();
-        }
-
-        let mut cli_args = Vec::new();
-        for (key, value) in &self.args {
-            match value {
-                Value::Bool(true) => cli_args.push(format!("--{key}")),
-                Value::Bool(false) => {}
-                Value::String(s) => {
-                    cli_args.push(format!("--{key}"));
-                    cli_args.push(s.clone());
-                }
-                Value::Number(n) => {
-                    cli_args.push(format!("--{key}"));
-                    cli_args.push(n.to_string());
-                }
-                Value::Array(arr) => {
-                    for item in arr {
-                        cli_args.push(format!("--{key}"));
-                        if let Some(s) = item.as_str() {
-                            cli_args.push(s.to_string());
-                        } else {
-                            cli_args.push(item.to_string());
-                        }
-                    }
-                }
-                _ => {
-                    cli_args.push(format!("--{key}"));
-                    cli_args.push(value.to_string());
-                }
-            }
-        }
-        cli_args
+        flatten_args_to_cli(&self.args)
     }
 }
 
@@ -2099,6 +2073,26 @@ mod tests {
         assert_eq!(
             cli,
             vec!["--question", "Pick one", "--options", "A", "--options", "B"]
+        );
+    }
+
+    #[test]
+    fn test_flatten_args_to_cli_sorts_structured_keys_deterministically() {
+        let args = serde_json::from_value::<HashMap<String, Value>>(serde_json::json!({
+            "zebra": "last",
+            "alpha": "first",
+            "multi": ["x", "y"],
+            "enabled": true
+        }))
+        .expect("structured args should deserialize");
+
+        let cli = flatten_args_to_cli(&args);
+        assert_eq!(
+            cli,
+            vec![
+                "--alpha", "first", "--enabled", "--multi", "x", "--multi", "y", "--zebra",
+                "last"
+            ]
         );
     }
 
