@@ -127,22 +127,6 @@ impl PermissionHandler for NoopPermissionHandler {
     }
 }
 
-/// Backward-compatible permission handler alias.
-///
-/// Prefer [`NoopPermissionHandler`] for new code.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AllowAll;
-
-impl PermissionHandler for AllowAll {
-    async fn check(&self, mode: BashMode, script: &str) -> Result<bool, PermissionError> {
-        NoopPermissionHandler.check(mode, script).await
-    }
-
-    async fn check_domain(&self, domain: &str, port: u16) -> bool {
-        NoopPermissionHandler.check_domain(domain, port).await
-    }
-}
-
 /// A permission handler that tracks network approval state.
 #[derive(Debug, Default)]
 pub struct StatefulPermissionHandler<Inner> {
@@ -219,8 +203,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_allow_all() {
-        let handler = AllowAll;
+    async fn test_noop_permission_handler() {
+        let handler = NoopPermissionHandler;
 
         assert!(handler.check(BashMode::Sandboxed, "ls").await.unwrap());
         assert!(handler.check(BashMode::Network, "curl").await.unwrap());
@@ -229,7 +213,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stateful_handler() {
-        let handler = StatefulPermissionHandler::new(AllowAll);
+        let handler = StatefulPermissionHandler::new(NoopPermissionHandler);
 
         // Network not yet approved
         assert!(!handler.is_network_approved());
@@ -252,17 +236,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_allow_all_check_domain() {
-        let handler = AllowAll;
+    async fn test_noop_permission_handler_check_domain() {
+        let handler = NoopPermissionHandler;
 
-        // AllowAll allows all domains
+        // NoopPermissionHandler allows all domains
         assert!(handler.check_domain("example.com", 443).await);
         assert!(handler.check_domain("malicious.com", 80).await);
     }
 
     #[tokio::test]
     async fn test_stateful_handler_check_domain() {
-        let handler = StatefulPermissionHandler::new(AllowAll);
+        let handler = StatefulPermissionHandler::new(NoopPermissionHandler);
 
         // Delegates to inner handler
         assert!(handler.check_domain("example.com", 443).await);
