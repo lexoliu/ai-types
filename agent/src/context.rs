@@ -7,7 +7,7 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-use aither_core::llm::Message;
+use aither_core::llm::{Message, Role};
 
 #[derive(Serialize)]
 struct TextBlock<'a> {
@@ -155,6 +155,15 @@ impl Context {
         self.recent.len()
     }
 
+    /// Returns the number of recent system messages.
+    #[must_use]
+    pub fn count_recent_system_messages(&self) -> usize {
+        self.recent
+            .iter()
+            .filter(|message| message.role() == Role::System)
+            .count()
+    }
+
     /// Returns recent conversation messages.
     #[must_use]
     pub fn recent(&self) -> &[Message] {
@@ -269,6 +278,13 @@ impl Context {
         self.reminders = checkpoint.reminders;
         self.handoff = checkpoint.handoff;
         self.recent = checkpoint.recent;
+    }
+
+    /// Removes recent system messages and returns how many were pruned.
+    pub fn prune_recent_system_messages(&mut self) -> usize {
+        let before = self.recent.len();
+        self.recent.retain(|message| message.role() != Role::System);
+        before - self.recent.len()
     }
 
     /// Restores runtime-managed state from another serialized context while
@@ -484,6 +500,22 @@ mod tests {
         assert_eq!(current.reminders().len(), 1);
         assert!(current.handoff().is_some());
         assert_eq!(current.len_recent(), 1);
+    }
+
+    #[test]
+    fn prune_recent_system_messages_removes_only_system_entries() {
+        let mut context = Context::new();
+        context.push(Message::user("user"));
+        context.push(Message::system("system"));
+        context.push(Message::assistant("assistant"));
+        context.push(Message::system("system-2"));
+
+        let removed = context.prune_recent_system_messages();
+
+        assert_eq!(removed, 2);
+        assert_eq!(context.len_recent(), 2);
+        assert_eq!(context.recent()[0].content(), "user");
+        assert_eq!(context.recent()[1].content(), "assistant");
     }
 
     #[test]

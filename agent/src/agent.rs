@@ -1101,6 +1101,7 @@ where
             system_block_count: self.context.system_block_count(),
             reminder_count: self.context.reminders().len(),
             recent_message_count: self.context.len_recent(),
+            recent_system_message_count: self.context.count_recent_system_messages(),
             has_handoff: self.context.handoff().is_some(),
         }
     }
@@ -1116,6 +1117,12 @@ where
 
         match &self.config.context {
             ContextStrategy::Unlimited => ContextWindowPhase::Stable,
+            ContextStrategy::Smart(config)
+                if metrics.usage_fraction >= config.effective_trigger()
+                    && metrics.recent_system_message_count > 0 =>
+            {
+                ContextWindowPhase::ReassemblyDue
+            }
             ContextStrategy::Smart(config)
                 if metrics.usage_fraction >= config.effective_trigger()
                     && metrics.recent_message_count > config.preserve_recent =>
@@ -1375,11 +1382,16 @@ where
     /// 3. Only writes files for URLs actually referenced in the summary
     async fn maybe_compress(&mut self) -> Result<(), AgentError> {
         self.ensure_initialized().await;
-        let snapshot = self.assemble_context_window().await;
+        let mut snapshot = self.assemble_context_window().await;
+        let context_strategy = self.config.context.clone();
 
-        match &self.config.context {
+        match context_strategy {
             ContextStrategy::Unlimited => Ok(()),
             ContextStrategy::Smart(config) => {
+                if snapshot.phase == ContextWindowPhase::ReassemblyDue {
+                    let _ = self.reassemble_context();
+                    snapshot = self.assemble_context_window().await;
+                }
                 if snapshot.phase == ContextWindowPhase::CompressionDue {
                     let preserve_recent = config.preserve_recent;
                     if self.context.len_recent() > preserve_recent {
@@ -1396,6 +1408,11 @@ where
     /// Previously handled reload markers, now just returns the content as-is.
     fn process_reload_marker(&self, result: &str) -> String {
         result.to_string()
+    }
+
+    fn reassemble_context(&mut self) -> usize {
+        self.context.clear_reminders();
+        self.context.prune_recent_system_messages()
     }
 
     /// Formats the todo list as a system reminder.
@@ -1677,6 +1694,37 @@ mod tests {
 
             assert_eq!(agent.context().len_recent(), before_recent);
             assert!(agent.context().handoff().is_none());
+        });
+    }
+
+    #[test]
+    fn reassembly_due_prunes_recent_system_messages_before_compaction() {
+        futures_lite::future::block_on(async {
+            let mut config = AgentConfig::default();
+            config.context = ContextStrategy::Smart(SmartCompressionConfig {
+                trigger_threshold: 0.05,
+                emergency_threshold: 0.9,
+                preserve_recent: 100,
+                preserve: PreserveConfig::default(),
+                level: CompressionLevel::Standard,
+            });
+            config.context_assembler.handoff_threshold = 10.0;
+
+            let mut agent = Agent::with_config(MockLlm { context_length: 100 }, config);
+            agent.push_message(Message::user("hello"));
+            agent.push_message(Message::system("<system-reminder>ephemeral</system-reminder>"));
+
+            let snapshot = agent.snapshot_context_window().await;
+            assert_eq!(snapshot.phase, ContextWindowPhase::ReassemblyDue);
+
+            agent
+                .maybe_compress()
+                .await
+                .unwrap_or_else(|error| panic!("reassembly_due must not fail: {error}"));
+
+            assert_eq!(agent.context().count_recent_system_messages(), 0);
+            assert_eq!(agent.context().len_recent(), 1);
+            assert_eq!(agent.context().recent()[0].content(), "hello");
         });
     }
 }

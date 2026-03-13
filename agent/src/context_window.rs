@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 pub enum ContextWindowPhase {
     /// Regular operating state.
     Stable,
+    /// A lightweight reassembly should run before attempting compaction.
+    ReassemblyDue,
     /// Full-window usage is high enough that compaction should be considered.
     CompressionDue,
     /// Usage is close enough to the hard limit that the model should hand off.
@@ -34,6 +36,8 @@ pub struct ContextWindowMetrics {
     pub reminder_count: usize,
     /// Number of recent conversation messages.
     pub recent_message_count: usize,
+    /// Number of recent system messages that can be pruned by reassembly.
+    pub recent_system_message_count: usize,
     /// Whether a persisted handoff document is present.
     pub has_handoff: bool,
 }
