@@ -29,8 +29,8 @@ use executor_core::{Executor, Task};
 #[cfg(unix)]
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use leash::{
-    AllowAll, DomainRequest, IpcRouter, NetworkPolicy, Sandbox, SandboxConfig, SecurityConfig,
-    StdioConfig, WorkingDir,
+    AllowAll, DenyAll, DomainRequest, IpcRouter, NetworkPolicy, Sandbox, SandboxConfig,
+    SecurityConfig, StdioConfig, WorkingDir,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -129,6 +129,7 @@ pub struct BashArgs {
 
     /// Runtime execution mode.
     /// - "default": local runtime execution with network enabled
+    /// - "sandboxed": local runtime execution with network denied
     /// - "unsafe": direct host execution (leash profile only)
     /// - "ssh": execute on a preconfigured SSH server (`ssh_server_id` required when multiple are configured)
     #[serde(default)]
@@ -175,6 +176,7 @@ pub struct BashArgs {
 pub enum BashExecutionMode {
     #[default]
     Default,
+    Sandboxed,
     Unsafe,
     Ssh,
 }
@@ -769,6 +771,20 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                     }
                 }
             }
+            BashExecutionMode::Sandboxed => {
+                let backend = self
+                    .shell_sessions
+                    .resolve_local_backend()
+                    .map_err(anyhow::Error::msg)?;
+                let container_id = if matches!(backend, ShellBackend::Container) {
+                    Some(self.shell_sessions.container_id().ok_or_else(|| {
+                        anyhow::anyhow!("missing container_id for container backend")
+                    })?)
+                } else {
+                    None
+                };
+                (backend, BashMode::Sandboxed, None, None, container_id)
+            }
             BashExecutionMode::Unsafe => {
                 let backend = self
                     .shell_sessions
@@ -1101,6 +1117,22 @@ where
                 )
                 .await?
             }
+            BashMode::Sandboxed => {
+                execute_sandboxed_background(
+                    working_dir,
+                    writable_paths,
+                    readable_paths,
+                    executor.clone(),
+                    registry.clone(),
+                    task_id,
+                    execution_id,
+                    script,
+                    mode,
+                    DenyAll,
+                    &job_registry,
+                )
+                .await?
+            }
             BashMode::Unsafe => {
                 execute_unsafe_background(
                     working_dir,
@@ -1115,11 +1147,6 @@ where
                     &job_registry,
                 )
                 .await?
-            }
-            BashMode::Sandboxed => {
-                return Err(BashError::Execution(
-                    "sandboxed mode is unsupported; use mode=default or mode=unsafe".to_string(),
-                ));
             }
         }
     };
@@ -2185,5 +2212,12 @@ mod tests {
         );
         assert!(policy.check(&request).await);
         assert_eq!(handler.domain_checks.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[test]
+    fn sandboxed_execution_mode_deserializes() {
+        let mode: BashExecutionMode =
+            serde_json::from_str("\"sandboxed\"").expect("sandboxed mode must deserialize");
+        assert_eq!(mode, BashExecutionMode::Sandboxed);
     }
 }
