@@ -22,6 +22,7 @@ use std::{
 };
 
 use aither_core::llm::{Tool, ToolOutput};
+use askama::Template;
 use async_channel::{Receiver, Sender};
 #[cfg(unix)]
 use async_io::Async;
@@ -1573,7 +1574,20 @@ async fn execute_ssh_background(
 }
 
 fn shell_escape(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
+    let escaped = value.replace('\'', "'\"'\"'");
+    let mut output = String::with_capacity(escaped.len() + 2);
+    output.push('\'');
+    output.push_str(&escaped);
+    output.push('\'');
+    output
+}
+
+#[derive(Template)]
+#[template(path = "container_ipc_wrapper.sh", escape = "none")]
+struct ContainerIpcWrapperTemplate<'a> {
+    escaped_commands: &'a str,
+    ipc_port: u16,
+    script: &'a str,
 }
 
 fn wrap_container_script(
@@ -1596,9 +1610,9 @@ fn wrap_container_script(
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
-            return Err(BashError::Execution(format!(
-                "invalid ipc command name for container wrapper: {name}"
-            )));
+            return Err(BashError::Execution(
+                ["invalid ipc command name for container wrapper: ", name].concat(),
+            ));
         }
     }
 
@@ -1607,26 +1621,21 @@ fn wrap_container_script(
         .map(|name| shell_escape(name))
         .collect::<Vec<_>>()
         .join(" ");
-
-    let mut wrapped = String::with_capacity(script.len() + 1024);
-    wrapped.push_str("MAY_IPC_BIN=\"$(command -v leash-ipc || true)\"; ");
-    wrapped.push_str("if [ -z \"$MAY_IPC_BIN\" ]; then echo \"leash-ipc command not found in container\" >&2; exit 127; fi; ");
-    wrapped.push_str("MAY_IPC_DIR=\"$(mktemp -d)\"; ");
-    wrapped.push_str("cleanup(){ local __may_ipc_status=$?; wait >/dev/null 2>&1 || true; rm -rf \"$MAY_IPC_DIR\"; return $__may_ipc_status; }; trap cleanup EXIT; ");
-    wrapped.push_str("for cmd in ");
-    wrapped.push_str(&escaped_commands);
-    wrapped.push_str("; do ");
-    wrapped.push_str("printf '%s\\n' '#!/usr/bin/env bash' \"exec \\\"$MAY_IPC_BIN\\\" \\\"$cmd\\\" \\\"\\$@\\\"\" > \"$MAY_IPC_DIR/$cmd\"; ");
-    wrapped.push_str("chmod +x \"$MAY_IPC_DIR/$cmd\"; ");
-    wrapped.push_str("done; ");
-    wrapped.push_str("export PATH=\"$MAY_IPC_DIR:$PATH\"; ");
-    wrapped.push_str("hash -r; ");
-    wrapped.push_str("export LEASH_IPC_SOCKET=\"tcp://${MAY_HOST_GATEWAY:-host.docker.internal}:");
-    wrapped.push_str(&port.to_string());
-    wrapped.push_str("\"; ");
-    wrapped.push_str(script);
-
-    Ok(wrapped)
+    ContainerIpcWrapperTemplate {
+        escaped_commands: &escaped_commands,
+        ipc_port: port,
+        script,
+    }
+    .render()
+    .map_err(|error| {
+        BashError::Execution(
+            [
+                "failed to render container IPC wrapper: ",
+                error.to_string().as_str(),
+            ]
+            .concat(),
+        )
+    })
 }
 
 struct ContainerIpcBridge {
@@ -1698,7 +1707,7 @@ fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
     _registry: Arc<ToolRegistry>,
 ) -> Result<ContainerIpcBridge, BashError> {
     Err(BashError::Execution(
-        "container IPC bridge requires unix domain sockets".to_string(),
+        "container IPC bridge is only supported on unix hosts".to_string(),
     ))
 }
 
@@ -2175,6 +2184,29 @@ mod tests {
             .expect("wrap script");
         assert!(wrapped.contains(script));
         assert!(!wrapped.contains("set -euo pipefail"));
+    }
+
+    #[test]
+    fn wrap_container_script_rejects_invalid_ipc_command_names() {
+        let error = wrap_container_script("echo ok", &[String::from("bad name")], Some(9000))
+            .expect_err("invalid command name must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid ipc command name for container wrapper")
+        );
+    }
+
+    #[test]
+    fn wrap_container_script_renders_expected_endpoint() {
+        let wrapped = wrap_container_script(
+            "environment --query deployment",
+            &[String::from("environment"), String::from("session")],
+            Some(43123),
+        )
+        .expect("wrap script");
+        assert!(wrapped.contains("tcp://${MAY_HOST_GATEWAY:-host.docker.internal}:43123"));
+        assert!(wrapped.contains("for cmd in 'environment' 'session'; do"));
     }
 
     #[tokio::test]
