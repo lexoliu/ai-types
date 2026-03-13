@@ -42,7 +42,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aither_agent::sandbox::{
-    ToolRegistryBuilder, cli_to_json,
+    CommandPayload, ToolRegistryBuilder, cli_to_json,
     permission::{BashMode, PermissionError, PermissionHandler, StatefulPermissionHandler},
     schema_to_help,
 };
@@ -280,7 +280,7 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
                 // Parse CLI args into JSON object
                 let arguments = match parse_cli_args_to_json(&schema, &args) {
                     Ok(value) => value,
-                    Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
+                    Err(error) => return Err(error.to_string()),
                 };
 
                 // Call the MCP tool
@@ -288,7 +288,7 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
                 match conn.call(&tool_name, arguments).await {
                     Ok(result) => {
                         // Extract text content from result
-                        result
+                        let content = result
                             .content
                             .into_iter()
                             .filter_map(|c| {
@@ -299,9 +299,10 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
                                 }
                             })
                             .collect::<Vec<_>>()
-                            .join("\n")
+                            .join("\n");
+                        Ok(Some(CommandPayload::Text { content }))
                     }
-                    Err(e) => format!("{{\"error\": \"{e}\"}}"),
+                    Err(error) => Err(error.to_string()),
                 }
             })
         });

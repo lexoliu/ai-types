@@ -1767,10 +1767,8 @@ async fn handle_container_ipc_connection(
             .map_err(|e| format!("invalid IPC method name utf8: {e}"))?;
         let params = &body[1 + method_length..];
         let cli_args = decode_container_ipc_args(params)?;
-        let tool_output = registry.query_tool_handler(method, &cli_args).await;
-        let payload_value = serde_json::from_str::<serde_json::Value>(&tool_output)
-            .unwrap_or(serde_json::Value::String(tool_output));
-        write_container_ipc_success(&mut stream, &payload_value).await?;
+        let response = registry.query_tool_handler(method, &cli_args).await;
+        write_container_ipc_success(&mut stream, &response).await?;
     }
 }
 
@@ -1800,7 +1798,7 @@ fn decode_container_ipc_args(params: &[u8]) -> Result<Vec<String>, String> {
 #[cfg(unix)]
 async fn write_container_ipc_success(
     stream: &mut Async<StdTcpStream>,
-    response: &serde_json::Value,
+    response: &crate::command::CommandEnvelope,
 ) -> Result<(), String> {
     let payload = leash::rmp_serde::to_vec(response)
         .map_err(|e| format!("failed to encode IPC success payload: {e}"))?;

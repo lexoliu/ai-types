@@ -34,10 +34,10 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aither_core::llm::Tool;
+use aither_core::llm::{Tool, ToolOutput};
 use leash::IpcCommand;
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -45,9 +45,65 @@ use serde_json::Value;
 // Tool Registry
 // ============================================================================
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandPayload {
+    Text { content: String },
+    Json { value: Value },
+}
+
+impl CommandPayload {
+    fn render_for_cli(&self) -> Result<String, String> {
+        match self {
+            Self::Text { content } => Ok(content.clone()),
+            Self::Json { value } => serde_json::to_string_pretty(value)
+                .map_err(|error| ["failed to encode JSON output: ", error.to_string().as_str()].concat()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandEnvelope {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<CommandPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl CommandEnvelope {
+    fn success(payload: CommandPayload) -> Self {
+        Self {
+            ok: true,
+            payload: Some(payload),
+            error: None,
+        }
+    }
+
+    fn success_empty() -> Self {
+        Self {
+            ok: true,
+            payload: None,
+            error: None,
+        }
+    }
+
+    fn failure(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            payload: None,
+            error: Some(message.into()),
+        }
+    }
+}
+
 /// Type-erased tool handler function.
-type ToolHandlerFn =
-    Box<dyn Fn(Vec<String>) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
+type ToolHandlerFn = Box<
+    dyn Fn(Vec<String>) -> Pin<Box<dyn Future<Output = Result<Option<CommandPayload>, String>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Tool entry in the registry.
 struct ToolEntry {
@@ -73,30 +129,75 @@ use crate::output::{INLINE_OUTPUT_LIMIT, generate_word_filename};
 ///
 /// Returns the output as-is if small enough, or saves to file and returns
 /// a reference message if the output exceeds the limit.
-async fn handle_large_output(output: String, output_dir: &PathBuf) -> String {
-    if output.len() <= INLINE_OUTPUT_LIMIT {
-        return output;
+async fn handle_large_output(
+    output: Option<CommandPayload>,
+    output_dir: &PathBuf,
+) -> CommandEnvelope {
+    let Some(output) = output else {
+        return CommandEnvelope::success_empty();
+    };
+
+    let rendered = match output.render_for_cli() {
+        Ok(rendered) => rendered,
+        Err(error) => return CommandEnvelope::failure(error),
+    };
+
+    if rendered.is_empty() {
+        return CommandEnvelope::success_empty();
+    }
+
+    if rendered.len() <= INLINE_OUTPUT_LIMIT {
+        return CommandEnvelope::success(output);
     }
 
     // Generate four-random-words filename (consistent with rest of codebase)
     let filename = format!("{}.txt", generate_word_filename());
     let filepath = output_dir.join(&filename);
 
-    let line_count = output.lines().count();
+    let line_count = rendered.lines().count();
 
-    if let Err(error) = async_fs::write(&filepath, &output).await {
-        return format!(
-            "Error: failed to write output to {}: {error}",
+    if let Err(error) = async_fs::write(&filepath, &rendered).await {
+        return CommandEnvelope::failure(format!(
+            "failed to write output to {}: {error}",
             filepath.display()
-        );
+        ));
     }
 
-    format!(
-        "Output saved to outputs/{} ({} lines, {} bytes)",
-        filename,
-        line_count,
-        output.len()
-    )
+    CommandEnvelope::success(CommandPayload::Text {
+        content: format!(
+            "Output saved to outputs/{} ({} lines, {} bytes)",
+            filename,
+            line_count,
+            rendered.len()
+        ),
+    })
+}
+
+fn tool_output_to_payload(output: ToolOutput) -> Result<Option<CommandPayload>, String> {
+    match output {
+        ToolOutput::Done => Ok(None),
+        ToolOutput::Output { mime, content } => {
+            let mime_is_json =
+                mime.subtype().as_str() == "json" || mime.suffix().is_some_and(|suffix| suffix.as_str() == "json");
+            if mime_is_json {
+                let value = serde_json::from_slice(&content).map_err(|error| {
+                    ["invalid JSON tool output: ", error.to_string().as_str()].concat()
+                })?;
+                return Ok(Some(CommandPayload::Json { value }));
+            }
+
+            let text = String::from_utf8(content).map_err(|error| {
+                [
+                    "unsupported non-UTF8 CLI tool output for MIME ",
+                    mime.essence_str(),
+                    ": ",
+                    error.to_string().as_str(),
+                ]
+                .concat()
+            })?;
+            Ok(Some(CommandPayload::Text { content: text }))
+        }
+    }
 }
 
 // ============================================================================
@@ -173,22 +274,22 @@ impl ToolRegistryBuilder {
                 let json_args = match cli_to_json(&schema, &args) {
                     Ok(v) => v,
                     Err(e) => {
-                        return format!("Error: {e}\n\nRun `{name} --help` for usage information.");
+                        return Err(format!(
+                            "{e}\n\nRun `{name} --help` for usage information."
+                        ));
                     }
                 };
                 tracing::debug!(tool = %name, json = %json_args, "configure_tool handler: parsed JSON");
                 let parsed = match serde_json::from_value(json_args) {
                     Ok(v) => v,
                     Err(e) => {
-                        return format!(
-                            "Error: invalid arguments: {e}\n\nRun `{name} --help` for usage information."
-                        );
+                        return Err(format!(
+                            "invalid arguments: {e}\n\nRun `{name} --help` for usage information."
+                        ));
                     }
                 };
-                match tool.call(parsed).await {
-                    Ok(output) => output.as_str().unwrap_or("").to_string(),
-                    Err(e) => format!("Error: {e}"),
-                }
+                let output = tool.call(parsed).await.map_err(|error| error.to_string())?;
+                tool_output_to_payload(output)
             })
         });
 
@@ -213,7 +314,12 @@ impl ToolRegistryBuilder {
         positional_args: Vec<String>,
         handler: F,
     ) where
-        F: Fn(Vec<String>) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync + 'static,
+        F: Fn(
+                Vec<String>,
+            ) -> Pin<Box<dyn Future<Output = Result<Option<CommandPayload>, String>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     {
         self.entries.insert(
             name.into(),
@@ -304,16 +410,18 @@ impl ToolRegistry {
     /// Queries a tool handler by name.
     ///
     /// Large outputs (> 4000 chars) are automatically saved to file.
-    pub async fn query_tool_handler(&self, tool_name: &str, args: &[String]) -> String {
+    pub async fn query_tool_handler(&self, tool_name: &str, args: &[String]) -> CommandEnvelope {
         let entry = self.entries.get(tool_name);
         match entry {
             Some(entry) => {
-                let output = (entry.handler)(args.to_vec()).await;
-                handle_large_output(output, &self.output_dir).await
+                match (entry.handler)(args.to_vec()).await {
+                    Ok(output) => handle_large_output(output, &self.output_dir).await,
+                    Err(error) => CommandEnvelope::failure(error),
+                }
             }
-            None => format!(
-                "Error: unknown command '{tool_name}'. Run 'help' to see available commands."
-            ),
+            None => CommandEnvelope::failure(format!(
+                "unknown command '{tool_name}'. Run 'help' to see available commands."
+            )),
         }
     }
 
@@ -437,7 +545,7 @@ fn flatten_args_to_cli(args: &std::collections::HashMap<String, Value>) -> Vec<S
 }
 
 impl IpcCommand for ToolCallCommand {
-    type Response = Value;
+    type Response = CommandEnvelope;
 
     fn name(&self) -> String {
         self.tool_name.clone()
@@ -469,7 +577,7 @@ impl IpcCommand for ToolCallCommand {
         Ok(())
     }
 
-    async fn handle(&mut self) -> Value {
+    async fn handle(&mut self) -> CommandEnvelope {
         let cli_args = self.args_to_cli();
         tracing::info!(tool = %self.tool_name, args = ?cli_args, "ToolCallCommand::handle invoked");
 
@@ -480,19 +588,14 @@ impl IpcCommand for ToolCallCommand {
                 .tool_help(&self.tool_name)
                 .unwrap_or_else(|| format!("No help available for '{}'", self.tool_name));
             tracing::info!(tool = %self.tool_name, "Returning help text");
-            return Value::String(help);
+            return CommandEnvelope::success(CommandPayload::Text { content: help });
         }
 
         tracing::info!(tool = %self.tool_name, "Calling registry.query_tool_handler");
-        let result = self
+        self
             .registry
             .query_tool_handler(&self.tool_name, &cli_args)
-            .await;
-        tracing::info!(tool = %self.tool_name, result_len = result.len(), "Tool handler returned");
-
-        // Parse the result as JSON to avoid double-serialization.
-        // Tool outputs are JSON strings, so we need to parse them to Value.
-        serde_json::from_str(&result).unwrap_or_else(|_| Value::String(result))
+            .await
     }
 }
 
@@ -538,7 +641,7 @@ impl IpcGatewayCommand {
 }
 
 impl IpcCommand for IpcGatewayCommand {
-    type Response = Value;
+    type Response = CommandEnvelope;
 
     fn name(&self) -> String {
         "ipc".to_string()
@@ -551,29 +654,26 @@ impl IpcCommand for IpcGatewayCommand {
         Ok(())
     }
 
-    async fn handle(&mut self) -> Value {
+    async fn handle(&mut self) -> CommandEnvelope {
         let cli_args = flatten_args_to_cli(&self.args);
         if cli_args.is_empty() {
-            return Value::String("Error: usage: ipc <tool> [args ...]".to_string());
+            return CommandEnvelope::failure("usage: ipc <tool> [args ...]");
         }
 
         if has_help_flag(&cli_args) && cli_args.len() == 1 {
             let mut names = self.registry.registered_tool_names();
             names.sort();
-            return Value::String(format!(
-                "Usage: ipc <tool> [args ...]\nAvailable tools: {}",
-                names.join(", ")
-            ));
+            return CommandEnvelope::success(CommandPayload::Text {
+                content: format!(
+                    "Usage: ipc <tool> [args ...]\nAvailable tools: {}",
+                    names.join(", ")
+                ),
+            });
         }
 
         let tool_name = &cli_args[0];
         let tool_args = cli_args[1..].to_vec();
-        let result = self
-            .registry
-            .query_tool_handler(tool_name, &tool_args)
-            .await;
-
-        serde_json::from_str(&result).unwrap_or_else(|_| Value::String(result))
+        self.registry.query_tool_handler(tool_name, &tool_args).await
     }
 }
 
@@ -635,8 +735,11 @@ where
         let json_args = cli_to_json(&self.schema, args)?;
         let parsed: T::Arguments = serde_json::from_value(json_args)?;
         let output = self.tool.call(parsed).await?;
-        // Convert ToolOutput to string for CLI output
-        Ok(output.as_str().unwrap_or("").to_string())
+        let payload = tool_output_to_payload(output).map_err(anyhow::Error::msg)?;
+        match payload {
+            Some(payload) => payload.render_for_cli().map_err(anyhow::Error::msg),
+            None => Ok(String::new()),
+        }
     }
 }
 
@@ -755,7 +858,7 @@ where
     T: Tool + Clone + Send + Sync + 'static,
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
-    type Response = Value;
+    type Response = CommandEnvelope;
 
     fn name(&self) -> String {
         self.name.clone()
@@ -788,20 +891,22 @@ where
         Ok(())
     }
 
-    async fn handle(&mut self) -> Value {
+    async fn handle(&mut self) -> CommandEnvelope {
         let cli_args = self.args_to_cli();
 
         // Handle help flags
         if has_help_flag(&cli_args) {
-            return Value::String(self.help.clone());
+            return CommandEnvelope::success(CommandPayload::Text {
+                content: self.help.clone(),
+            });
         }
 
         // Parse CLI args to JSON
         let json_args = match cli_to_json(&self.schema, &cli_args) {
             Ok(args) => args,
             Err(e) => {
-                return Value::String(format!(
-                    "Error: {e}\n\nRun `{} --help` for usage information.",
+                return CommandEnvelope::failure(format!(
+                    "{e}\n\nRun `{} --help` for usage information.",
                     self.name
                 ));
             }
@@ -811,19 +916,20 @@ where
         let parsed: T::Arguments = match serde_json::from_value(json_args) {
             Ok(args) => args,
             Err(e) => {
-                return Value::String(format!(
-                    "Error: invalid arguments: {e}\n\nRun `{} --help` for usage information.",
+                return CommandEnvelope::failure(format!(
+                    "invalid arguments: {e}\n\nRun `{} --help` for usage information.",
                     self.name
                 ));
             }
         };
 
         match self.tool.call(parsed).await {
-            Ok(output) => {
-                let result = output.as_str().unwrap_or("").to_string();
-                serde_json::from_str(&result).unwrap_or_else(|_| Value::String(result))
-            }
-            Err(e) => Value::String(format!("Error: {e}")),
+            Ok(output) => match tool_output_to_payload(output) {
+                Ok(Some(payload)) => CommandEnvelope::success(payload),
+                Ok(None) => CommandEnvelope::success_empty(),
+                Err(error) => CommandEnvelope::failure(error),
+            },
+            Err(e) => CommandEnvelope::failure(e.to_string()),
         }
     }
 }
@@ -2001,10 +2107,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let output_dir = tmp.path().join("not-a-directory");
         std::fs::write(&output_dir, "occupied").unwrap();
-        let output = "x".repeat(INLINE_OUTPUT_LIMIT + 1);
+        let output = Some(CommandPayload::Text {
+            content: "x".repeat(INLINE_OUTPUT_LIMIT + 1),
+        });
 
         let result = futures_lite::future::block_on(handle_large_output(output, &output_dir));
-        assert!(result.contains("failed to write output"));
+        assert!(!result.ok);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed to write output")
+        );
     }
 
     #[test]
@@ -2042,14 +2157,11 @@ mod tests {
             type Arguments = AskUserArgs;
             async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
                 // Return the parsed args as JSON so we can inspect
-                Ok(ToolOutput::text(
-                    serde_json::to_string(&serde_json::json!({
+                ToolOutput::json(&serde_json::json!({
                         "question": args.question,
                         "option": args.option,
                         "multi_select": args.multi_select,
                     }))
-                    .unwrap(),
-                ))
             }
         }
 
@@ -2070,8 +2182,11 @@ mod tests {
 
         let result = futures_lite::future::block_on(cmd.handle());
         tracing::debug!("result: {}", serde_json::to_string_pretty(&result).unwrap());
+        assert!(result.ok, "command should succeed: {result:?}");
 
-        let parsed: serde_json::Value = serde_json::from_value(result).unwrap();
+        let Some(CommandPayload::Json { value: parsed }) = result.payload else {
+            panic!("expected JSON payload, got {result:?}");
+        };
         let options = parsed["option"].as_array().expect("option should be array");
         assert_eq!(options.len(), 3, "expected 3 options, got: {:?}", options);
         assert_eq!(options[0], "原味");
