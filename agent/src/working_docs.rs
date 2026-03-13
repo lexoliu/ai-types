@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use async_fs as fs;
+use similar::{ChangeTag, TextDiff};
 
 /// Snapshot of working documents currently present in the sandbox.
 #[derive(Debug, Clone, Default)]
@@ -30,6 +31,46 @@ pub async fn read_snapshot(sandbox_dir: &Path) -> WorkingDocsSnapshot {
     let tasks_md = read_file_if_exists(&tasks_path).await;
 
     WorkingDocsSnapshot { tasks_md }
+}
+
+/// Returns a compact changed-line diff for `tasks.md` when it changed.
+#[must_use]
+pub fn tasks_md_diff(
+    previous: &WorkingDocsSnapshot,
+    current: &WorkingDocsSnapshot,
+) -> Option<String> {
+    if previous.tasks_md == current.tasks_md {
+        return None;
+    }
+
+    let diff = TextDiff::from_lines(
+        previous.tasks_md.as_deref().unwrap_or_default(),
+        current.tasks_md.as_deref().unwrap_or_default(),
+    );
+
+    let mut lines = Vec::new();
+    for change in diff.iter_all_changes() {
+        let prefix = match change.tag() {
+            ChangeTag::Delete => "- ",
+            ChangeTag::Insert => "+ ",
+            ChangeTag::Equal => continue,
+        };
+        let value = change.value().trim_end_matches('\n');
+        if value.is_empty() {
+            continue;
+        }
+        lines.push([prefix, value].concat());
+        if lines.len() == 48 {
+            lines.push("...".to_string());
+            break;
+        }
+    }
+
+    if lines.is_empty() {
+        return Some("tasks.md changed.".to_string());
+    }
+
+    Some(lines.join("\n"))
 }
 
 /// Detects unfinished markdown checklist items (`- [ ]`).

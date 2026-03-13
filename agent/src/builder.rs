@@ -441,6 +441,7 @@ where
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
+            last_working_docs: None,
         }
     }
 }

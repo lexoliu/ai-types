@@ -58,6 +58,12 @@ struct Tasks {
     content: String,
 }
 
+#[derive(serde::Serialize)]
+struct TasksDiffReminder {
+    #[serde(rename = "$text")]
+    diff: String,
+}
+
 #[derive(Template)]
 #[template(path = "todo_reminder.txt", escape = "none")]
 struct TodoReminderTemplate<'a> {
@@ -218,6 +224,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
 
     /// Optional sandbox directory for working-doc supervision (`tasks.md`).
     pub(crate) sandbox_dir: Option<PathBuf>,
+
+    /// Last observed working-doc snapshot for diff reminders.
+    pub(crate) last_working_docs: Option<working_docs::WorkingDocsSnapshot>,
 }
 
 impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
@@ -252,6 +261,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             job_registry: None,
             transcript: None,
             sandbox_dir: None,
+            last_working_docs: None,
         }
     }
 }
@@ -1035,6 +1045,12 @@ where
 
         if let Some(sandbox_dir) = self.sandbox_dir.as_deref() {
             let docs = working_docs::read_snapshot(sandbox_dir).await;
+            if let Some(previous) = self.last_working_docs.as_ref()
+                && let Some(diff) = working_docs::tasks_md_diff(previous, &docs)
+            {
+                self.context.insert_reminder(&TasksDiffReminder { diff });
+            }
+            self.last_working_docs = Some(docs.clone());
             if let Some(tasks_md) = docs.tasks_md {
                 self.context.insert_reminder(&Tasks { content: tasks_md });
             }
