@@ -12,6 +12,7 @@ pub use aither_gemini::{self as gemini, Gemini, GeminiProvider};
 pub use aither_openai::{self as openai, OpenAI, OpenAIProvider};
 
 use aither_core::{
+    EmbeddingModel,
     LanguageModel,
     llm::{
         Event, LLMRequest, LanguageModelProvider, model::Profile,
@@ -32,6 +33,99 @@ pub enum CloudProvider {
     Gemini(Gemini),
     /// GitHub Copilot models.
     Copilot(Copilot),
+}
+
+/// Unified embedding-capable cloud provider.
+#[derive(Clone, Debug)]
+pub enum CloudEmbedder {
+    /// `OpenAI` embeddings.
+    OpenAI(OpenAI),
+    /// Google Gemini embeddings.
+    Gemini(Gemini),
+}
+
+impl From<OpenAI> for CloudEmbedder {
+    fn from(client: OpenAI) -> Self {
+        Self::OpenAI(client)
+    }
+}
+
+impl From<Gemini> for CloudEmbedder {
+    fn from(client: Gemini) -> Self {
+        Self::Gemini(client)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CloudEmbedderError {
+    #[error("provider does not support embeddings: {0}")]
+    UnsupportedProvider(&'static str),
+}
+
+impl TryFrom<CloudProvider> for CloudEmbedder {
+    type Error = CloudEmbedderError;
+
+    fn try_from(value: CloudProvider) -> Result<Self, Self::Error> {
+        match value {
+            CloudProvider::OpenAI(client) => Ok(Self::OpenAI(client)),
+            CloudProvider::Gemini(client) => Ok(Self::Gemini(client)),
+            CloudProvider::Claude(_) => Err(CloudEmbedderError::UnsupportedProvider("claude")),
+            CloudProvider::Copilot(_) => Err(CloudEmbedderError::UnsupportedProvider("copilot")),
+        }
+    }
+}
+
+impl EmbeddingModel for CloudEmbedder {
+    fn dim(&self) -> usize {
+        match self {
+            Self::OpenAI(client) => client.dim(),
+            Self::Gemini(client) => client.dim(),
+        }
+    }
+
+    fn embed(
+        &self,
+        text: &str,
+    ) -> impl std::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
+        let embedder = self.clone();
+        let text = text.to_string();
+        async move {
+            match embedder {
+                Self::OpenAI(client) => client.embed(text.as_str()).await,
+                Self::Gemini(client) => client.embed(text.as_str()).await,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CloudEmbedder, CloudEmbedderError, CloudProvider};
+    use crate::{Claude, Gemini, OpenAI, Copilot};
+
+    #[test]
+    fn openai_and_gemini_convert_to_cloud_embedder() {
+        assert!(matches!(
+            CloudEmbedder::try_from(CloudProvider::OpenAI(OpenAI::new("test"))),
+            Ok(CloudEmbedder::OpenAI(_))
+        ));
+        assert!(matches!(
+            CloudEmbedder::try_from(CloudProvider::Gemini(Gemini::new("test"))),
+            Ok(CloudEmbedder::Gemini(_))
+        ));
+    }
+
+    #[test]
+    fn unsupported_cloud_providers_fail_fast() {
+        assert!(matches!(
+            CloudEmbedder::try_from(CloudProvider::Claude(Claude::new("test"))),
+            Err(CloudEmbedderError::UnsupportedProvider("claude"))
+        ));
+        assert!(matches!(
+            CloudEmbedder::try_from(CloudProvider::Copilot(Copilot::new("test"))),
+            Err(CloudEmbedderError::UnsupportedProvider("copilot"))
+        ));
+    }
 }
 
 impl From<OpenAI> for CloudProvider {
