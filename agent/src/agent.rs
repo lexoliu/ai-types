@@ -77,6 +77,12 @@ struct TodoContextTemplate<'a> {
     items_json: &'a str,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EmittedCheckpoint {
+    phase: ContextWindowPhase,
+    message_count: usize,
+}
+
 #[derive(Template)]
 #[template(path = "background_started_reminder.txt", escape = "none")]
 struct BackgroundStartedReminderTemplate<'a> {
@@ -348,7 +354,9 @@ where
         let attachments: Vec<url::Url> = attachments.into_iter().collect();
 
         async_stream::try_stream! {
+            let run_id = uuid::Uuid::new_v4().to_string();
             self.ensure_initialized().await;
+            yield AgentEvent::run_start(run_id.clone(), self.config.max_iterations);
 
             // Apply context compression if needed
             self.maybe_compress().await?;
@@ -717,8 +725,16 @@ where
                     turn: iteration,
                     message_count: self.context.len_recent(),
                 };
-                self.emit_checkpoint(CheckpointReason::TurnBoundary, &response_text, iteration)
+                let checkpoint = self
+                    .emit_checkpoint(CheckpointReason::TurnBoundary, &response_text, iteration)
                     .await?;
+                yield AgentEvent::checkpoint(
+                    run_id.clone(),
+                    CheckpointReason::TurnBoundary,
+                    iteration,
+                    checkpoint.phase,
+                    checkpoint.message_count,
+                );
                 yield AgentEvent::turn_complete(iteration, true);
                 if self.hooks.on_turn_boundary(&boundary_ctx).await == TurnBoundaryAction::EndTurn
                 {
@@ -761,7 +777,7 @@ where
 
                 if had_completed {
                     // Continue processing with background results
-                    let continuation = self.continue_after_background_streaming().await;
+                    let continuation = self.continue_after_background_streaming(run_id.as_str()).await;
                     for event in continuation {
                         yield event?;
                     }
@@ -769,8 +785,16 @@ where
                 }
             }
 
-            self.emit_checkpoint(CheckpointReason::Stop, &final_text, iteration)
+            let checkpoint = self
+                .emit_checkpoint(CheckpointReason::Stop, &final_text, iteration)
                 .await?;
+            yield AgentEvent::checkpoint(
+                run_id.clone(),
+                CheckpointReason::Stop,
+                iteration,
+                checkpoint.phase,
+                checkpoint.message_count,
+            );
 
             // Notify hooks
             let stop_ctx = StopContext {
@@ -1254,7 +1278,10 @@ where
     }
 
     /// Continues agent processing after background tasks complete (streaming version).
-    async fn continue_after_background_streaming(&mut self) -> Vec<Result<AgentEvent, AgentError>> {
+    async fn continue_after_background_streaming(
+        &mut self,
+        run_id: &str,
+    ) -> Vec<Result<AgentEvent, AgentError>> {
         let mut events = Vec::new();
         let mut iteration = 0;
 
@@ -1365,13 +1392,23 @@ where
                 if !response_text.is_empty() {
                     self.context.push(Message::assistant(&response_text));
                 }
-                if let Err(error) = self
+                let checkpoint = match self
                     .emit_checkpoint(CheckpointReason::Stop, &response_text, iteration)
                     .await
                 {
-                    events.push(Err(error));
-                    return events;
-                }
+                    Ok(checkpoint) => checkpoint,
+                    Err(error) => {
+                        events.push(Err(error));
+                        return events;
+                    }
+                };
+                events.push(Ok(AgentEvent::checkpoint(
+                    run_id.to_string(),
+                    CheckpointReason::Stop,
+                    iteration,
+                    checkpoint.phase,
+                    checkpoint.message_count,
+                )));
                 events.push(Ok(AgentEvent::turn_complete(iteration, false)));
                 events.push(Ok(AgentEvent::Complete {
                     final_text: response_text,
@@ -1432,13 +1469,23 @@ where
                 }
             }
 
-            if let Err(error) = self
+            let checkpoint = match self
                 .emit_checkpoint(CheckpointReason::TurnBoundary, &response_text, iteration)
                 .await
             {
-                events.push(Err(error));
-                return events;
-            }
+                Ok(checkpoint) => checkpoint,
+                Err(error) => {
+                    events.push(Err(error));
+                    return events;
+                }
+            };
+            events.push(Ok(AgentEvent::checkpoint(
+                run_id.to_string(),
+                CheckpointReason::TurnBoundary,
+                iteration,
+                checkpoint.phase,
+                checkpoint.message_count,
+            )));
             events.push(Ok(AgentEvent::turn_complete(iteration, true)));
         }
     }
@@ -1497,7 +1544,7 @@ where
         reason: CheckpointReason,
         assistant_text: &str,
         turn: usize,
-    ) -> Result<(), AgentError> {
+    ) -> Result<EmittedCheckpoint, AgentError> {
         let context_json = self
             .export_context_json()
             .map_err(|error| AgentError::Config(error.to_string()))?;
@@ -1516,7 +1563,10 @@ where
                 reason,
             });
         }
-        Ok(())
+        Ok(EmittedCheckpoint {
+            phase: window.phase,
+            message_count: self.context.len_recent(),
+        })
     }
 
     /// Formats the todo list as a system reminder.

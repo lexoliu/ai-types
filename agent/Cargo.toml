@@ -21,6 +21,7 @@ askama = "0.14"
 schemars = "1.1.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 indexmap = { version = "2", features = ["serde"] }
 heck = "0.5"
 quick-xml = { version = "0.37", features = ["serialize"] }
@@ -42,6 +43,7 @@ pin-project-lite = "0.2.16"
 url = "2"
 sha2 = "0.10"
 similar = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }

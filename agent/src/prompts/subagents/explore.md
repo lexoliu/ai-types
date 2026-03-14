@@ -1,4 +1,5 @@
 ---
+version: 1
 name: explore
 description: Explores codebases to find files and search code. Use when you need to understand project structure, locate files, or search for patterns in source code.
 ---

@@ -1,4 +1,5 @@
 ---
+version: 1
 name: research
 description: Researches topics on the web, gathering information with sources and references. Use when you need to find current information, statistics, expert opinions, or verify facts from the internet.
 ---

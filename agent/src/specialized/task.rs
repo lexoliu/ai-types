@@ -446,12 +446,6 @@ where
                         "Failed to read subagent file '{}': {e}",
                         resolved_path.display()
                     )
-                })?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Invalid subagent definition in '{}'",
-                        resolved_path.display()
-                    )
                 })?;
 
             let builder = crate::AgentBuilder::new(self.llm.clone())

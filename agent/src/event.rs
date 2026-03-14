@@ -1,10 +1,20 @@
 //! Agent events for streaming execution.
 
+use crate::context_window::ContextWindowPhase;
 use crate::error::AgentError;
+use crate::hook::CheckpointReason;
 
 /// Events emitted during agent execution.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// Agent run started with a stable run identifier.
+    RunStart {
+        /// Unique identifier for this run invocation.
+        run_id: String,
+        /// Maximum number of iterations configured for this run.
+        max_iterations: usize,
+    },
+
     /// Text chunk from the LLM response.
     Text(String),
 
@@ -39,6 +49,20 @@ pub enum AgentEvent {
         has_tool_calls: bool,
     },
 
+    /// Runtime checkpoint emitted after mutating agent state.
+    Checkpoint {
+        /// Unique identifier for this run invocation.
+        run_id: String,
+        /// Why the checkpoint was emitted.
+        reason: CheckpointReason,
+        /// Current turn number (1-indexed within the agent loop).
+        turn: usize,
+        /// Current lifecycle phase of the assembled context window.
+        phase: ContextWindowPhase,
+        /// Number of recent conversation messages currently in memory.
+        message_count: usize,
+    },
+
     /// Agent finished processing successfully.
     Complete {
         /// The final response text.
@@ -55,6 +79,15 @@ pub enum AgentEvent {
 }
 
 impl AgentEvent {
+    /// Creates a new run-start event.
+    #[must_use]
+    pub fn run_start(run_id: impl Into<String>, max_iterations: usize) -> Self {
+        Self::RunStart {
+            run_id: run_id.into(),
+            max_iterations,
+        }
+    }
+
     /// Creates a new text event.
     #[must_use]
     pub fn text(content: impl Into<String>) -> Self {
@@ -115,6 +148,24 @@ impl AgentEvent {
         Self::TurnComplete {
             turn,
             has_tool_calls,
+        }
+    }
+
+    /// Creates a new checkpoint event.
+    #[must_use]
+    pub fn checkpoint(
+        run_id: impl Into<String>,
+        reason: CheckpointReason,
+        turn: usize,
+        phase: ContextWindowPhase,
+        message_count: usize,
+    ) -> Self {
+        Self::Checkpoint {
+            run_id: run_id.into(),
+            reason,
+            turn,
+            phase,
+            message_count,
         }
     }
 
