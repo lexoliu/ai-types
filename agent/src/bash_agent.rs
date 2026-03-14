@@ -85,6 +85,45 @@ struct ShellRuntimeAvailableBackendsXml {
     ssh: bool,
 }
 
+fn join_text(parts: &[&str]) -> String {
+    let capacity = parts.iter().map(|part| part.len()).sum();
+    let mut output = String::with_capacity(capacity);
+    for part in parts {
+        output.push_str(part);
+    }
+    output
+}
+
+fn path_error_text(
+    prefix: &str,
+    path: &std::path::Path,
+    error: &impl std::fmt::Display,
+) -> String {
+    let path_text = path.display().to_string();
+    let error_text = error.to_string();
+    join_text(&[prefix, path_text.as_str(), "': ", error_text.as_str()])
+}
+
+fn quoted_path_error_text(
+    prefix: &str,
+    first_path: &std::path::Path,
+    infix: &str,
+    second_path: &std::path::Path,
+    error: &impl std::fmt::Display,
+) -> String {
+    let first_path_text = first_path.display().to_string();
+    let second_path_text = second_path.display().to_string();
+    let error_text = error.to_string();
+    join_text(&[
+        prefix,
+        first_path_text.as_str(),
+        infix,
+        second_path_text.as_str(),
+        "': ",
+        error_text.as_str(),
+    ])
+}
+
 /// Loaded skill metadata for system prompt.
 #[derive(Debug, Clone)]
 pub struct SkillInfo {
@@ -216,17 +255,13 @@ where
         kind: &str,
     ) -> Result<std::path::PathBuf, crate::AgentError> {
         fs::create_dir_all(path).await.map_err(|error| {
-            crate::AgentError::Config(format!(
-                "failed to create {kind} directory '{}': {error}",
-                path.display()
-            ))
+            let prefix = join_text(&["failed to create ", kind, " directory '"]);
+            crate::AgentError::Config(path_error_text(prefix.as_str(), path, &error))
         })?;
 
         fs::canonicalize(path).await.map_err(|error| {
-            crate::AgentError::Config(format!(
-                "failed to canonicalize {kind} directory '{}': {error}",
-                path.display()
-            ))
+            let prefix = join_text(&["failed to canonicalize ", kind, " directory '"]);
+            crate::AgentError::Config(path_error_text(prefix.as_str(), path, &error))
         })
     }
 
@@ -253,25 +288,28 @@ where
             Ok(metadata) => {
                 if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
                     fs::remove_dir(&symlink_path).await.map_err(|error| {
-                        crate::AgentError::Config(format!(
-                            "failed to remove existing directory '{}': {error}",
-                            symlink_path.display()
+                        crate::AgentError::Config(path_error_text(
+                            "failed to remove existing directory '",
+                            &symlink_path,
+                            &error,
                         ))
                     })?;
                 } else {
                     fs::remove_file(&symlink_path).await.map_err(|error| {
-                        crate::AgentError::Config(format!(
-                            "failed to remove existing file '{}': {error}",
-                            symlink_path.display()
+                        crate::AgentError::Config(path_error_text(
+                            "failed to remove existing file '",
+                            &symlink_path,
+                            &error,
                         ))
                     })?;
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(crate::AgentError::Config(format!(
-                    "failed to inspect '{}': {error}",
-                    symlink_path.display()
+                return Err(crate::AgentError::Config(path_error_text(
+                    "failed to inspect '",
+                    &symlink_path,
+                    &error,
                 )));
             }
         }
@@ -281,10 +319,12 @@ where
             fs::unix::symlink(&abs_path, &symlink_path)
                 .await
                 .map_err(|error| {
-                    crate::AgentError::Config(format!(
-                        "failed to create symlink '{}' -> '{}': {error}",
-                        symlink_path.display(),
-                        abs_path.display()
+                    crate::AgentError::Config(quoted_path_error_text(
+                        "failed to create symlink '",
+                        &symlink_path,
+                        "' -> '",
+                        &abs_path,
+                        &error,
                     ))
                 })?;
         }
@@ -293,10 +333,12 @@ where
             fs::windows::symlink_dir(&abs_path, &symlink_path)
                 .await
                 .map_err(|error| {
-                    crate::AgentError::Config(format!(
-                        "failed to create symlink '{}' -> '{}': {error}",
-                        symlink_path.display(),
-                        abs_path.display()
+                    crate::AgentError::Config(quoted_path_error_text(
+                        "failed to create symlink '",
+                        &symlink_path,
+                        "' -> '",
+                        &abs_path,
+                        &error,
                     ))
                 })?;
         }
@@ -544,9 +586,10 @@ where
         let abs_path = Self::resolve_absolute_dir(&path, "skills").await?;
         let loader = SkillLoader::new().add_path(&abs_path);
         let skills = loader.load_all().await.map_err(|error| {
-            crate::AgentError::Config(format!(
-                "failed to load skills from '{}': {error}",
-                abs_path.display()
+            crate::AgentError::Config(path_error_text(
+                "failed to load skills from '",
+                &abs_path,
+                &error,
             ))
         })?;
 
@@ -623,14 +666,16 @@ where
         let defs = SubagentDefinition::load_from_dir_async(&abs_path)
             .await
             .map_err(|error| {
-                crate::AgentError::Config(format!(
-                    "failed to load subagents from '{}': {error}",
-                    abs_path.display()
+                crate::AgentError::Config(path_error_text(
+                    "failed to load subagents from '",
+                    &abs_path,
+                    &error,
                 ))
             })?;
 
         for def in defs {
-            let filename = format!("{}.md", def.id);
+            let mut filename = def.id.clone();
+            filename.push_str(".md");
             self.subagents.push(SubagentInfo {
                 name: def.id,
                 description: def.description,
