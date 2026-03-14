@@ -1834,21 +1834,12 @@ fn decode_container_ipc_args(params: &[u8]) -> Result<Vec<String>, String> {
         leash::rmp_serde::from_slice(params).map_err(|e| format!("invalid IPC params: {e}"))?;
     let args = parsed
         .as_object()
-        .and_then(|map| map.get("args"))
-        .and_then(serde_json::Value::as_array)
-        .map(|array| {
-            array
-                .iter()
-                .filter_map(|value| match value {
-                    serde_json::Value::String(text) => Some(text.clone()),
-                    serde_json::Value::Number(number) => Some(number.to_string()),
-                    serde_json::Value::Bool(flag) => Some(flag.to_string()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    Ok(args)
+        .ok_or_else(|| "container IPC params must be a map".to_string())?;
+    let args = args
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+    Ok(crate::command::flatten_args_to_cli(&args))
 }
 
 #[cfg(unix)]

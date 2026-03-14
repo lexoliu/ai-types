@@ -597,7 +597,7 @@ impl ToolCallCommand {
     }
 }
 
-fn flatten_args_to_cli(args: &std::collections::HashMap<String, Value>) -> Vec<String> {
+pub(crate) fn flatten_args_to_cli(args: &std::collections::HashMap<String, Value>) -> Vec<String> {
     if let Some(Value::Array(arr)) = args.get("args") {
         return arr
             .iter()
