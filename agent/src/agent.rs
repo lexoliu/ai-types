@@ -227,6 +227,9 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
 
     /// Last observed working-doc snapshot for diff reminders.
     pub(crate) last_working_docs: Option<working_docs::WorkingDocsSnapshot>,
+
+    /// Start time of the most recent LLM request issued by this agent.
+    pub(crate) last_request_started_at: Option<Instant>,
 }
 
 impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
@@ -262,6 +265,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             transcript: None,
             sandbox_dir: None,
             last_working_docs: None,
+            last_request_started_at: None,
         }
     }
 }
@@ -368,7 +372,7 @@ where
                 }
 
                 // Build messages
-                let messages = self.build_request_messages().await;
+                let messages = self.build_live_request_messages().await;
 
                 // Create request with tool definitions
                 let tool_defs = self.tools.active_definitions();
@@ -1077,6 +1081,13 @@ where
         self.assemble_context_window().await.messages
     }
 
+    async fn build_live_request_messages(&mut self) -> Vec<Message> {
+        let _ = self.maybe_reassemble_after_idle_gap();
+        let messages = self.build_request_messages().await;
+        self.last_request_started_at = Some(Instant::now());
+        messages
+    }
+
     async fn assemble_context_window(&mut self) -> ContextWindowSnapshot {
         self.populate_dynamic_reminders().await;
 
@@ -1100,6 +1111,19 @@ where
             metrics,
             messages,
         }
+    }
+
+    fn maybe_reassemble_after_idle_gap(&mut self) -> usize {
+        if self.context.handoff().is_some() {
+            return 0;
+        }
+        let Some(last_request_started_at) = self.last_request_started_at else {
+            return 0;
+        };
+        if last_request_started_at.elapsed() < self.config.context_assembler.idle_reassemble_after {
+            return 0;
+        }
+        self.reassemble_context()
     }
 
     fn estimate_context_window_metrics(&self, messages: &[Message]) -> ContextWindowMetrics {
@@ -1223,7 +1247,7 @@ where
                 return events;
             }
 
-            let messages = self.build_request_messages().await;
+            let messages = self.build_live_request_messages().await;
             let tool_defs = self.tools.active_definitions();
             let request = LLMRequest::new(messages).with_tool_definitions(tool_defs);
 
@@ -1741,6 +1765,26 @@ mod tests {
             assert_eq!(agent.context().count_recent_system_messages(), 0);
             assert_eq!(agent.context().len_recent(), 1);
             assert_eq!(agent.context().recent()[0].content(), "hello");
+        });
+    }
+
+    #[test]
+    fn idle_gap_reassembles_before_next_live_request() {
+        futures_lite::future::block_on(async {
+            let mut config = AgentConfig::default();
+            config.context_assembler.idle_reassemble_after = Duration::from_secs(1);
+
+            let mut agent = Agent::with_config(MockLlm { context_length: 1_000 }, config);
+            agent.push_message(Message::user("hello"));
+            agent.push_message(Message::system("<system-reminder>ephemeral</system-reminder>"));
+            agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(5));
+
+            let _ = agent.build_live_request_messages().await;
+
+            assert_eq!(agent.context().count_recent_system_messages(), 0);
+            assert_eq!(agent.context().len_recent(), 1);
+            assert_eq!(agent.context().recent()[0].content(), "hello");
+            assert!(agent.last_request_started_at.is_some());
         });
     }
 }

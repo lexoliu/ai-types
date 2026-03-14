@@ -1,5 +1,7 @@
 //! Agent configuration.
 
+use std::time::Duration;
+
 use crate::compression::ContextStrategy;
 
 /// Agent specialization mode.
@@ -19,6 +21,8 @@ pub struct ContextAssemblerConfig {
     pub static_budget_fraction: f32,
     /// Usage threshold to request handoff summary.
     pub handoff_threshold: f32,
+    /// Reassemble ephemeral context when no LLM request has been sent for this long.
+    pub idle_reassemble_after: Duration,
     /// Instruction injected near context exhaustion.
     pub handoff_instruction: String,
 }
@@ -28,6 +32,7 @@ impl Default for ContextAssemblerConfig {
         Self {
             static_budget_fraction: 0.2,
             handoff_threshold: 0.9,
+            idle_reassemble_after: Duration::from_secs(300),
             handoff_instruction: "Your context window is nearly exhausted. Generate a concise handoff summary now, preserving current goals, constraints, file paths, pending tasks, and immediate next actions.".to_string(),
         }
     }
@@ -118,6 +123,13 @@ impl AgentConfig {
     #[must_use]
     pub fn with_transcript_path(mut self, path: impl Into<String>) -> Self {
         self.transcript_path = Some(path.into());
+        self
+    }
+
+    /// Sets the idle gap after which ephemeral context should be reassembled.
+    #[must_use]
+    pub fn with_idle_reassemble_after(mut self, idle_reassemble_after: Duration) -> Self {
+        self.context_assembler.idle_reassemble_after = idle_reassemble_after;
         self
     }
 }
