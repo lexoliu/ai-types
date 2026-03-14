@@ -114,6 +114,42 @@ fn no_help_available_text(tool_name: &str) -> String {
     message
 }
 
+fn push_help_line(help: &mut String, line: &str) {
+    help.push_str(line);
+    help.push('\n');
+}
+
+fn render_positional_usage(name: &str) -> String {
+    let kebab = name.replace('_', "-");
+    let mut output = String::with_capacity(kebab.len() + 2);
+    output.push('<');
+    output.push_str(kebab.as_str());
+    output.push('>');
+    output
+}
+
+fn render_repeatable_usage(name: &str) -> String {
+    let kebab = name.replace('_', "-");
+    let mut output = String::with_capacity(kebab.len() + 12);
+    output.push_str("--");
+    output.push_str(kebab.as_str());
+    output.push_str(" <value>...");
+    output
+}
+
+fn render_flag_prefix(flag: &str, short: Option<char>) -> String {
+    let mut output = String::with_capacity(flag.len() + 8);
+    output.push_str("  ");
+    if let Some(short) = short {
+        output.push('-');
+        output.push(short);
+        output.push_str(", ");
+    }
+    output.push_str("--");
+    output.push_str(flag);
+    output
+}
+
 impl CommandPayload {
     fn render_for_cli(&self) -> Result<String, String> {
         match self {
@@ -943,9 +979,10 @@ where
         let json_args = match cli_to_json(&self.schema, &cli_args) {
             Ok(args) => args,
             Err(e) => {
-                return CommandEnvelope::failure(format!(
-                    "{e}\n\nRun `{} --help` for usage information.",
-                    self.name
+                let message = e.to_string();
+                return CommandEnvelope::failure(tool_usage_error(
+                    message.as_str(),
+                    self.name.as_str(),
                 ));
             }
         };
@@ -954,9 +991,10 @@ where
         let parsed: T::Arguments = match serde_json::from_value(json_args) {
             Ok(args) => args,
             Err(e) => {
-                return CommandEnvelope::failure(format!(
-                    "invalid arguments: {e}\n\nRun `{} --help` for usage information.",
-                    self.name
+                let message = prefix_error("invalid arguments: ", &e);
+                return CommandEnvelope::failure(tool_usage_error(
+                    message.as_str(),
+                    self.name.as_str(),
                 ));
             }
         };
@@ -1574,9 +1612,11 @@ pub fn schema_to_help(schema: &Value) -> String {
 
             for variant in variants {
                 if let Some(name) = get_variant_name(variant, &tag) {
-                    help.push_str(&format!("  {name}"));
+                    help.push_str("  ");
+                    help.push_str(name.as_str());
                     if let Some(desc) = variant.get("description").and_then(Value::as_str) {
-                        help.push_str(&format!(" - {desc}"));
+                        help.push_str(" - ");
+                        help.push_str(desc);
                     }
                     help.push('\n');
                 }
@@ -1602,7 +1642,7 @@ pub fn schema_to_help(schema: &Value) -> String {
                     .get(**n)
                     .is_none_or(|s| get_instance_type(s) != Some("array"))
             })
-            .map(|n| format!("<{}>", n.replace('_', "-")))
+            .map(|n| render_positional_usage(n))
             .collect();
         // Show required array fields as repeatable flags in usage
         let repeatable: Vec<_> = required
@@ -1612,7 +1652,7 @@ pub fn schema_to_help(schema: &Value) -> String {
                     .get(**n)
                     .is_some_and(|s| get_instance_type(s) == Some("array"))
             })
-            .map(|n| format!("--{} <value>...", n.replace('_', "-")))
+            .map(|n| render_repeatable_usage(n))
             .collect();
 
         let mut usage_parts = Vec::new();
@@ -1623,7 +1663,9 @@ pub fn schema_to_help(schema: &Value) -> String {
             usage_parts.push(r.clone());
         }
         usage_parts.push("[options]".to_string());
-        help.push_str(&format!("  {}\n", usage_parts.join(" ")));
+        let usage = usage_parts.join(" ");
+        help.push_str("  ");
+        push_help_line(&mut help, usage.as_str());
 
         help.push_str("\nOptions:\n  -h, --help  Show help\n");
         help.push_str("\nArguments:\n");
@@ -1635,11 +1677,8 @@ pub fn schema_to_help(schema: &Value) -> String {
             let is_array = get_instance_type(prop) == Some("array");
             let flag = name.replace('_', "-");
 
-            if let Some(short) = field_to_short.get(name) {
-                help.push_str(&format!("  -{short}, --{flag}"));
-            } else {
-                help.push_str(&format!("  --{flag}"));
-            }
+            let short = field_to_short.get(name).copied();
+            help.push_str(render_flag_prefix(flag.as_str(), short).as_str());
             if is_array {
                 help.push_str(" <value>  (repeatable");
                 if is_required {
@@ -1651,7 +1690,8 @@ pub fn schema_to_help(schema: &Value) -> String {
             }
 
             if let Some(desc) = prop.get("description").and_then(Value::as_str) {
-                help.push_str(&format!("\n      {desc}"));
+                help.push_str("\n      ");
+                help.push_str(desc);
             }
             help.push('\n');
         }
