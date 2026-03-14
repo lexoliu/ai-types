@@ -477,6 +477,8 @@ mod tests {
     use super::*;
     use std::borrow::Cow;
 
+    #[cfg(feature = "skills")]
+    use aither_skills::{Skill, SkillRegistry};
     use schemars::JsonSchema;
     use serde::Deserialize;
 
@@ -595,6 +597,53 @@ mod tests {
         assert_eq!(
             agent.config.max_iterations,
             AgentConfig::default().max_iterations
+        );
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn test_builder_preserves_skill_registry() {
+        let mut registry = SkillRegistry::new();
+        registry.register(Skill {
+            name: "code-review".to_string(),
+            description: "Review code carefully".to_string(),
+            triggers: vec!["review".to_string()],
+            instructions: "Use a review checklist.".to_string(),
+            allowed_tools: Some(vec!["mock_tool".to_string()]),
+            resources: std::collections::HashMap::new(),
+        });
+
+        let agent = AgentBuilder::new(MockLlm)
+            .skill_registry(Arc::new(registry))
+            .build();
+        assert!(agent.skill_registry.is_some());
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn test_runtime_skill_activation_matches_prompt() {
+        let mut registry = SkillRegistry::new();
+        registry.register(Skill {
+            name: "code-review".to_string(),
+            description: "Review code carefully".to_string(),
+            triggers: vec!["review".to_string()],
+            instructions: "Use a review checklist.".to_string(),
+            allowed_tools: Some(vec!["mock_tool".to_string()]),
+            resources: std::collections::HashMap::new(),
+        });
+
+        let mut agent = AgentBuilder::new(MockLlm)
+            .skill_registry(Arc::new(registry))
+            .build();
+        let events = agent.activate_skills_for_prompt("please review this patch");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(agent.active_skills.len(), 1);
+        assert!(
+            agent
+                .active_allowed_tools
+                .as_ref()
+                .is_some_and(|allowed| allowed.contains("mock_tool"))
         );
     }
 }

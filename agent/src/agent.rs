@@ -1289,7 +1289,7 @@ where
     }
 
     #[cfg(feature = "skills")]
-    fn activate_skills_for_prompt(&mut self, prompt: &str) -> Vec<AgentEvent> {
+    pub(crate) fn activate_skills_for_prompt(&mut self, prompt: &str) -> Vec<AgentEvent> {
         self.active_skills.clear();
         self.active_allowed_tools = None;
         let Some(registry) = self.skill_registry.as_ref() else {
