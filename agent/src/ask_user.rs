@@ -104,13 +104,22 @@ pub enum AnswerValue {
 }
 
 /// A request from the agent to ask the user questions.
-pub type AskUserRequest = ToolRequest<AskUserArgs, Vec<QuestionAnswer>>;
+pub type AskUserRequest = ToolRequest<AskUserRequestPayload, Vec<QuestionAnswer>>;
+
+/// Internal request payload sent from a session-bound tool to the host runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskUserRequestPayload {
+    /// Session issuing the request.
+    pub session_id: String,
+    /// User-visible request body.
+    pub request: AskUserArgs,
+}
 
 /// Broker for `ask_user` requests.
-pub type AskUserBroker = ToolRequestBroker<AskUserArgs, Vec<QuestionAnswer>>;
+pub type AskUserBroker = ToolRequestBroker<AskUserRequestPayload, Vec<QuestionAnswer>>;
 
 /// Queue for pending `ask_user` requests.
-pub type AskUserQueue = ToolRequestQueue<AskUserArgs, Vec<QuestionAnswer>>;
+pub type AskUserQueue = ToolRequestQueue<AskUserRequestPayload, Vec<QuestionAnswer>>;
 
 /// Create a new `ask_user` channel pair.
 #[must_use]
@@ -122,13 +131,17 @@ pub fn channel() -> (AskUserBroker, AskUserQueue) {
 #[derive(Clone)]
 pub struct AskUserTool {
     broker: AskUserBroker,
+    session_id: String,
 }
 
 impl AskUserTool {
     /// Create a new `AskUserTool` with the given sender.
     #[must_use]
-    pub const fn new(broker: AskUserBroker) -> Self {
-        Self { broker }
+    pub fn new(session_id: impl Into<String>, broker: AskUserBroker) -> Self {
+        Self {
+            broker,
+            session_id: session_id.into(),
+        }
     }
 }
 
@@ -140,7 +153,13 @@ impl Tool for AskUserTool {
     type Arguments = AskUserArgs;
 
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        let response = self.broker.request(args).await?;
+        let response = self
+            .broker
+            .request(AskUserRequestPayload {
+                session_id: self.session_id.clone(),
+                request: args,
+            })
+            .await?;
         ToolOutput::json(&response)
     }
 }
