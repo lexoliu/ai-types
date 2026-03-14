@@ -44,7 +44,7 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::hook::Hook;
-use crate::{Agent, AgentBuilder, config::AgentKind};
+use crate::{Agent, AgentBuilder, config::AgentKind, context::serialize_xml};
 use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool, ReadTerminalDeltaTool};
 use aither_sandbox::{
     BashTool, BashToolFactory, BashToolFactoryReceiver, ContainerShellRuntime,
@@ -69,6 +69,20 @@ struct SystemPrompt {
     subagents: String,
     has_subagents: bool,
     is_macos: bool,
+}
+
+#[derive(serde::Serialize)]
+struct ShellRuntimeContextXml {
+    available_backends: ShellRuntimeAvailableBackendsXml,
+    runtime: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct ShellRuntimeAvailableBackendsXml {
+    #[serde(rename = "@local")]
+    local: bool,
+    #[serde(rename = "@ssh")]
+    ssh: bool,
 }
 
 /// Loaded skill metadata for system prompt.
@@ -438,57 +452,32 @@ where
             "leash" => "user_local_machine",
             _ => unreachable!("validated host profile"),
         };
-        let shell_context = format!(
-            "<shell_runtime><available_backends local=\"{}\" ssh=\"{}\" /><runtime>{}</runtime></shell_runtime>",
-            availability.local || availability.container,
-            availability.ssh,
-            runtime_kind,
+        let shell_context = serialize_xml(
+            "shell_runtime",
+            &ShellRuntimeContextXml {
+                available_backends: ShellRuntimeAvailableBackendsXml {
+                    local: availability.local || availability.container,
+                    ssh: availability.ssh,
+                },
+                runtime: runtime_kind,
+            },
         );
         self.inner = self.inner.system_named("shell_runtime", shell_context);
 
         let ssh_context = describe_ssh_servers(&self.shell_sessions.list_ssh_servers());
-        let host_runtime_context = if host_profile == "container" {
-            format!(
-                "Linux container runtime. Default mode has network enabled. You may install dependencies freely. SSH available: {}. {}",
-                availability.ssh, ssh_context
-            )
-        } else if host_profile == "remote" {
-            format!(
-                "Remote SSH runtime. Default mode runs on the configured SSH target with network enabled. Local CLI commands exposed through bash are unavailable unless a local backend also exists. {}",
-                ssh_context
-            )
-        } else {
-            format!(
-                "User machine runtime in sandbox. Default mode has network enabled. Use unsafe for host-level side effects. SSH available: {}. {}",
-                availability.ssh, ssh_context
-            )
-        };
+        let host_runtime_context =
+            describe_host_runtime_context(host_profile, &availability, ssh_context.as_str());
 
         // Build tools description
-        let tools = self
-            .tool_descriptions
-            .iter()
-            .map(|(name, desc)| format!("- {name}: {desc}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let tools = render_tool_descriptions(&self.tool_descriptions);
 
         // Build skills description
         let has_skills = !self.skills.is_empty();
-        let skills = self
-            .skills
-            .iter()
-            .map(|s| format!("- {}: {}", s.name, s.description))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let skills = render_skill_descriptions(&self.skills);
 
         // Build subagents description
         let has_subagents = !self.subagents.is_empty();
-        let subagents = self
-            .subagents
-            .iter()
-            .map(|s| format!("- {} ({}): {}", s.name, s.path, s.description))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let subagents = render_subagent_descriptions(&self.subagents);
 
         // Get directory paths
         let sandbox_dir = self.bash_tool.working_dir().display().to_string();
@@ -737,23 +726,114 @@ fn short_description(description: &str) -> String {
         .to_string()
 }
 
+fn push_bullet_line(output: &mut String, body: &str) {
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str("- ");
+    output.push_str(body);
+}
+
+fn render_tool_descriptions(entries: &[(String, String)]) -> String {
+    let mut output = String::new();
+    for (name, description) in entries {
+        let mut line = String::with_capacity(name.len() + description.len() + 2);
+        line.push_str(name.as_str());
+        line.push_str(": ");
+        line.push_str(description.as_str());
+        push_bullet_line(&mut output, line.as_str());
+    }
+    output
+}
+
+fn render_skill_descriptions(entries: &[SkillInfo]) -> String {
+    let mut output = String::new();
+    for skill in entries {
+        let mut line = String::with_capacity(skill.name.len() + skill.description.len() + 2);
+        line.push_str(skill.name.as_str());
+        line.push_str(": ");
+        line.push_str(skill.description.as_str());
+        push_bullet_line(&mut output, line.as_str());
+    }
+    output
+}
+
+fn render_subagent_descriptions(entries: &[SubagentInfo]) -> String {
+    let mut output = String::new();
+    for subagent in entries {
+        let mut line = String::with_capacity(
+            subagent.name.len() + subagent.path.len() + subagent.description.len() + 5,
+        );
+        line.push_str(subagent.name.as_str());
+        line.push_str(" (");
+        line.push_str(subagent.path.as_str());
+        line.push_str("): ");
+        line.push_str(subagent.description.as_str());
+        push_bullet_line(&mut output, line.as_str());
+    }
+    output
+}
+
+fn describe_host_runtime_context(
+    host_profile: &str,
+    availability: &ShellRuntimeAvailability,
+    ssh_context: &str,
+) -> String {
+    let mut output = String::new();
+    match host_profile {
+        "container" => {
+            output.push_str(
+                "Linux container runtime. Default mode has network enabled. You may install dependencies freely. SSH available: ",
+            );
+            output.push_str(if availability.ssh { "true" } else { "false" });
+            output.push_str(". ");
+        }
+        "remote" => {
+            output.push_str(
+                "Remote SSH runtime. Default mode runs on the configured SSH target with network enabled. Local CLI commands exposed through bash are unavailable unless a local backend also exists. ",
+            );
+        }
+        "leash" => {
+            output.push_str(
+                "User machine runtime in sandbox. Default mode has network enabled. Use unsafe for host-level side effects. SSH available: ",
+            );
+            output.push_str(if availability.ssh { "true" } else { "false" });
+            output.push_str(". ");
+        }
+        _ => unreachable!("validated host profile"),
+    }
+    output.push_str(ssh_context);
+    output
+}
+
 fn describe_ssh_servers(servers: &[SshServer]) -> String {
     if servers.is_empty() {
         "No SSH servers are configured.".to_string()
     } else if servers.len() == 1 {
         let server = &servers[0];
-        format!(
-            "Configured SSH server: {} ({}). When using SSH backend, ssh_server_id may be omitted because only one server is configured.",
-            server.id(),
-            server.target
-        )
+        let mut output = String::with_capacity(server.id().len() + server.target.len() + 89);
+        output.push_str("Configured SSH server: ");
+        output.push_str(server.id());
+        output.push_str(" (");
+        output.push_str(server.target.as_str());
+        output.push_str("). When using SSH backend, ssh_server_id may be omitted because only one server is configured.");
+        output
     } else {
-        let listings = servers
-            .iter()
-            .map(|server| format!("{} ({})", server.id(), server.target))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("Configured SSH servers: {listings}.")
+        let mut listings = String::new();
+        for server in servers {
+            if !listings.is_empty() {
+                listings.push_str(", ");
+            }
+            listings.push_str(server.id());
+            listings.push_str(" (");
+            listings.push_str(server.target.as_str());
+            listings.push(')');
+        }
+        let mut output = String::with_capacity(listings.len() + 24);
+        output.push_str("Configured SSH servers: ");
+        output.push_str(listings.as_str());
+        output.push('.');
+        output
     }
 }
 
