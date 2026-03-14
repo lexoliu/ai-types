@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use aither_core::llm::{Message, Role};
 
+use crate::handoff::HandoffDocument;
+
 #[derive(Serialize)]
 struct TextBlock<'a> {
     #[serde(rename = "$text")]
@@ -124,6 +126,11 @@ impl Context {
     pub fn set_handoff(&mut self, handoff: impl Into<String>) {
         let handoff = handoff.into();
         self.handoff = Some(serialize_xml("handoff", &TextBlock { content: &handoff }));
+    }
+
+    /// Sets the compaction handoff document from a structured handoff artifact.
+    pub fn set_handoff_document(&mut self, handoff: &HandoffDocument) {
+        self.handoff = Some(serialize_xml("handoff", handoff));
     }
 
     /// Clears the compaction handoff document.

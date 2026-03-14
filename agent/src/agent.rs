@@ -22,6 +22,7 @@ use crate::{
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
     event::AgentEvent,
+    handoff::HandoffDocument,
     hook::{
         Hook, PostToolAction, PreToolAction, StopContext, StopReason, ToolResultContext,
         ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
@@ -831,7 +832,8 @@ where
         }
 
         let messages_compacted = messages.len();
-        let summary = self.generate_handoff_summary(focus).await?;
+        let handoff = self.generate_handoff_document(focus).await?;
+        let summary = handoff.render_markdown();
 
         if let Some(transcript) = &self.transcript {
             transcript.write_compact_marker().await;
@@ -839,7 +841,7 @@ where
 
         self.context.clear_recent();
         self.context.clear_reminders();
-        self.context.set_handoff(summary.clone());
+        self.context.set_handoff_document(&handoff);
 
         Ok(Some(CompactResult {
             messages_compacted,
@@ -848,10 +850,18 @@ where
         }))
     }
 
-    /// Generates a structured handoff summary using the current tier model.
-    async fn generate_handoff_summary(&self, focus: Option<&str>) -> Result<String, AgentError> {
+    /// Generates a structured handoff document using the current tier model.
+    async fn generate_handoff_document(
+        &self,
+        focus: Option<&str>,
+    ) -> Result<HandoffDocument, AgentError> {
         let focus_instruction = match focus.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(f) => ["Focus the handoff on: ", f].concat(),
+            Some(f) => {
+                let mut instruction = String::with_capacity(f.len() + 22);
+                instruction.push_str("Focus the handoff on: ");
+                instruction.push_str(f);
+                instruction
+            }
             None => "No additional focus hint was provided.".to_string(),
         };
 
@@ -915,13 +925,16 @@ where
             }
         }
 
-        let summary = chunks.join("").trim().to_string();
-        if summary.is_empty() {
+        let response = chunks.join("").trim().to_string();
+        if response.is_empty() {
             return Err(AgentError::Llm(
                 "Compaction failed to generate handoff summary".to_string(),
             ));
         }
-        Ok(summary)
+        serde_json::from_str::<HandoffDocument>(&response)
+            .map_err(|error| AgentError::Llm(error.to_string()))?
+            .validate()
+            .map_err(AgentError::Llm)
     }
 
     /// Injects a continuation reminder when working documents still have pending tasks.

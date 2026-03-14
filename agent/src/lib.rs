@@ -42,6 +42,7 @@ mod context_window;
 mod error;
 mod event;
 mod fs_util;
+mod handoff;
 mod hook;
 mod model_group;
 mod stream;
@@ -85,6 +86,7 @@ pub use context::{Context, ContextCheckpoint};
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;
 pub use event::AgentEvent;
+pub use handoff::HandoffDocument;
 pub use hook::{
     HCons, Hook, PostToolAction, PreToolAction, StopContext, StopReason, ToolResultContext,
     ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
