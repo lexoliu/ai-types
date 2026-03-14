@@ -11,6 +11,9 @@ pub struct AgentCheckpoint {
     pub context_json: String,
     /// Current todo list state.
     pub todo_items: Vec<TodoItem>,
+    /// Skills activated for the current run.
+    #[cfg(feature = "skills")]
+    pub active_skill_names: Vec<String>,
     /// Optional external history anchor supplied by the host runtime.
     pub history_anchor: Option<usize>,
     /// Hash of the active tool surface for compatibility checks.

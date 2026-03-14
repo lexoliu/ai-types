@@ -1110,6 +1110,12 @@ where
         Ok(AgentCheckpoint {
             context_json,
             todo_items,
+            #[cfg(feature = "skills")]
+            active_skill_names: self
+                .active_skills
+                .iter()
+                .map(|skill| skill.name.clone())
+                .collect(),
             history_anchor,
             tool_surface_hash: self.tool_surface_hash(),
             context_window,
@@ -1145,6 +1151,35 @@ where
             list.write(checkpoint.todo_items);
         } else if let Some(list) = &self.todo_list {
             list.clear();
+        }
+        #[cfg(feature = "skills")]
+        {
+            self.active_skills.clear();
+            self.active_allowed_tools = None;
+            if !checkpoint.active_skill_names.is_empty() {
+                let registry = self
+                    .skill_registry
+                    .as_ref()
+                    .ok_or_else(|| AgentError::Config("checkpoint contains active skills but no skill registry is loaded".to_string()))?;
+                let mut allowed_tools = HashSet::new();
+                let mut saw_explicit_allowlist = false;
+                for name in checkpoint.active_skill_names {
+                    let skill = registry
+                        .get(&name)
+                        .ok_or_else(|| AgentError::Config(["checkpoint references unknown skill '", name.as_str(), "'"].concat()))?
+                        .clone();
+                    if let Some(tools) = &skill.allowed_tools {
+                        saw_explicit_allowlist = true;
+                        for tool in tools {
+                            allowed_tools.insert(tool.to_lowercase());
+                        }
+                    }
+                    self.active_skills.push(skill);
+                }
+                if saw_explicit_allowlist {
+                    self.active_allowed_tools = Some(allowed_tools);
+                }
+            }
         }
         Ok(())
     }
