@@ -14,8 +14,10 @@ use aither_core::{
 use askama::Template;
 use futures_core::Stream;
 use futures_lite::StreamExt;
+use sha2::{Digest, Sha256};
 
 use crate::{
+    checkpoint::AgentCheckpoint,
     compression::{ContextStrategy, estimate_context_usage},
     config::{AgentConfig, AgentKind},
     context::{Context, serialize_xml},
@@ -996,11 +998,84 @@ where
         serde_json::to_string(&self.context)
     }
 
+    fn tool_surface_hash(&self) -> String {
+        let mut names = self
+            .tools
+            .active_definitions()
+            .into_iter()
+            .map(|definition| definition.name().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        let mut hasher = Sha256::new();
+        for name in names {
+            hasher.update(name.as_bytes());
+            hasher.update(b"\n");
+        }
+        hex_encode(hasher.finalize().as_slice())
+    }
+
+    /// Export a checkpoint bundle for restart-safe persistence.
+    pub async fn export_checkpoint(
+        &mut self,
+        history_anchor: Option<usize>,
+    ) -> Result<AgentCheckpoint, AgentError> {
+        self.ensure_initialized().await;
+        let context_json = self
+            .export_context_json()
+            .map_err(|error| AgentError::Config(error.to_string()))?;
+        let context_window = self.snapshot_context_window().await;
+        let todo_items = self
+            .todo_list
+            .as_ref()
+            .map(super::todo::TodoList::items)
+            .unwrap_or_default();
+        Ok(AgentCheckpoint {
+            context_json,
+            todo_items,
+            history_anchor,
+            tool_surface_hash: self.tool_surface_hash(),
+            context_window,
+            has_background_tasks: self
+                .background_receiver
+                .as_ref()
+                .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running),
+        })
+    }
+
+    /// Export a checkpoint bundle encoded as JSON.
+    pub async fn export_checkpoint_json(
+        &mut self,
+        history_anchor: Option<usize>,
+    ) -> Result<String, AgentError> {
+        let checkpoint = self.export_checkpoint(history_anchor).await?;
+        serde_json::to_string(&checkpoint).map_err(|error| AgentError::Config(error.to_string()))
+    }
+
     /// Restore the full agent context from a serialized snapshot.
     pub fn restore_context_json(&mut self, context_json: &str) -> Result<(), serde_json::Error> {
         let restored: Context = serde_json::from_str(context_json)?;
         self.context.restore_runtime_state(restored);
         Ok(())
+    }
+
+    /// Restore a previously exported checkpoint bundle.
+    pub fn restore_checkpoint(&mut self, checkpoint: AgentCheckpoint) -> Result<(), AgentError> {
+        self.restore_context_json(&checkpoint.context_json)
+            .map_err(|error| AgentError::Config(error.to_string()))?;
+        if !checkpoint.todo_items.is_empty() {
+            let list = self.todo_list.get_or_insert_with(TodoList::new);
+            list.write(checkpoint.todo_items);
+        } else if let Some(list) = &self.todo_list {
+            list.clear();
+        }
+        Ok(())
+    }
+
+    /// Restore a previously exported checkpoint bundle from JSON.
+    pub fn restore_checkpoint_json(&mut self, checkpoint_json: &str) -> Result<(), AgentError> {
+        let checkpoint: AgentCheckpoint = serde_json::from_str(checkpoint_json)
+            .map_err(|error| AgentError::Config(error.to_string()))?;
+        self.restore_checkpoint(checkpoint)
     }
 
     /// Returns a structured snapshot of the currently assembled context window.
@@ -1707,6 +1782,16 @@ fn format_todo_items_json(items: &[TodoItem]) -> String {
 
 fn format_builtin_tool_result(tool: &str, result: &str) -> String {
     ["[", tool, "] ", result].concat()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 fn first_paragraph(text: &str) -> String {

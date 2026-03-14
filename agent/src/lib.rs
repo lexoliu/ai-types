@@ -35,6 +35,7 @@ pub mod ask_user;
 mod bash_agent;
 mod browser_backend;
 mod builder;
+mod checkpoint;
 mod compression;
 mod config;
 mod context;
@@ -78,6 +79,7 @@ pub use agent::{Agent, CompactResult};
 pub use bash_agent::BashAgentBuilder;
 pub use browser_backend::{BrowserBackend, BrowserBackendError, StaticCdpBrowser};
 pub use builder::AgentBuilder;
+pub use checkpoint::AgentCheckpoint;
 pub use compression::{
     CompressionLevel, ContextStrategy, PreserveConfig, PreservedContent, SmartCompressionConfig,
 };
