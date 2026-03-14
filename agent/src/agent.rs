@@ -805,7 +805,9 @@ where
 
                 if had_completed {
                     // Continue processing with background results
-                    let continuation = self.continue_after_background_streaming(run_id.as_str()).await;
+                    let continuation = self
+                        .continue_after_background_streaming(run_id.as_str(), iteration)
+                        .await;
                     for event in continuation {
                         yield event?;
                     }
@@ -1382,13 +1384,15 @@ where
     async fn continue_after_background_streaming(
         &mut self,
         run_id: &str,
+        turn_offset: usize,
     ) -> Vec<Result<AgentEvent, AgentError>> {
         let mut events = Vec::new();
         let mut iteration = 0;
 
         loop {
             iteration += 1;
-            if iteration > self.config.max_iterations {
+            let turns = turn_offset + iteration;
+            if turns > self.config.max_iterations {
                 events.push(Err(AgentError::MaxIterations {
                     limit: self.config.max_iterations,
                 }));
@@ -1494,7 +1498,7 @@ where
                     self.context.push(Message::assistant(&response_text));
                 }
                 let checkpoint = match self
-                    .emit_checkpoint(CheckpointReason::Stop, &response_text, iteration)
+                    .emit_checkpoint(CheckpointReason::Stop, &response_text, turns)
                     .await
                 {
                     Ok(checkpoint) => checkpoint,
@@ -1506,14 +1510,26 @@ where
                 events.push(Ok(AgentEvent::checkpoint(
                     run_id.to_string(),
                     CheckpointReason::Stop,
-                    iteration,
+                    turns,
                     checkpoint.phase,
                     checkpoint.message_count,
                 )));
-                events.push(Ok(AgentEvent::turn_complete(iteration, false)));
+                events.push(Ok(AgentEvent::turn_complete(turns, false)));
+                let stop_ctx = StopContext {
+                    final_text: &response_text,
+                    turns,
+                    reason: StopReason::NoToolCalls,
+                };
+                if let Some(reason) = self.hooks.on_stop(&stop_ctx).await {
+                    events.push(Err(AgentError::HookRejected {
+                        hook: "on_stop",
+                        reason,
+                    }));
+                    return events;
+                }
                 events.push(Ok(AgentEvent::Complete {
                     final_text: response_text,
-                    turns: iteration,
+                    turns,
                 }));
                 return events;
             }
@@ -1589,7 +1605,7 @@ where
             }
 
             let checkpoint = match self
-                .emit_checkpoint(CheckpointReason::TurnBoundary, &response_text, iteration)
+                .emit_checkpoint(CheckpointReason::TurnBoundary, &response_text, turns)
                 .await
             {
                 Ok(checkpoint) => checkpoint,
@@ -1601,11 +1617,11 @@ where
             events.push(Ok(AgentEvent::checkpoint(
                 run_id.to_string(),
                 CheckpointReason::TurnBoundary,
-                iteration,
+                turns,
                 checkpoint.phase,
                 checkpoint.message_count,
             )));
-            events.push(Ok(AgentEvent::turn_complete(iteration, true)));
+            events.push(Ok(AgentEvent::turn_complete(turns, true)));
         }
     }
 
