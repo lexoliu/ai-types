@@ -88,8 +88,8 @@ pub use error::AgentError;
 pub use event::AgentEvent;
 pub use handoff::HandoffDocument;
 pub use hook::{
-    HCons, Hook, PostToolAction, PreToolAction, StopContext, StopReason, ToolResultContext,
-    ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
+    CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction, StopContext,
+    StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
 };
 pub use stream::AgentStream;
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoTool, TodoWriteArgs};

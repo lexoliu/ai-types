@@ -24,6 +24,8 @@
 
 use std::time::Duration;
 
+use crate::context_window::ContextWindowSnapshot;
+
 /// Context provided to hooks before a tool is called.
 #[derive(Debug)]
 pub struct ToolUseContext<'a> {
@@ -74,6 +76,32 @@ pub struct TurnBoundaryContext<'a> {
     pub turn: usize,
     /// Number of recent conversation messages after processing the tool batch.
     pub message_count: usize,
+}
+
+/// Reason why a checkpoint is being emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointReason {
+    /// A full tool/result cycle was committed and the next model request has not started yet.
+    TurnBoundary,
+    /// The run is about to stop with the current context state.
+    Stop,
+}
+
+/// Structured checkpoint payload emitted from the runtime.
+#[derive(Debug)]
+pub struct CheckpointContext<'a> {
+    /// Why this checkpoint was emitted.
+    pub reason: CheckpointReason,
+    /// Assistant text produced in the current turn before this checkpoint.
+    pub assistant_text: &'a str,
+    /// Current turn number (1-indexed within the agent loop).
+    pub turn: usize,
+    /// Number of recent conversation messages currently in memory.
+    pub message_count: usize,
+    /// Serialized runtime context after the latest turn mutations.
+    pub context_json: &'a str,
+    /// Structured snapshot of the currently assembled context window.
+    pub window: &'a ContextWindowSnapshot,
 }
 
 /// Reason why the agent stopped.
@@ -175,6 +203,16 @@ pub trait Hook: Send + Sync {
     ) -> impl std::future::Future<Output = TurnBoundaryAction> + Send {
         async { TurnBoundaryAction::Continue }
     }
+
+    /// Called when the runtime emits a structured checkpoint.
+    ///
+    /// Return `Some(error)` to fail the run immediately.
+    fn on_checkpoint(
+        &self,
+        _ctx: &CheckpointContext<'_>,
+    ) -> impl std::future::Future<Output = Option<String>> + Send {
+        async { None }
+    }
 }
 
 /// No-op implementation for unit type (base case for `HCons`).
@@ -245,6 +283,13 @@ where
             TurnBoundaryAction::Continue => self.tail.on_turn_boundary(ctx).await,
             other => other,
         }
+    }
+
+    async fn on_checkpoint(&self, ctx: &CheckpointContext<'_>) -> Option<String> {
+        if let Some(err) = self.head.on_checkpoint(ctx).await {
+            return Some(err);
+        }
+        self.tail.on_checkpoint(ctx).await
     }
 }
 

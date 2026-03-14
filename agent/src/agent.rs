@@ -24,8 +24,8 @@ use crate::{
     event::AgentEvent,
     handoff::HandoffDocument,
     hook::{
-        Hook, PostToolAction, PreToolAction, StopContext, StopReason, ToolResultContext,
-        ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
+        CheckpointContext, CheckpointReason, Hook, PostToolAction, PreToolAction, StopContext,
+        StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
     },
     todo::{TodoItem, TodoList, TodoStatus},
     tools::AgentTools,
@@ -518,6 +518,7 @@ where
                             transcript.write_assistant_text(&response_text).await;
                         }
                     }
+                    yield AgentEvent::turn_complete(iteration, false);
                     if self.inject_working_doc_continue_reminder().await {
                         continue;
                     }
@@ -716,6 +717,9 @@ where
                     turn: iteration,
                     message_count: self.context.len_recent(),
                 };
+                self.emit_checkpoint(CheckpointReason::TurnBoundary, &response_text, iteration)
+                    .await?;
+                yield AgentEvent::turn_complete(iteration, true);
                 if self.hooks.on_turn_boundary(&boundary_ctx).await == TurnBoundaryAction::EndTurn
                 {
                     break (response_text, StopReason::EndTurn);
@@ -764,6 +768,9 @@ where
                     return;
                 }
             }
+
+            self.emit_checkpoint(CheckpointReason::Stop, &final_text, iteration)
+                .await?;
 
             // Notify hooks
             let stop_ctx = StopContext {
@@ -1358,6 +1365,14 @@ where
                 if !response_text.is_empty() {
                     self.context.push(Message::assistant(&response_text));
                 }
+                if let Err(error) = self
+                    .emit_checkpoint(CheckpointReason::Stop, &response_text, iteration)
+                    .await
+                {
+                    events.push(Err(error));
+                    return events;
+                }
+                events.push(Ok(AgentEvent::turn_complete(iteration, false)));
                 events.push(Ok(AgentEvent::Complete {
                     final_text: response_text,
                     turns: iteration,
@@ -1416,6 +1431,15 @@ where
                     self.context.push(Message::system(&result_msg));
                 }
             }
+
+            if let Err(error) = self
+                .emit_checkpoint(CheckpointReason::TurnBoundary, &response_text, iteration)
+                .await
+            {
+                events.push(Err(error));
+                return events;
+            }
+            events.push(Ok(AgentEvent::turn_complete(iteration, true)));
         }
     }
 
@@ -1466,6 +1490,33 @@ where
     fn reassemble_context(&mut self) -> usize {
         self.context.clear_reminders();
         self.context.prune_recent_system_messages()
+    }
+
+    async fn emit_checkpoint(
+        &mut self,
+        reason: CheckpointReason,
+        assistant_text: &str,
+        turn: usize,
+    ) -> Result<(), AgentError> {
+        let context_json = self
+            .export_context_json()
+            .map_err(|error| AgentError::Config(error.to_string()))?;
+        let window = self.assemble_context_window().await;
+        let checkpoint_ctx = CheckpointContext {
+            reason,
+            assistant_text,
+            turn,
+            message_count: self.context.len_recent(),
+            context_json: &context_json,
+            window: &window,
+        };
+        if let Some(reason) = self.hooks.on_checkpoint(&checkpoint_ctx).await {
+            return Err(AgentError::HookRejected {
+                hook: "on_checkpoint",
+                reason,
+            });
+        }
+        Ok(())
     }
 
     /// Formats the todo list as a system reminder.
