@@ -100,6 +100,10 @@ pub struct CheckpointContext<'a> {
     pub message_count: usize,
     /// Serialized runtime context after the latest turn mutations.
     pub context_json: &'a str,
+    /// Hash of the currently exposed tool surface.
+    pub tool_surface_hash: &'a str,
+    /// Whether background work is still active.
+    pub has_background_tasks: bool,
     /// Structured snapshot of the currently assembled context window.
     pub window: &'a ContextWindowSnapshot,
 }

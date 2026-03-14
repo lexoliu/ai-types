@@ -1623,6 +1623,7 @@ where
         let context_json = self
             .export_context_json()
             .map_err(|error| AgentError::Config(error.to_string()))?;
+        let tool_surface_hash = self.tool_surface_hash();
         let window = self.assemble_context_window().await;
         let checkpoint_ctx = CheckpointContext {
             reason,
@@ -1630,6 +1631,11 @@ where
             turn,
             message_count: self.context.len_recent(),
             context_json: &context_json,
+            tool_surface_hash: &tool_surface_hash,
+            has_background_tasks: self
+                .background_receiver
+                .as_ref()
+                .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running),
             window: &window,
         };
         if let Some(reason) = self.hooks.on_checkpoint(&checkpoint_ctx).await {
