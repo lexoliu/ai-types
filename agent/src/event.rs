@@ -63,6 +63,32 @@ pub enum AgentEvent {
         message_count: usize,
     },
 
+    /// A bash command was promoted to a background task.
+    BackgroundTaskStarted {
+        /// Background task identifier.
+        task_id: String,
+        /// Inline preview of current output.
+        output_preview: String,
+        /// File path or URL where full output can be recovered.
+        output_file: String,
+    },
+
+    /// A background task completed and its result was reinjected into context.
+    BackgroundTaskCompleted {
+        /// Background task identifier.
+        task_id: String,
+        /// Structured XML/text payload injected back into context.
+        result: String,
+    },
+
+    /// A terminal task is waiting for stdin from the user or host runtime.
+    TerminalInputNeeded {
+        /// Optional task identifier for the waiting terminal.
+        task_id: Option<String>,
+        /// Human-readable notice explaining why input is needed.
+        notice: String,
+    },
+
     /// Agent finished processing successfully.
     Complete {
         /// The final response text.
@@ -166,6 +192,41 @@ impl AgentEvent {
             turn,
             phase,
             message_count,
+        }
+    }
+
+    /// Creates a background-task-started event.
+    #[must_use]
+    pub fn background_task_started(
+        task_id: impl Into<String>,
+        output_preview: impl Into<String>,
+        output_file: impl Into<String>,
+    ) -> Self {
+        Self::BackgroundTaskStarted {
+            task_id: task_id.into(),
+            output_preview: output_preview.into(),
+            output_file: output_file.into(),
+        }
+    }
+
+    /// Creates a background-task-completed event.
+    #[must_use]
+    pub fn background_task_completed(task_id: impl Into<String>, result: impl Into<String>) -> Self {
+        Self::BackgroundTaskCompleted {
+            task_id: task_id.into(),
+            result: result.into(),
+        }
+    }
+
+    /// Creates a terminal-input-needed event.
+    #[must_use]
+    pub fn terminal_input_needed(
+        task_id: Option<String>,
+        notice: impl Into<String>,
+    ) -> Self {
+        Self::TerminalInputNeeded {
+            task_id,
+            notice: notice.into(),
         }
     }
 

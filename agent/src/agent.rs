@@ -35,7 +35,7 @@ use crate::{
     working_docs,
 };
 
-use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, OutputStore};
+use aither_sandbox::{BackgroundTaskReceiver, CONTAINER_STDIN_BLOCKED_NOTICE, JobRegistry, OutputStore};
 use std::sync::Arc;
 
 /// Result of a compaction operation.
@@ -120,6 +120,18 @@ struct BackgroundBashResultXml {
     stderr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+struct BackgroundTaskStartedEvent {
+    task_id: String,
+    output_preview: String,
+    output_file: String,
+    reminder: String,
+}
+
+struct TerminalInputNeededEvent {
+    task_id: Option<String>,
+    notice: String,
 }
 
 /// Which model tier to use for the agent's main reasoning loop.
@@ -671,9 +683,20 @@ where
                     self.context.push(Message::tool(&call_id, processed_content));
                     if is_bash_call
                         && tool_result.is_ok()
-                        && let Some(reminder) = self.format_background_started_reminder(content)
+                        && let Some(started) = self.format_background_started_event(content)
                     {
-                        self.context.push(Message::system(reminder));
+                        self.context.push(Message::system(&started.reminder));
+                        yield AgentEvent::background_task_started(
+                            started.task_id,
+                            started.output_preview,
+                            started.output_file,
+                        );
+                    }
+                    if is_bash_call
+                        && tool_result.is_ok()
+                        && let Some(waiting) = self.detect_terminal_input_needed(content)
+                    {
+                        yield AgentEvent::terminal_input_needed(waiting.task_id, waiting.notice);
                     }
                 }
 
@@ -719,6 +742,7 @@ where
                         tracing::info!(task_id = %task.task_id, "background task completed");
                         let result_msg = self.format_background_task_result(&task);
                         self.context.push(Message::system(&result_msg));
+                        yield AgentEvent::background_task_completed(task.task_id.clone(), result_msg);
                     }
                 }
 
@@ -754,6 +778,7 @@ where
                     tracing::info!(task_id = %task.task_id, "background task completed (final check)");
                     let result_msg = self.format_background_task_result(&task);
                     self.context.push(Message::system(&result_msg));
+                    yield AgentEvent::background_task_completed(task.task_id.clone(), result_msg);
                 }
 
                 const MAX_WAIT: Duration = Duration::from_secs(300);
@@ -765,6 +790,7 @@ where
                         tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
                         let result_msg = self.format_background_task_result(&task);
                         self.context.push(Message::system(&result_msg));
+                        yield AgentEvent::background_task_completed(task.task_id.clone(), result_msg);
                         had_completed = true;
                     } else {
                         let has_running = self
@@ -1530,9 +1556,23 @@ where
                     .push(Message::tool(&call_id, processed_content));
                 if is_bash_call
                     && tool_result.is_ok()
-                    && let Some(reminder) = self.format_background_started_reminder(content)
+                    && let Some(started) = self.format_background_started_event(content)
                 {
-                    self.context.push(Message::system(reminder));
+                    self.context.push(Message::system(&started.reminder));
+                    events.push(Ok(AgentEvent::background_task_started(
+                        started.task_id,
+                        started.output_preview,
+                        started.output_file,
+                    )));
+                }
+                if is_bash_call
+                    && tool_result.is_ok()
+                    && let Some(waiting) = self.detect_terminal_input_needed(content)
+                {
+                    events.push(Ok(AgentEvent::terminal_input_needed(
+                        waiting.task_id,
+                        waiting.notice,
+                    )));
                 }
             }
 
@@ -1541,6 +1581,10 @@ where
                 for task in completed_tasks {
                     let result_msg = self.format_background_task_result(&task);
                     self.context.push(Message::system(&result_msg));
+                    events.push(Ok(AgentEvent::background_task_completed(
+                        task.task_id.clone(),
+                        result_msg,
+                    )));
                 }
             }
 
@@ -1683,8 +1727,8 @@ where
         .ok()
     }
 
-    /// Formats a reminder when `bash` has been auto-promoted to background.
-    fn format_background_started_reminder(&self, tool_content: &str) -> Option<String> {
+    /// Formats a reminder and event payload when `bash` has been auto-promoted to background.
+    fn format_background_started_event(&self, tool_content: &str) -> Option<BackgroundTaskStartedEvent> {
         let payload: serde_json::Value = serde_json::from_str(tool_content).ok()?;
         let status = payload.get("status")?.as_str()?;
         if status != "running" {
@@ -1711,13 +1755,46 @@ where
             .and_then(serde_json::Value::as_str)
             .unwrap_or("(missing output file)");
 
-        BackgroundStartedReminderTemplate {
+        let reminder = BackgroundStartedReminderTemplate {
             task_id,
             output_preview,
             output_file,
         }
         .render()
-        .ok()
+        .ok()?;
+
+        Some(BackgroundTaskStartedEvent {
+            task_id: task_id.to_string(),
+            output_preview: output_preview.to_string(),
+            output_file: output_file.to_string(),
+            reminder,
+        })
+    }
+
+    fn detect_terminal_input_needed(&self, tool_content: &str) -> Option<TerminalInputNeededEvent> {
+        let payload: aither_sandbox::BashResult = serde_json::from_str(tool_content).ok()?;
+        if payload.status.as_deref() != Some("running") {
+            return None;
+        }
+        let notice = match &payload.stdout {
+            aither_sandbox::OutputEntry::Inline { content }
+            | aither_sandbox::OutputEntry::Loaded { content, .. } => match content {
+                aither_sandbox::Content::Text { text, .. } => text.as_str(),
+                aither_sandbox::Content::Image { .. } => return None,
+            },
+            aither_sandbox::OutputEntry::Stored { content, .. } => match content {
+                Some(aither_sandbox::Content::Text { text, .. }) => text.as_str(),
+                Some(aither_sandbox::Content::Image { .. }) | None => return None,
+            },
+            aither_sandbox::OutputEntry::Empty => return None,
+        };
+        if !notice.starts_with(CONTAINER_STDIN_BLOCKED_NOTICE) {
+            return None;
+        }
+        Some(TerminalInputNeededEvent {
+            task_id: payload.task_id,
+            notice: notice.to_string(),
+        })
     }
 
     /// Formats a completed background task result as a system message.
