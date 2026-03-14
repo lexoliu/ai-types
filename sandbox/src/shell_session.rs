@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     future::Future,
     pin::Pin,
-    sync::{Arc, OnceLock, RwLock},
+    sync::Arc,
 };
 
 use async_channel::{Receiver, Sender};
@@ -105,6 +105,61 @@ impl ContainerExec for ContainerExecHandle {
     }
 }
 
+#[derive(Clone)]
+pub struct ContainerShellRuntime {
+    exec: Arc<dyn ContainerExecObject>,
+    container_id: String,
+    ipc_host: String,
+}
+
+impl std::fmt::Debug for ContainerShellRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContainerShellRuntime")
+            .field("container_id", &self.container_id)
+            .field("ipc_host", &self.ipc_host)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ContainerShellRuntime {
+    #[must_use]
+    pub fn new(
+        container_id: impl Into<String>,
+        ipc_host: impl Into<String>,
+        exec: ContainerExecHandle,
+    ) -> Self {
+        let container_id = container_id.into();
+        let ipc_host = ipc_host.into();
+        assert!(
+            !container_id.trim().is_empty(),
+            "container runtime requires a non-empty container_id"
+        );
+        assert!(
+            !ipc_host.trim().is_empty(),
+            "container runtime requires a non-empty ipc_host"
+        );
+        Self {
+            exec: Arc::clone(&exec.inner),
+            container_id,
+            ipc_host,
+        }
+    }
+
+    #[must_use]
+    pub fn container_id(&self) -> &str {
+        &self.container_id
+    }
+
+    #[must_use]
+    pub fn ipc_host(&self) -> &str {
+        &self.ipc_host
+    }
+
+    pub(crate) fn exec(&self) -> Arc<dyn ContainerExecObject> {
+        Arc::clone(&self.exec)
+    }
+}
+
 impl<T: ContainerExec> ContainerExecObject for T {
     fn exec_boxed<'a>(
         &'a self,
@@ -182,13 +237,10 @@ pub trait SshSessionAuthorizer: Send + Sync {
 
 #[derive(Clone)]
 pub struct ShellSessionRegistry {
-    availability: Arc<RwLock<ShellRuntimeAvailability>>,
-    ssh_servers: Arc<RwLock<Vec<SshServer>>>,
-    ssh_authorizer: Arc<RwLock<Option<Arc<dyn SshSessionAuthorizer>>>>,
-    /// Container executor — set once, shared across all clones via `OnceLock`.
-    container_exec: Arc<OnceLock<Arc<dyn ContainerExecObject>>>,
-    /// Default container ID — set once, used by container backend.
-    container_id: Arc<OnceLock<String>>,
+    availability: ShellRuntimeAvailability,
+    ssh_servers: Vec<SshServer>,
+    ssh_authorizer: Option<Arc<dyn SshSessionAuthorizer>>,
+    container_runtime: Option<ContainerShellRuntime>,
 }
 
 impl std::fmt::Debug for ShellSessionRegistry {
@@ -202,67 +254,37 @@ impl ShellSessionRegistry {
     #[must_use]
     pub fn new(availability: ShellRuntimeAvailability) -> Self {
         Self {
-            availability: Arc::new(RwLock::new(availability)),
-            ssh_servers: Arc::new(RwLock::new(Vec::new())),
-            ssh_authorizer: Arc::new(RwLock::new(None)),
-            container_exec: Arc::new(OnceLock::new()),
-            container_id: Arc::new(OnceLock::new()),
+            availability,
+            ssh_servers: Vec::new(),
+            ssh_authorizer: None,
+            container_runtime: None,
         }
     }
 
-    /// Set the container executor (can only be called once; subsequent calls are no-ops).
-    pub fn set_container_exec<T>(&self, exec: Arc<T>)
-    where
-        T: ContainerExec + 'static,
-    {
-        let exec: Arc<dyn ContainerExecObject> = exec;
-        let _ = self.container_exec.set(exec);
+    #[must_use]
+    pub fn with_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
+        self.availability = availability;
+        self
     }
 
-    /// Set the default container ID for container backend commands.
-    pub fn set_container_id(&self, id: String) {
-        let _ = self.container_id.set(id);
+    #[must_use]
+    pub fn with_ssh_authorizer(mut self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
+        self.ssh_authorizer = Some(authorizer);
+        self
     }
 
-    pub fn set_availability(&self, availability: ShellRuntimeAvailability) -> Result<(), String> {
-        *self
-            .availability
-            .write()
-            .map_err(|_| "shell availability lock poisoned".to_string())? = availability;
-        Ok(())
-    }
-
-    pub fn set_ssh_authorizer(
-        &self,
-        authorizer: Arc<dyn SshSessionAuthorizer>,
-    ) -> Result<(), String> {
-        *self
-            .ssh_authorizer
-            .write()
-            .map_err(|_| "ssh authorizer lock poisoned".to_string())? = Some(authorizer);
-        Ok(())
+    #[must_use]
+    pub fn with_container_runtime(mut self, runtime: ContainerShellRuntime) -> Self {
+        self.container_runtime = Some(runtime);
+        self
     }
 
     #[must_use]
     pub fn availability(&self) -> ShellRuntimeAvailability {
-        self.availability
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.availability.clone()
     }
 
-    /// Get the container executor (if set).
-    pub(crate) fn container_exec(&self) -> Option<Arc<dyn ContainerExecObject>> {
-        self.container_exec.get().cloned()
-    }
-
-    /// Get the configured container ID (if set).
-    #[must_use]
-    pub fn container_id(&self) -> Option<String> {
-        self.container_id.get().cloned()
-    }
-
-    pub fn set_ssh_servers(&self, servers: Vec<SshServer>) -> Result<(), String> {
+    pub fn with_ssh_servers(mut self, servers: Vec<SshServer>) -> Result<Self, String> {
         let mut seen = HashSet::new();
         let mut deduped = Vec::new();
         for server in servers {
@@ -277,27 +299,21 @@ impl ShellSessionRegistry {
             deduped.push(SshServer { name: id, target });
         }
 
-        *self
-            .ssh_servers
-            .write()
-            .map_err(|_| "ssh server lock poisoned".to_string())? = deduped;
-        Ok(())
+        self.ssh_servers = deduped;
+        Ok(self)
     }
 
     #[must_use]
     pub fn list_ssh_servers(&self) -> Vec<SshServer> {
-        self.ssh_servers
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.ssh_servers.clone()
+    }
+
+    pub(crate) fn container_runtime(&self) -> Option<&ContainerShellRuntime> {
+        self.container_runtime.as_ref()
     }
 
     pub fn default_ssh_server(&self) -> Result<SshServer, String> {
-        let servers = self
-            .ssh_servers
-            .read()
-            .map_err(|_| "ssh server lock poisoned".to_string())?;
-        match servers.as_slice() {
+        match self.ssh_servers.as_slice() {
             [] => Err("no ssh servers are configured".to_string()),
             [server] => Ok(server.clone()),
             _ => Err("ssh_server_id is required because multiple ssh servers are configured".to_string()),
@@ -310,8 +326,6 @@ impl ShellSessionRegistry {
             return Err("ssh_server_id is required for ssh mode".to_string());
         }
         self.ssh_servers
-            .read()
-            .map_err(|_| "ssh server lock poisoned".to_string())?
             .iter()
             .find(|s| s.id() == wanted)
             .cloned()
@@ -338,7 +352,7 @@ impl ShellSessionRegistry {
     }
 
     pub fn ssh_authorizer(&self) -> Option<Arc<dyn SshSessionAuthorizer>> {
-        self.ssh_authorizer.read().ok()?.clone()
+        self.ssh_authorizer.clone()
     }
 }
 
@@ -558,13 +572,12 @@ mod tests {
             local: false,
             container: false,
             ssh: true,
-        });
-        registry
-            .set_ssh_servers(vec![SshServer {
+        })
+        .with_ssh_servers(vec![SshServer {
                 name: "prod".to_string(),
                 target: "root@example.com".to_string(),
             }])
-            .expect("ssh server should configure");
+        .expect("ssh server should configure");
 
         let server = registry
             .default_ssh_server()
@@ -579,9 +592,8 @@ mod tests {
             local: false,
             container: false,
             ssh: true,
-        });
-        registry
-            .set_ssh_servers(vec![
+        })
+        .with_ssh_servers(vec![
                 SshServer {
                     name: "prod".to_string(),
                     target: "root@example.com".to_string(),
@@ -591,7 +603,7 @@ mod tests {
                     target: "root@staging.example.com".to_string(),
                 },
             ])
-            .expect("ssh servers should configure");
+        .expect("ssh servers should configure");
 
         let error = registry
             .default_ssh_server()

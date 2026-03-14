@@ -9,5 +9,5 @@ chmod +x "$MAY_IPC_DIR/$cmd";
 done;
 export PATH="$MAY_IPC_DIR:$PATH";
 hash -r;
-export LEASH_IPC_SOCKET="tcp://${MAY_HOST_GATEWAY:-host.docker.internal}:{{ ipc_port }}";
+export LEASH_IPC_SOCKET="tcp://{{ ipc_host }}:{{ ipc_port }}";
 {{ script }}

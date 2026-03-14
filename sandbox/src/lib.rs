@@ -89,7 +89,7 @@ pub use job_registry::{JobInfo, JobRegistry, JobStatus, TerminalDelta};
 pub use output::{Content, OutputEntry, OutputFormat, OutputStore, PendingUrl};
 pub use permission::{BashMode, PermissionHandler};
 pub use shell_session::{
-    ContainerExec, ContainerExecHandle, ContainerExecOutcome, ShellBackend,
-    ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile, SshServer,
+    ContainerExec, ContainerExecHandle, ContainerExecOutcome, ContainerShellRuntime,
+    ShellBackend, ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile, SshServer,
     SshSessionAuthorizer, bootstrap_ssh_runtime,
 };

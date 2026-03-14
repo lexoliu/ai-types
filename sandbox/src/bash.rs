@@ -45,7 +45,10 @@ use crate::{
         Content, INLINE_OUTPUT_LIMIT, OutputEntry, OutputFormat, OutputStore, save_raw_to_file,
     },
     permission::{BashMode, PermissionError, PermissionHandler},
-    shell_session::{ShellBackend, ShellSessionRegistry, SshRuntimeProfile, bootstrap_ssh_runtime},
+    shell_session::{
+        ContainerShellRuntime, ShellBackend, ShellSessionRegistry, SshRuntimeProfile,
+        bootstrap_ssh_runtime,
+    },
 };
 
 /// Generate a random four-word ID (e.g., "amber-forest-thunder-pearl").
@@ -423,10 +426,16 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
     /// Sets dynamic runtime availability for bash execution.
     #[must_use]
     pub fn with_shell_runtime_availability(
-        self,
+        mut self,
         availability: crate::shell_session::ShellRuntimeAvailability,
     ) -> Self {
-        let _ = self.shell_sessions.set_availability(availability);
+        self.shell_sessions = self.shell_sessions.with_availability(availability);
+        self
+    }
+
+    #[must_use]
+    pub fn with_container_runtime(mut self, runtime: ContainerShellRuntime) -> Self {
+        self.shell_sessions = self.shell_sessions.with_container_runtime(runtime);
         self
     }
 
@@ -736,18 +745,25 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         let raw = arguments.raw;
         let timeout = arguments.timeout;
 
-        let (backend, mode, ssh_target, ssh_runtime, container_id) = match arguments.mode {
+        let (backend, mode, ssh_target, ssh_runtime, container_runtime) = match arguments.mode {
             BashExecutionMode::Default => {
                 match self.shell_sessions.resolve_local_backend() {
                     Ok(backend) => {
-                        let container_id = if matches!(backend, ShellBackend::Container) {
-                            Some(self.shell_sessions.container_id().ok_or_else(|| {
-                                anyhow::anyhow!("missing container_id for container backend")
-                            })?)
+                        let container_runtime = if matches!(backend, ShellBackend::Container) {
+                            Some(
+                                self.shell_sessions
+                                    .container_runtime()
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "missing container runtime for container backend"
+                                        )
+                                    })?,
+                            )
                         } else {
                             None
                         };
-                        (backend, BashMode::Network, None, None, container_id)
+                        (backend, BashMode::Network, None, None, container_runtime)
                     }
                     Err(local_error) => {
                         self.shell_sessions
@@ -777,14 +793,19 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                     .shell_sessions
                     .resolve_local_backend()
                     .map_err(anyhow::Error::msg)?;
-                let container_id = if matches!(backend, ShellBackend::Container) {
-                    Some(self.shell_sessions.container_id().ok_or_else(|| {
-                        anyhow::anyhow!("missing container_id for container backend")
-                    })?)
+                let container_runtime = if matches!(backend, ShellBackend::Container) {
+                    Some(
+                        self.shell_sessions
+                            .container_runtime()
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("missing container runtime for container backend")
+                            })?,
+                    )
                 } else {
                     None
                 };
-                (backend, BashMode::Sandboxed, None, None, container_id)
+                (backend, BashMode::Sandboxed, None, None, container_runtime)
             }
             BashExecutionMode::Unsafe => {
                 let backend = self
@@ -829,15 +850,11 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             .await
             .map_err(anyhow::Error::new)?;
 
-        if matches!(backend, ShellBackend::Container)
-            && self.shell_sessions.container_exec().is_none()
-        {
+        if matches!(backend, ShellBackend::Container) && container_runtime.is_none() {
             return Err(anyhow::anyhow!(
-                "missing container executor for container backend"
+                "missing container runtime for container backend"
             ));
         }
-
-        let container_exec = self.shell_sessions.container_exec();
         let working_dir = self.working_dir.clone();
         let writable_paths = self.writable_paths.clone();
         let readable_paths = self.readable_paths.clone();
@@ -877,8 +894,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                     backend,
                     ssh_target.as_deref(),
                     ssh_runtime.clone(),
-                    container_id.as_deref(),
-                    container_exec.as_ref(),
+                    container_runtime.clone(),
                     stdin_blocked_notice,
                     expect,
                     &store_dir_for_spawn,
@@ -1053,8 +1069,7 @@ async fn execute_script_standalone<P, E>(
     backend: ShellBackend,
     ssh_target: Option<&str>,
     ssh_runtime: Option<SshRuntimeProfile>,
-    container_id: Option<&str>,
-    container_exec: Option<&Arc<dyn crate::shell_session::ContainerExecObject>>,
+    container_runtime: Option<ContainerShellRuntime>,
     stdin_blocked_notice: Option<async_channel::Sender<String>>,
     expect: OutputFormat,
     store_dir: &PathBuf,
@@ -1082,8 +1097,7 @@ where
             execution_id,
             script,
             mode,
-            container_id,
-            container_exec,
+            container_runtime.as_ref(),
             &ipc_commands,
             &job_registry,
             stdin_blocked_notice,
@@ -1431,17 +1445,15 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
     execution_id: &str,
     script: &str,
     mode: BashMode,
-    container_id: Option<&str>,
-    container_exec: Option<&Arc<dyn crate::shell_session::ContainerExecObject>>,
+    container_runtime: Option<&ContainerShellRuntime>,
     ipc_commands: &[String],
     job_registry: &JobRegistry,
     stdin_blocked_notice: Option<async_channel::Sender<String>>,
 ) -> Result<(u32, std::process::Output), BashError> {
-    let container_id = container_id
-        .ok_or_else(|| BashError::Execution("missing container_id for container backend".into()))?;
-    let exec = container_exec.ok_or_else(|| {
-        BashError::Execution("missing container executor for container backend".into())
+    let container_runtime = container_runtime.ok_or_else(|| {
+        BashError::Execution("missing container runtime for container backend".into())
     })?;
+    let exec = container_runtime.exec();
 
     // Use lower 32 bits of a UUID as a synthetic PID for job tracking.
     let pid = uuid::Uuid::new_v4().as_u128() as u32;
@@ -1459,12 +1471,15 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
     let wrapped_script = wrap_container_script(
         script,
         ipc_commands,
-        ipc_bridge.as_ref().map(ContainerIpcBridge::port),
+        ipc_bridge.as_ref().map(|bridge| ContainerIpcEndpoint {
+            host: container_runtime.ipc_host(),
+            port: bridge.port(),
+        }),
     )?;
 
     let execution = exec
         .exec_boxed(
-            container_id,
+            container_runtime.container_id(),
             &wrapped_script,
             "/workspace",
             kill_rx,
@@ -1586,20 +1601,26 @@ fn shell_escape(value: &str) -> String {
 #[template(path = "container_ipc_wrapper.sh", escape = "none")]
 struct ContainerIpcWrapperTemplate<'a> {
     escaped_commands: &'a str,
+    ipc_host: &'a str,
     ipc_port: u16,
     script: &'a str,
+}
+
+struct ContainerIpcEndpoint<'a> {
+    host: &'a str,
+    port: u16,
 }
 
 fn wrap_container_script(
     script: &str,
     ipc_commands: &[String],
-    ipc_port: Option<u16>,
+    ipc_endpoint: Option<ContainerIpcEndpoint<'_>>,
 ) -> Result<String, BashError> {
     if ipc_commands.is_empty() {
         return Ok(script.to_string());
     }
 
-    let port = ipc_port.ok_or_else(|| {
+    let endpoint = ipc_endpoint.ok_or_else(|| {
         BashError::Execution(
             "missing container IPC endpoint for wrapped script execution".to_string(),
         )
@@ -1623,7 +1644,8 @@ fn wrap_container_script(
         .join(" ");
     ContainerIpcWrapperTemplate {
         escaped_commands: &escaped_commands,
-        ipc_port: port,
+        ipc_host: endpoint.host,
+        ipc_port: endpoint.port,
         script,
     }
     .render()
@@ -1664,10 +1686,8 @@ fn start_container_ipc_bridge<E: Executor + Clone + 'static>(
     let local_addr = listener.local_addr().map_err(|e| {
         BashError::Execution(format!("failed to resolve container IPC tcp endpoint: {e}"))
     })?;
-    let endpoint = format!("tcp://host.docker.internal:{}", local_addr.port());
     tracing::debug!(
         bind = %local_addr,
-        endpoint = %endpoint,
         "starting container IPC bridge"
     );
     listener.set_nonblocking(true).map_err(|e| {
@@ -2169,7 +2189,10 @@ mod tests {
         let wrapped = wrap_container_script(
             "websearch \"gold price\"",
             &[String::from("websearch")],
-            Some(9000),
+            Some(ContainerIpcEndpoint {
+                host: "host.docker.internal",
+                port: 9000,
+            }),
         )
         .expect("wrap script");
         assert!(wrapped.contains("hash -r;"));
@@ -2180,16 +2203,30 @@ mod tests {
     #[test]
     fn wrap_container_script_preserves_user_script_semantics() {
         let script = "echo '$5,040' && subagent --subagent .skills/slide/subagents/art_direction.md --prompt 'x'";
-        let wrapped = wrap_container_script(script, &[String::from("subagent")], Some(9000))
-            .expect("wrap script");
+        let wrapped = wrap_container_script(
+            script,
+            &[String::from("subagent")],
+            Some(ContainerIpcEndpoint {
+                host: "host.docker.internal",
+                port: 9000,
+            }),
+        )
+        .expect("wrap script");
         assert!(wrapped.contains(script));
         assert!(!wrapped.contains("set -euo pipefail"));
     }
 
     #[test]
     fn wrap_container_script_rejects_invalid_ipc_command_names() {
-        let error = wrap_container_script("echo ok", &[String::from("bad name")], Some(9000))
-            .expect_err("invalid command name must fail");
+        let error = wrap_container_script(
+            "echo ok",
+            &[String::from("bad name")],
+            Some(ContainerIpcEndpoint {
+                host: "host.docker.internal",
+                port: 9000,
+            }),
+        )
+        .expect_err("invalid command name must fail");
         assert!(
             error
                 .to_string()
@@ -2202,10 +2239,13 @@ mod tests {
         let wrapped = wrap_container_script(
             "environment --query deployment",
             &[String::from("environment"), String::from("session")],
-            Some(43123),
+            Some(ContainerIpcEndpoint {
+                host: "host.containers.internal",
+                port: 43123,
+            }),
         )
         .expect("wrap script");
-        assert!(wrapped.contains("tcp://${MAY_HOST_GATEWAY:-host.docker.internal}:43123"));
+        assert!(wrapped.contains("tcp://host.containers.internal:43123"));
         assert!(wrapped.contains("for cmd in 'environment' 'session'; do"));
     }
 

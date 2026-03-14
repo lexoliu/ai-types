@@ -47,9 +47,9 @@ use crate::hook::Hook;
 use crate::{Agent, AgentBuilder, config::AgentKind};
 use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool, ReadTerminalDeltaTool};
 use aither_sandbox::{
-    BashTool, BashToolFactory, BashToolFactoryReceiver, ContainerExec, PermissionHandler,
-    ShellRuntimeAvailability, ShellSessionRegistry, SshServer, SshSessionAuthorizer,
-    ToolRegistryBuilder, Unconfigured, bash_tool_factory_channel,
+    BashTool, BashToolFactory, BashToolFactoryReceiver, ContainerShellRuntime,
+    PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, SshServer,
+    SshSessionAuthorizer, ToolRegistryBuilder, Unconfigured, bash_tool_factory_channel,
 };
 
 /// System prompt template for bash-centric agents.
@@ -293,40 +293,35 @@ where
 
     /// Sets runtime shell backend availability for `bash`.
     pub fn shell_runtime_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
+        self.shell_sessions = self.shell_sessions.with_availability(availability.clone());
         self.bash_tool = self
             .bash_tool
-            .with_shell_runtime_availability(availability.clone());
-        let _ = self.shell_sessions.set_availability(availability);
+            .with_shell_sessions(self.shell_sessions.clone())
+            .with_shell_runtime_availability(availability);
         self
     }
 
     /// Sets preconfigured SSH targets that can be used by `bash` with ssh mode.
-    pub fn ssh_servers(self, servers: Vec<SshServer>) -> Self {
-        let _ = self.shell_sessions.set_ssh_servers(servers);
+    pub fn ssh_servers(mut self, servers: Vec<SshServer>) -> Self {
+        self.shell_sessions = self
+            .shell_sessions
+            .with_ssh_servers(servers)
+            .expect("invalid ssh server configuration");
+        self.bash_tool = self.bash_tool.with_shell_sessions(self.shell_sessions.clone());
         self
     }
 
     /// Sets the SSH session authorizer for interactive connect/install consent prompts.
-    pub fn ssh_authorizer(self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
-        let _ = self.shell_sessions.set_ssh_authorizer(authorizer);
+    pub fn ssh_authorizer(mut self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
+        self.shell_sessions = self.shell_sessions.with_ssh_authorizer(authorizer);
+        self.bash_tool = self.bash_tool.with_shell_sessions(self.shell_sessions.clone());
         self
     }
 
-    /// Sets the container executor for Docker-based shell backends.
-    ///
-    /// This is shared across all clones of the internal `ShellSessionRegistry`
-    /// via `OnceLock`, so it must only be called once.
-    pub fn container_exec<T>(self, exec: Arc<T>) -> Self
-    where
-        T: ContainerExec + 'static,
-    {
-        self.shell_sessions.set_container_exec(exec);
-        self
-    }
-
-    /// Sets the default container ID for Container shell sessions.
-    pub fn container_id(self, id: String) -> Self {
-        self.shell_sessions.set_container_id(id);
+    /// Sets the container runtime for container-backed shell sessions.
+    pub fn container_runtime(mut self, runtime: ContainerShellRuntime) -> Self {
+        self.shell_sessions = self.shell_sessions.with_container_runtime(runtime.clone());
+        self.bash_tool = self.bash_tool.with_container_runtime(runtime);
         self
     }
 
