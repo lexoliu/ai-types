@@ -603,6 +603,7 @@ where
         })?;
 
         let skills = registry.all().into_iter().cloned().collect::<Vec<_>>();
+        self.skills.clear();
         tracing::info!(count = skills.len(), path = %abs_path.display(), "Loaded skills");
         for skill in skills {
             tracing::debug!(name = %skill.name, "Loaded skill");
