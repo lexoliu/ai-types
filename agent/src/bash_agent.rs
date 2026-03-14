@@ -42,6 +42,8 @@ use async_fs as fs;
 use executor_core::Executor;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
+#[cfg(feature = "skills")]
+use aither_skills::SkillRegistry;
 
 use crate::hook::Hook;
 use crate::{Agent, AgentBuilder, config::AgentKind, context::serialize_xml};
@@ -163,6 +165,8 @@ where
     skills: Vec<SkillInfo>,
     subagents: Vec<SubagentInfo>,
     shell_sessions: ShellSessionRegistry,
+    #[cfg(feature = "skills")]
+    skill_registry: Option<SkillRegistry>,
 }
 
 impl<LLM, P, E, H> std::fmt::Debug for BashAgentBuilder<LLM, P, E, H>
@@ -239,6 +243,8 @@ where
             skills: Vec::new(),
             subagents: Vec::new(),
             shell_sessions,
+            #[cfg(feature = "skills")]
+            skill_registry: None,
         }
     }
 }
@@ -566,6 +572,8 @@ where
             skills: self.skills,
             subagents: self.subagents,
             shell_sessions: self.shell_sessions,
+            #[cfg(feature = "skills")]
+            skill_registry: self.skill_registry,
         }
     }
 
@@ -585,7 +593,8 @@ where
         let path = path.as_ref().to_path_buf();
         let abs_path = Self::resolve_absolute_dir(&path, "skills").await?;
         let loader = SkillLoader::new().add_path(&abs_path);
-        let skills = loader.load_all().await.map_err(|error| {
+        let mut registry = self.skill_registry.take().unwrap_or_default();
+        registry.load_from(&loader).await.map_err(|error| {
             crate::AgentError::Config(path_error_text(
                 "failed to load skills from '",
                 &abs_path,
@@ -593,6 +602,7 @@ where
             ))
         })?;
 
+        let skills = registry.all().into_iter().cloned().collect::<Vec<_>>();
         tracing::info!(count = skills.len(), path = %abs_path.display(), "Loaded skills");
         for skill in skills {
             tracing::debug!(name = %skill.name, "Loaded skill");
@@ -601,6 +611,7 @@ where
                 description: skill.description,
             });
         }
+        self.skill_registry = Some(registry);
 
         Ok(self)
     }
@@ -758,7 +769,15 @@ where
             bash_tool.start_factory_service(receiver);
         }
 
-        self.inner.bash(bash_tool).build()
+        let inner = self.inner.bash(bash_tool);
+        #[cfg(feature = "skills")]
+        let inner = if let Some(registry) = self.skill_registry {
+            inner.skill_registry(Arc::new(registry))
+        } else {
+            inner
+        };
+
+        inner.build()
     }
 }
 

@@ -15,6 +15,10 @@ use askama::Template;
 use futures_core::Stream;
 use futures_lite::StreamExt;
 use sha2::{Digest, Sha256};
+#[cfg(feature = "skills")]
+use aither_skills::Skill;
+#[cfg(feature = "skills")]
+use std::collections::HashSet;
 
 use crate::{
     checkpoint::AgentCheckpoint,
@@ -134,6 +138,16 @@ struct TerminalInputNeededEvent {
     notice: String,
 }
 
+#[cfg(feature = "skills")]
+#[derive(serde::Serialize)]
+struct SkillInstructionXml {
+    name: String,
+    description: String,
+    instructions: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_tools: Option<Vec<String>>,
+}
+
 /// Which model tier to use for the agent's main reasoning loop.
 ///
 /// This allows creating agents that use different capability levels:
@@ -251,6 +265,18 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
 
     /// Start time of the most recent LLM request issued by this agent.
     pub(crate) last_request_started_at: Option<Instant>,
+
+    /// Runtime skill registry for prompt-triggered activation.
+    #[cfg(feature = "skills")]
+    pub(crate) skill_registry: Option<Arc<aither_skills::SkillRegistry>>,
+
+    /// Skills activated for the current run.
+    #[cfg(feature = "skills")]
+    pub(crate) active_skills: Vec<Skill>,
+
+    /// Exact tool-name allowlist derived from activated skills.
+    #[cfg(feature = "skills")]
+    pub(crate) active_allowed_tools: Option<HashSet<String>>,
 }
 
 impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
@@ -287,6 +313,12 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             sandbox_dir: None,
             last_working_docs: None,
             last_request_started_at: None,
+            #[cfg(feature = "skills")]
+            skill_registry: None,
+            #[cfg(feature = "skills")]
+            active_skills: Vec::new(),
+            #[cfg(feature = "skills")]
+            active_allowed_tools: None,
         }
     }
 }
@@ -371,6 +403,10 @@ where
             let run_id = uuid::Uuid::new_v4().to_string();
             self.ensure_initialized().await;
             yield AgentEvent::run_start(run_id.clone(), self.config.max_iterations);
+            #[cfg(feature = "skills")]
+            for event in self.activate_skills_for_prompt(&prompt) {
+                yield event;
+            }
 
             // Apply context compression if needed
             self.maybe_compress().await?;
@@ -579,11 +615,25 @@ where
                 // Execute tool calls in parallel
                 let tools = &self.tools;
                 let hooks = &self.hooks;
+                #[cfg(feature = "skills")]
+                let active_allowed_tools = self.active_allowed_tools.clone();
                 let tool_futures = tool_calls.iter().map(|call| {
                     let args_json = call.arguments.to_string();
                     let message_count = self.context.len_recent();
+                    #[cfg(feature = "skills")]
+                    let active_allowed_tools = active_allowed_tools.clone();
 
                     async move {
+                        #[cfg(feature = "skills")]
+                        if let Some(allowed_tools) = &active_allowed_tools
+                            && !allowed_tools.contains(&call.name.to_lowercase())
+                        {
+                            return Err(AgentError::HookRejected {
+                                hook: "skill_allowed_tools",
+                                reason: ["skill activation blocked tool '", call.name.as_str(), "'"].concat(),
+                            });
+                        }
+
                         let tool_ctx = ToolUseContext {
                             tool_name: &call.name,
                             arguments: &args_json,
@@ -1189,6 +1239,9 @@ where
     async fn populate_dynamic_reminders(&mut self) {
         self.context.clear_reminders();
 
+        #[cfg(feature = "skills")]
+        self.populate_skill_reminders();
+
         if let Some(todo_ctx) = self.format_todo_context() {
             self.context
                 .insert_reminder(&SystemReminder { content: todo_ctx });
@@ -1233,6 +1286,59 @@ where
         let messages = self.build_request_messages().await;
         self.last_request_started_at = Some(Instant::now());
         messages
+    }
+
+    #[cfg(feature = "skills")]
+    fn activate_skills_for_prompt(&mut self, prompt: &str) -> Vec<AgentEvent> {
+        self.active_skills.clear();
+        self.active_allowed_tools = None;
+        let Some(registry) = self.skill_registry.as_ref() else {
+            return Vec::new();
+        };
+        let matches = registry.match_prompt(prompt);
+        if matches.is_empty() {
+            return Vec::new();
+        }
+
+        let mut allowed_tools = HashSet::new();
+        let mut saw_explicit_allowlist = false;
+        let mut events = Vec::with_capacity(matches.len());
+        for matched in matches {
+            let skill = matched.skill.clone();
+            if let Some(tools) = &skill.allowed_tools {
+                saw_explicit_allowlist = true;
+                for tool in tools {
+                    allowed_tools.insert(tool.to_lowercase());
+                }
+            }
+            events.push(AgentEvent::skill_activated(
+                skill.name.clone(),
+                matched.matched_trigger.clone(),
+                skill.allowed_tools.clone(),
+            ));
+            self.active_skills.push(skill);
+        }
+        if saw_explicit_allowlist {
+            self.active_allowed_tools = Some(allowed_tools);
+        }
+        events
+    }
+
+    #[cfg(feature = "skills")]
+    fn populate_skill_reminders(&mut self) {
+        for skill in &self.active_skills {
+            let payload = serialize_xml(
+                "skill_instruction",
+                &SkillInstructionXml {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    instructions: skill.instructions.clone(),
+                    allowed_tools: skill.allowed_tools.clone(),
+                },
+            );
+            self.context
+                .insert_reminder(&SystemReminder { content: payload });
+        }
     }
 
     async fn assemble_context_window(&mut self) -> ContextWindowSnapshot {
@@ -1541,9 +1647,23 @@ where
 
             // Execute tool calls
             let tools = &self.tools;
+            #[cfg(feature = "skills")]
+            let active_allowed_tools = self.active_allowed_tools.clone();
             let tool_futures = tool_calls.iter().map(|call| {
                 let args_json = call.arguments.to_string();
+                #[cfg(feature = "skills")]
+                let active_allowed_tools = active_allowed_tools.clone();
                 async move {
+                    #[cfg(feature = "skills")]
+                    if let Some(allowed_tools) = &active_allowed_tools
+                        && !allowed_tools.contains(&call.name.to_lowercase())
+                    {
+                        return (
+                            call.id.clone(),
+                            call.name.clone(),
+                            Err(["skill activation blocked tool '", call.name.as_str(), "'"].concat()),
+                        );
+                    }
                     let result = tools
                         .call(&call.name, &args_json)
                         .await

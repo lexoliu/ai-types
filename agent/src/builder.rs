@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use aither_core::{LanguageModel, llm::Tool};
 use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, OutputStore};
+#[cfg(feature = "skills")]
+use aither_skills::SkillRegistry;
 
 use crate::{
     agent::{Agent, ModelTier},
@@ -59,6 +61,8 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     job_registry: Option<JobRegistry>,
     transcript: Option<Transcript>,
     sandbox_dir: Option<std::path::PathBuf>,
+    #[cfg(feature = "skills")]
+    skill_registry: Option<Arc<SkillRegistry>>,
 }
 
 impl<Advanced, Balanced, Fast, H> std::fmt::Debug for AgentBuilder<Advanced, Balanced, Fast, H> {
@@ -91,6 +95,8 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             job_registry: None,
             transcript: None,
             sandbox_dir: None,
+            #[cfg(feature = "skills")]
+            skill_registry: None,
         }
     }
 }
@@ -125,6 +131,8 @@ where
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
+            #[cfg(feature = "skills")]
+            skill_registry: self.skill_registry,
         }
     }
 
@@ -151,6 +159,8 @@ where
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
+            #[cfg(feature = "skills")]
+            skill_registry: self.skill_registry,
         }
     }
 
@@ -223,6 +233,8 @@ where
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
+            #[cfg(feature = "skills")]
+            skill_registry: self.skill_registry,
         }
     }
 
@@ -276,6 +288,13 @@ where
     /// Sets sandbox directory for working document supervision.
     pub fn sandbox_dir(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.sandbox_dir = Some(path.into());
+        self
+    }
+
+    /// Sets the skill registry used for runtime skill matching and activation.
+    #[cfg(feature = "skills")]
+    pub fn skill_registry(mut self, registry: Arc<SkillRegistry>) -> Self {
+        self.skill_registry = Some(registry);
         self
     }
 
@@ -443,6 +462,12 @@ where
             sandbox_dir: self.sandbox_dir,
             last_working_docs: None,
             last_request_started_at: None,
+            #[cfg(feature = "skills")]
+            skill_registry: self.skill_registry,
+            #[cfg(feature = "skills")]
+            active_skills: Vec::new(),
+            #[cfg(feature = "skills")]
+            active_allowed_tools: None,
         }
     }
 }
