@@ -35,6 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aither_core::llm::{Tool, ToolOutput};
+use askama::Template;
 use leash::IpcCommand;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -52,12 +53,76 @@ pub enum CommandPayload {
     Json { value: Value },
 }
 
+#[derive(Template)]
+#[template(path = "command_output_saved.txt", escape = "none")]
+struct CommandOutputSavedTemplate<'a> {
+    filename: &'a str,
+    line_count: usize,
+    byte_count: usize,
+}
+
+#[derive(Template)]
+#[template(path = "tool_usage_error.txt", escape = "none")]
+struct ToolUsageErrorTemplate<'a> {
+    message: &'a str,
+    tool_name: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "ipc_gateway_help.txt", escape = "none")]
+struct IpcGatewayHelpTemplate<'a> {
+    tool_names: &'a str,
+}
+
+fn prefix_error(prefix: &str, error: &impl std::fmt::Display) -> String {
+    let error_text = error.to_string();
+    let mut message = String::with_capacity(prefix.len() + error_text.len());
+    message.push_str(prefix);
+    message.push_str(error_text.as_str());
+    message
+}
+
+fn tool_usage_error(message: &str, tool_name: &str) -> String {
+    ToolUsageErrorTemplate { message, tool_name }
+        .render()
+        .expect("tool usage error template must render")
+}
+
+fn output_saved_text(filename: &str, line_count: usize, byte_count: usize) -> String {
+    CommandOutputSavedTemplate {
+        filename,
+        line_count,
+        byte_count,
+    }
+    .render()
+    .expect("command output saved template must render")
+}
+
+fn unknown_command_text(tool_name: &str) -> String {
+    let mut message = String::with_capacity(tool_name.len() + 47);
+    message.push_str("unknown command '");
+    message.push_str(tool_name);
+    message.push_str("'. Run 'help' to see available commands.");
+    message
+}
+
+fn no_help_available_text(tool_name: &str) -> String {
+    let mut message = String::with_capacity(tool_name.len() + 23);
+    message.push_str("No help available for '");
+    message.push_str(tool_name);
+    message.push('\'');
+    message
+}
+
 impl CommandPayload {
     fn render_for_cli(&self) -> Result<String, String> {
         match self {
             Self::Text { content } => Ok(content.clone()),
-            Self::Json { value } => serde_json::to_string_pretty(value)
-                .map_err(|error| ["failed to encode JSON output: ", error.to_string().as_str()].concat()),
+            Self::Json { value } => {
+                serde_json::to_string_pretty(value).map_err(|error| {
+                    prefix_error("failed to encode JSON output: ", &error)
+                })
+            }
         }
     }
 }
@@ -151,25 +216,25 @@ async fn handle_large_output(
     }
 
     // Generate four-random-words filename (consistent with rest of codebase)
-    let filename = format!("{}.txt", generate_word_filename());
+    let mut filename = generate_word_filename();
+    filename.push_str(".txt");
     let filepath = output_dir.join(&filename);
 
     let line_count = rendered.lines().count();
 
     if let Err(error) = async_fs::write(&filepath, &rendered).await {
-        return CommandEnvelope::failure(format!(
-            "failed to write output to {}: {error}",
-            filepath.display()
-        ));
+        let filepath_text = filepath.display().to_string();
+        let error_text = error.to_string();
+        let mut message = String::with_capacity(filepath_text.len() + error_text.len() + 25);
+        message.push_str("failed to write output to ");
+        message.push_str(filepath_text.as_str());
+        message.push_str(": ");
+        message.push_str(error_text.as_str());
+        return CommandEnvelope::failure(message);
     }
 
     CommandEnvelope::success(CommandPayload::Text {
-        content: format!(
-            "Output saved to outputs/{} ({} lines, {} bytes)",
-            filename,
-            line_count,
-            rendered.len()
-        ),
+        content: output_saved_text(filename.as_str(), line_count, rendered.len()),
     })
 }
 
@@ -181,19 +246,20 @@ fn tool_output_to_payload(output: ToolOutput) -> Result<Option<CommandPayload>, 
                 mime.subtype().as_str() == "json" || mime.suffix().is_some_and(|suffix| suffix.as_str() == "json");
             if mime_is_json {
                 let value = serde_json::from_slice(&content).map_err(|error| {
-                    ["invalid JSON tool output: ", error.to_string().as_str()].concat()
+                    prefix_error("invalid JSON tool output: ", &error)
                 })?;
                 return Ok(Some(CommandPayload::Json { value }));
             }
 
             let text = String::from_utf8(content).map_err(|error| {
-                [
-                    "unsupported non-UTF8 CLI tool output for MIME ",
-                    mime.essence_str(),
-                    ": ",
-                    error.to_string().as_str(),
-                ]
-                .concat()
+                let error_text = error.to_string();
+                let mut message =
+                    String::with_capacity(mime.essence_str().len() + error_text.len() + 40);
+                message.push_str("unsupported non-UTF8 CLI tool output for MIME ");
+                message.push_str(mime.essence_str());
+                message.push_str(": ");
+                message.push_str(error_text.as_str());
+                message
             })?;
             Ok(Some(CommandPayload::Text { content: text }))
         }
@@ -274,18 +340,16 @@ impl ToolRegistryBuilder {
                 let json_args = match cli_to_json(&schema, &args) {
                     Ok(v) => v,
                     Err(e) => {
-                        return Err(format!(
-                            "{e}\n\nRun `{name} --help` for usage information."
-                        ));
+                        let message = e.to_string();
+                        return Err(tool_usage_error(message.as_str(), name.as_str()));
                     }
                 };
                 tracing::debug!(tool = %name, json = %json_args, "configure_tool handler: parsed JSON");
                 let parsed = match serde_json::from_value(json_args) {
                     Ok(v) => v,
                     Err(e) => {
-                        return Err(format!(
-                            "invalid arguments: {e}\n\nRun `{name} --help` for usage information."
-                        ));
+                        let message = prefix_error("invalid arguments: ", &e);
+                        return Err(tool_usage_error(message.as_str(), name.as_str()));
                     }
                 };
                 let output = tool.call(parsed).await.map_err(|error| error.to_string())?;
@@ -419,9 +483,7 @@ impl ToolRegistry {
                     Err(error) => CommandEnvelope::failure(error),
                 }
             }
-            None => CommandEnvelope::failure(format!(
-                "unknown command '{tool_name}'. Run 'help' to see available commands."
-            )),
+            None => CommandEnvelope::failure(unknown_command_text(tool_name)),
         }
     }
 
@@ -602,7 +664,7 @@ impl IpcCommand for ToolCallCommand {
             let help = self
                 .registry
                 .tool_help(&self.tool_name)
-                .unwrap_or_else(|| format!("No help available for '{}'", self.tool_name));
+                .unwrap_or_else(|| no_help_available_text(self.tool_name.as_str()));
             tracing::info!(tool = %self.tool_name, "Returning help text");
             return CommandEnvelope::success(CommandPayload::Text { content: help });
         }
@@ -679,11 +741,13 @@ impl IpcCommand for IpcGatewayCommand {
         if has_help_flag(&cli_args) && cli_args.len() == 1 {
             let mut names = self.registry.registered_tool_names();
             names.sort();
+            let joined_names = names.join(", ");
             return CommandEnvelope::success(CommandPayload::Text {
-                content: format!(
-                    "Usage: ipc <tool> [args ...]\nAvailable tools: {}",
-                    names.join(", ")
-                ),
+                content: IpcGatewayHelpTemplate {
+                    tool_names: joined_names.as_str(),
+                }
+                .render()
+                .expect("ipc gateway help template must render"),
             });
         }
 
