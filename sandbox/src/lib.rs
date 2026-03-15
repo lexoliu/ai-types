@@ -73,7 +73,8 @@ pub mod permission;
 pub use bash::{
     BackgroundTaskReceiver, BashArgs, BashError, BashExecutionMode, BashResult, BashTool,
     BashToolFactory, BashToolFactoryError, BashToolFactoryReceiver, CompletedTask, Configured,
-    Unconfigured, bash_tool_factory_channel,
+    PermissionEvent, PermissionEventReceiver, PermissionEventStage, Unconfigured,
+    bash_tool_factory_channel,
 };
 pub use bollard_exec::{BollardContainerExec, CONTAINER_STDIN_BLOCKED_NOTICE, is_waiting_on_stdin};
 pub use command::{

@@ -7,6 +7,8 @@ use crate::hook::CheckpointReason;
 /// Reason why an agent run is paused or resumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunPauseReason {
+    /// Waiting for a bash permission approval.
+    PermissionRequest,
     /// Waiting for an `ask_user` response.
     AskUser,
     /// Waiting for a `request_workspace` response.

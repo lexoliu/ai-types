@@ -230,6 +230,21 @@ pub struct CompletedTask {
     pub result: Result<BashResult, BashError>,
 }
 
+/// Stage of a permission-lifecycle event for `bash`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionEventStage {
+    Waiting,
+    Resolved,
+}
+
+/// Permission-lifecycle event emitted by `bash` while waiting for approval.
+#[derive(Debug, Clone)]
+pub struct PermissionEvent {
+    pub mode: BashMode,
+    pub script: String,
+    pub stage: PermissionEventStage,
+}
+
 /// Receiver for completed background tasks.
 ///
 /// This can be cloned and used independently of the `BashTool` to poll for
@@ -291,6 +306,35 @@ impl BackgroundTaskReceiver {
 impl std::fmt::Debug for BackgroundTaskReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BackgroundTaskReceiver")
+            .field("pending", &self.rx.len())
+            .finish()
+    }
+}
+
+/// Receiver for permission wait/resume events.
+#[derive(Clone)]
+pub struct PermissionEventReceiver {
+    rx: Receiver<PermissionEvent>,
+}
+
+impl PermissionEventReceiver {
+    #[must_use]
+    pub fn take_pending(&self) -> Vec<PermissionEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    pub async fn recv(&self) -> Option<PermissionEvent> {
+        self.rx.recv().await.ok()
+    }
+}
+
+impl std::fmt::Debug for PermissionEventReceiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PermissionEventReceiver")
             .field("pending", &self.rx.len())
             .finish()
     }
@@ -388,6 +432,10 @@ pub struct BashTool<P, E, State = Unconfigured> {
     completed_rx: Receiver<CompletedTask>,
     /// Channel for sending completed background tasks (cloned for each background task).
     completed_tx: Sender<CompletedTask>,
+    /// Channel for permission lifecycle events.
+    permission_rx: Receiver<PermissionEvent>,
+    /// Channel sender for permission lifecycle events.
+    permission_tx: Sender<PermissionEvent>,
     /// Additional paths that should be writable in the sandbox.
     writable_paths: Vec<PathBuf>,
     /// Additional paths that should be readable (but not writable) in the sandbox.
@@ -408,6 +456,8 @@ impl<P, E: Clone, State: Clone> Clone for BashTool<P, E, State> {
             job_registry: self.job_registry.clone(),
             completed_rx: self.completed_rx.clone(),
             completed_tx: self.completed_tx.clone(),
+            permission_rx: self.permission_rx.clone(),
+            permission_tx: self.permission_tx.clone(),
             writable_paths: self.writable_paths.clone(),
             readable_paths: self.readable_paths.clone(),
             registry: self.registry.clone(),
@@ -475,6 +525,7 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
 
         // Create channel for background task completion (unbounded to not block spawned tasks)
         let (completed_tx, completed_rx) = async_channel::unbounded();
+        let (permission_tx, permission_rx) = async_channel::unbounded();
 
         Ok(Self {
             working_dir: working_dir_path,
@@ -485,6 +536,8 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
             job_registry,
             completed_rx,
             completed_tx,
+            permission_rx,
+            permission_tx,
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
             registry: Unconfigured,
@@ -522,6 +575,7 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
 
         // Create channel for background task completion (unbounded to not block spawned tasks)
         let (completed_tx, completed_rx) = async_channel::unbounded();
+        let (permission_tx, permission_rx) = async_channel::unbounded();
 
         Ok(Self {
             working_dir: working_dir_path,
@@ -532,6 +586,8 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
             job_registry,
             completed_rx,
             completed_tx,
+            permission_rx,
+            permission_tx,
             writable_paths: Vec::new(),
             readable_paths: Vec::new(),
             registry: Unconfigured,
@@ -550,6 +606,8 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
             job_registry: self.job_registry,
             completed_rx: self.completed_rx,
             completed_tx: self.completed_tx,
+            permission_rx: self.permission_rx,
+            permission_tx: self.permission_tx,
             writable_paths: self.writable_paths,
             readable_paths: self.readable_paths,
             registry: Configured { registry },
@@ -596,6 +654,7 @@ where
     /// - Have independent completion channels (no message mixup)
     pub fn child(&self) -> Self {
         let (completed_tx, completed_rx) = async_channel::unbounded();
+        let (permission_tx, permission_rx) = async_channel::unbounded();
         Self {
             working_dir: self.working_dir.clone(),
             shell_sessions: self.shell_sessions.clone(),
@@ -605,6 +664,8 @@ where
             job_registry: self.job_registry.clone(),
             completed_rx,
             completed_tx,
+            permission_rx,
+            permission_tx,
             writable_paths: self.writable_paths.clone(),
             readable_paths: self.readable_paths.clone(),
             registry: self.registry.clone(),
@@ -639,6 +700,13 @@ where
     pub fn background_receiver(&self) -> BackgroundTaskReceiver {
         BackgroundTaskReceiver {
             rx: self.completed_rx.clone(),
+        }
+    }
+
+    /// Returns a receiver for permission lifecycle events.
+    pub fn permission_receiver(&self) -> PermissionEventReceiver {
+        PermissionEventReceiver {
+            rx: self.permission_rx.clone(),
         }
     }
 
@@ -844,9 +912,33 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             }
         };
 
-        ensure_mode_allowed(self.permission_handler.as_ref(), mode, &script)
-            .await
-            .map_err(anyhow::Error::new)?;
+        let permission_waits = self
+            .permission_handler
+            .will_wait_for_approval(mode, &script)
+            .await;
+        if permission_waits {
+            let _ = self
+                .permission_tx
+                .send(PermissionEvent {
+                    mode,
+                    script: script.clone(),
+                    stage: PermissionEventStage::Waiting,
+                })
+                .await;
+        }
+        let permission_result = ensure_mode_allowed(self.permission_handler.as_ref(), mode, &script)
+            .await;
+        if permission_waits {
+            let _ = self
+                .permission_tx
+                .send(PermissionEvent {
+                    mode,
+                    script: script.clone(),
+                    stage: PermissionEventStage::Resolved,
+                })
+                .await;
+        }
+        permission_result.map_err(anyhow::Error::new)?;
 
         if matches!(backend, ShellBackend::Container) && container_runtime.is_none() {
             return Err(anyhow::anyhow!(

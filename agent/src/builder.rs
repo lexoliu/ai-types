@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use aither_core::{LanguageModel, llm::Tool};
-use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, OutputStore};
+use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, OutputStore, PermissionEventReceiver};
 #[cfg(feature = "skills")]
 use aither_skills::SkillRegistry;
 
@@ -58,6 +58,7 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     todo_list: Option<TodoList>,
     output_store: Option<Arc<OutputStore>>,
     background_receiver: Option<BackgroundTaskReceiver>,
+    permission_receiver: Option<PermissionEventReceiver>,
     job_registry: Option<JobRegistry>,
     transcript: Option<Transcript>,
     sandbox_dir: Option<std::path::PathBuf>,
@@ -92,6 +93,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             todo_list: None,
             output_store: None,
             background_receiver: None,
+            permission_receiver: None,
             job_registry: None,
             transcript: None,
             sandbox_dir: None,
@@ -128,6 +130,7 @@ where
             todo_list: self.todo_list,
             output_store: self.output_store,
             background_receiver: self.background_receiver,
+            permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
@@ -156,6 +159,7 @@ where
             todo_list: self.todo_list,
             output_store: self.output_store,
             background_receiver: self.background_receiver,
+            permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
@@ -230,6 +234,7 @@ where
             todo_list: self.todo_list,
             output_store: self.output_store,
             background_receiver: self.background_receiver,
+            permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
@@ -393,11 +398,13 @@ where
     {
         let output_store = bash_tool.output_store().clone();
         let background_receiver = bash_tool.background_receiver();
+        let permission_receiver = bash_tool.permission_receiver();
         let job_registry = bash_tool.job_registry();
         self.sandbox_dir = Some(bash_tool.working_dir().clone());
         self.tools.register(bash_tool);
         self.output_store = Some(output_store);
         self.background_receiver = Some(background_receiver);
+        self.permission_receiver = Some(permission_receiver);
         self.job_registry = Some(job_registry);
         self
     }
@@ -457,6 +464,7 @@ where
             todo_list: self.todo_list,
             output_store: self.output_store,
             background_receiver: self.background_receiver,
+            permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,

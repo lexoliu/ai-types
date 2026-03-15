@@ -40,9 +40,11 @@ use crate::{
 };
 
 use aither_sandbox::{
-    BackgroundTaskReceiver, CONTAINER_STDIN_BLOCKED_NOTICE, JobRegistry, OutputStore,
+    BackgroundTaskReceiver, BashArgs, BashExecutionMode, BashMode, CONTAINER_STDIN_BLOCKED_NOTICE,
+    JobRegistry, OutputStore, PermissionEvent, PermissionEventReceiver, PermissionEventStage,
 };
 use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
 
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]
@@ -138,6 +140,56 @@ struct BackgroundTaskStartedEvent {
 struct TerminalInputNeededEvent {
     task_id: Option<String>,
     notice: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PermissionEventKey {
+    mode: BashMode,
+    script: String,
+}
+
+#[derive(Debug, Default)]
+struct PermissionPauseTracker {
+    pending: HashMap<PermissionEventKey, VecDeque<String>>,
+    active: HashMap<PermissionEventKey, VecDeque<String>>,
+}
+
+impl PermissionPauseTracker {
+    fn from_tool_calls(tool_calls: &[aither_core::llm::ToolCall]) -> Self {
+        let mut tracker = Self::default();
+        for call in tool_calls {
+            let Some(key) = permission_event_key_for_call(call.name.as_str(), &call.arguments) else {
+                continue;
+            };
+            tracker
+                .pending
+                .entry(key)
+                .or_default()
+                .push_back(call.id.clone());
+        }
+        tracker
+    }
+
+    fn event_for(&mut self, event: PermissionEvent) -> Option<(RunPauseReason, String)> {
+        let key = PermissionEventKey {
+            mode: event.mode,
+            script: event.script,
+        };
+        match event.stage {
+            PermissionEventStage::Waiting => {
+                let tool_call_id = self.pending.get_mut(&key)?.pop_front()?;
+                self.active
+                    .entry(key)
+                    .or_default()
+                    .push_back(tool_call_id.clone());
+                Some((RunPauseReason::PermissionRequest, tool_call_id))
+            }
+            PermissionEventStage::Resolved => {
+                let tool_call_id = self.active.get_mut(&key)?.pop_front()?;
+                Some((RunPauseReason::PermissionRequest, tool_call_id))
+            }
+        }
+    }
 }
 
 #[cfg(feature = "skills")]
@@ -253,6 +305,8 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
 
     /// Receiver for completed background bash tasks.
     pub(crate) background_receiver: Option<BackgroundTaskReceiver>,
+    /// Receiver for permission wait/resume events emitted by bash.
+    pub(crate) permission_receiver: Option<PermissionEventReceiver>,
     /// Registry for running background bash tasks.
     pub(crate) job_registry: Option<JobRegistry>,
 
@@ -310,6 +364,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             todo_list: None,
             output_store: None,
             background_receiver: None,
+            permission_receiver: None,
             job_registry: None,
             transcript: None,
             sandbox_dir: None,
@@ -620,6 +675,8 @@ where
                 // Execute tool calls in parallel
                 let tools = &self.tools;
                 let hooks = &self.hooks;
+                let permission_receiver = self.permission_receiver.clone();
+                let mut permission_pause_tracker = PermissionPauseTracker::from_tool_calls(&tool_calls);
                 #[cfg(feature = "skills")]
                 let active_allowed_tools = self.active_allowed_tools.clone();
                 let tool_futures = tool_calls.iter().map(|call| {
@@ -697,9 +754,63 @@ where
                     }
                 });
 
-                // Wait for all tool calls to complete
-                let results: Vec<Result<(String, String, Result<String, String>), AgentError>> =
-                    futures::future::join_all(tool_futures).await;
+                enum ExecutionSignal {
+                    Tool(Result<(String, String, Result<String, String>), AgentError>),
+                    Permission(PermissionEvent),
+                }
+
+                let mut pending_tool_futures =
+                    tool_futures.collect::<futures::stream::FuturesUnordered<_>>();
+                let mut results = Vec::new();
+                while !pending_tool_futures.is_empty() {
+                    let next = match &permission_receiver {
+                        Some(receiver) => {
+                            futures_lite::future::or(
+                                async { pending_tool_futures.next().await.map(ExecutionSignal::Tool) },
+                                async { receiver.recv().await.map(ExecutionSignal::Permission) },
+                            )
+                            .await
+                        }
+                        None => pending_tool_futures.next().await.map(ExecutionSignal::Tool),
+                    };
+                    let Some(signal) = next else {
+                        break;
+                    };
+                    match signal {
+                        ExecutionSignal::Tool(result) => results.push(result),
+                        ExecutionSignal::Permission(event) => {
+                            if let Some((reason, tool_call_id)) =
+                                permission_pause_tracker.event_for(event.clone())
+                            {
+                                match event.stage {
+                                    PermissionEventStage::Waiting => {
+                                        yield AgentEvent::run_paused(reason, tool_call_id);
+                                    }
+                                    PermissionEventStage::Resolved => {
+                                        yield AgentEvent::run_resumed(reason, tool_call_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(receiver) = &permission_receiver {
+                    for event in receiver.take_pending() {
+                        if let Some((reason, tool_call_id)) =
+                            permission_pause_tracker.event_for(event.clone())
+                        {
+                            match event.stage {
+                                PermissionEventStage::Waiting => {
+                                    yield AgentEvent::run_paused(reason, tool_call_id);
+                                }
+                                PermissionEventStage::Resolved => {
+                                    yield AgentEvent::run_resumed(reason, tool_call_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                drop(pending_tool_futures);
 
                 // Check if todo tool was called
                 let todo_tool_called = tool_names.iter().any(|name| name == "todo");
@@ -1709,6 +1820,8 @@ where
 
             // Execute tool calls
             let tools = &self.tools;
+            let permission_receiver = self.permission_receiver.clone();
+            let mut permission_pause_tracker = PermissionPauseTracker::from_tool_calls(&tool_calls);
             #[cfg(feature = "skills")]
             let active_allowed_tools = self.active_allowed_tools.clone();
             let tool_futures = tool_calls.iter().map(|call| {
@@ -1736,8 +1849,63 @@ where
                 }
             });
 
-            let results: Vec<(String, String, Result<String, String>)> =
-                futures::future::join_all(tool_futures).await;
+            enum ExecutionSignal {
+                Tool((String, String, Result<String, String>)),
+                Permission(PermissionEvent),
+            }
+
+            let mut pending_tool_futures =
+                tool_futures.collect::<futures::stream::FuturesUnordered<_>>();
+            let mut results = Vec::new();
+            while !pending_tool_futures.is_empty() {
+                let next = match &permission_receiver {
+                    Some(receiver) => {
+                        futures_lite::future::or(
+                            async { pending_tool_futures.next().await.map(ExecutionSignal::Tool) },
+                            async { receiver.recv().await.map(ExecutionSignal::Permission) },
+                        )
+                        .await
+                    }
+                    None => pending_tool_futures.next().await.map(ExecutionSignal::Tool),
+                };
+                let Some(signal) = next else {
+                    break;
+                };
+                match signal {
+                    ExecutionSignal::Tool(result) => results.push(result),
+                    ExecutionSignal::Permission(event) => {
+                        if let Some((reason, tool_call_id)) =
+                            permission_pause_tracker.event_for(event.clone())
+                        {
+                            match event.stage {
+                                PermissionEventStage::Waiting => {
+                                    events.push(Ok(AgentEvent::run_paused(reason, tool_call_id)));
+                                }
+                                PermissionEventStage::Resolved => {
+                                    events.push(Ok(AgentEvent::run_resumed(reason, tool_call_id)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(receiver) = &permission_receiver {
+                for event in receiver.take_pending() {
+                    if let Some((reason, tool_call_id)) =
+                        permission_pause_tracker.event_for(event.clone())
+                    {
+                        match event.stage {
+                            PermissionEventStage::Waiting => {
+                                events.push(Ok(AgentEvent::run_paused(reason, tool_call_id)));
+                            }
+                            PermissionEventStage::Resolved => {
+                                events.push(Ok(AgentEvent::run_resumed(reason, tool_call_id)));
+                            }
+                        }
+                    }
+                }
+            }
+            drop(pending_tool_futures);
 
             for (call_id, call_name, tool_result) in results {
                 if let Some(reason) = pause_reason_for_tool(call_name.as_str()) {
@@ -2072,6 +2240,25 @@ fn format_builtin_tool_result(tool: &str, result: &str) -> String {
     ["[", tool, "] ", result].concat()
 }
 
+fn permission_event_key_for_call(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Option<PermissionEventKey> {
+    if tool_name != "bash" {
+        return None;
+    }
+    let args: BashArgs = serde_json::from_value(arguments.clone()).ok()?;
+    let mode = match args.mode {
+        BashExecutionMode::Sandboxed => return None,
+        BashExecutionMode::Unsafe => BashMode::Unsafe,
+        BashExecutionMode::Default | BashExecutionMode::Ssh => BashMode::Network,
+    };
+    Some(PermissionEventKey {
+        mode,
+        script: args.script,
+    })
+}
+
 fn pause_reason_for_tool(tool_name: &str) -> Option<RunPauseReason> {
     match tool_name {
         "ask_user" => Some(RunPauseReason::AskUser),
@@ -2299,5 +2486,87 @@ mod tests {
             assert_eq!(agent.context().recent()[0].content(), "hello");
             assert!(agent.last_request_started_at.is_some());
         });
+    }
+
+    #[test]
+    fn permission_event_key_parses_bash_modes() {
+        let default_args = serde_json::to_value(BashArgs {
+            script: "ls".to_string(),
+            mode: BashExecutionMode::Default,
+            ssh_server_id: None,
+            expect: aither_sandbox::OutputFormat::Text,
+            timeout: 30,
+            max_lines: 200,
+            raw: false,
+        })
+        .expect("default args should serialize");
+        let unsafe_args = serde_json::to_value(BashArgs {
+            script: "rm -rf /tmp/demo".to_string(),
+            mode: BashExecutionMode::Unsafe,
+            ssh_server_id: None,
+            expect: aither_sandbox::OutputFormat::Text,
+            timeout: 30,
+            max_lines: 200,
+            raw: false,
+        })
+        .expect("unsafe args should serialize");
+        let sandboxed_args = serde_json::to_value(BashArgs {
+            script: "pwd".to_string(),
+            mode: BashExecutionMode::Sandboxed,
+            ssh_server_id: None,
+            expect: aither_sandbox::OutputFormat::Text,
+            timeout: 30,
+            max_lines: 200,
+            raw: false,
+        })
+        .expect("sandboxed args should serialize");
+
+        let default_key = permission_event_key_for_call("bash", &default_args)
+            .expect("default bash mode should require permission routing");
+        let unsafe_key = permission_event_key_for_call("bash", &unsafe_args)
+            .expect("unsafe bash mode should require permission routing");
+
+        assert_eq!(default_key.mode, BashMode::Network);
+        assert_eq!(default_key.script, "ls");
+        assert_eq!(unsafe_key.mode, BashMode::Unsafe);
+        assert_eq!(unsafe_key.script, "rm -rf /tmp/demo");
+        assert!(permission_event_key_for_call("bash", &sandboxed_args).is_none());
+    }
+
+    #[test]
+    fn permission_pause_tracker_routes_waiting_and_resolved_events() {
+        let tool_calls = vec![aither_core::llm::ToolCall::new(
+            "tool-1",
+            "bash",
+            serde_json::to_value(BashArgs {
+                script: "curl https://example.com".to_string(),
+                mode: BashExecutionMode::Default,
+                ssh_server_id: None,
+                expect: aither_sandbox::OutputFormat::Text,
+                timeout: 30,
+                max_lines: 200,
+                raw: false,
+            })
+            .expect("tool args should serialize"),
+        )];
+
+        let mut tracker = PermissionPauseTracker::from_tool_calls(&tool_calls);
+        let waiting = tracker
+            .event_for(PermissionEvent {
+                mode: BashMode::Network,
+                script: "curl https://example.com".to_string(),
+                stage: PermissionEventStage::Waiting,
+            })
+            .expect("waiting event should map to tool call");
+        let resolved = tracker
+            .event_for(PermissionEvent {
+                mode: BashMode::Network,
+                script: "curl https://example.com".to_string(),
+                stage: PermissionEventStage::Resolved,
+            })
+            .expect("resolved event should map to tool call");
+
+        assert_eq!(waiting, (RunPauseReason::PermissionRequest, "tool-1".to_string()));
+        assert_eq!(resolved, (RunPauseReason::PermissionRequest, "tool-1".to_string()));
     }
 }

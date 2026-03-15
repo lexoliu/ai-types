@@ -68,6 +68,19 @@ pub trait PermissionHandler: Send + Sync {
         script: &str,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send;
 
+    /// Returns whether `check` will suspend waiting for an external approval.
+    ///
+    /// This is used by higher-level runtimes to surface pause/resume lifecycle
+    /// events only when a permission request will actually block.
+    fn will_wait_for_approval(
+        &self,
+        mode: BashMode,
+        script: &str,
+    ) -> impl Future<Output = bool> + Send {
+        let _ = (mode, script);
+        async { false }
+    }
+
     /// Checks if a network domain is allowed.
     ///
     /// Called for each network connection attempt in `Network` mode.
@@ -111,6 +124,10 @@ impl PermissionHandler for DenyUnsafe {
             ))),
         }
     }
+
+    async fn will_wait_for_approval(&self, _mode: BashMode, _script: &str) -> bool {
+        false
+    }
 }
 
 /// A no-op permission handler that allows every execution mode and domain.
@@ -120,6 +137,10 @@ pub struct NoopPermissionHandler;
 impl PermissionHandler for NoopPermissionHandler {
     async fn check(&self, _mode: BashMode, _script: &str) -> Result<bool, PermissionError> {
         Ok(true)
+    }
+
+    async fn will_wait_for_approval(&self, _mode: BashMode, _script: &str) -> bool {
+        false
     }
 
     async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
@@ -181,6 +202,16 @@ impl<Inner: PermissionHandler> PermissionHandler for StatefulPermissionHandler<I
 
     async fn check_domain(&self, domain: &str, port: u16) -> bool {
         self.inner.check_domain(domain, port).await
+    }
+
+    async fn will_wait_for_approval(&self, mode: BashMode, script: &str) -> bool {
+        match mode {
+            BashMode::Sandboxed => false,
+            BashMode::Network => {
+                !self.is_network_approved() && self.inner.will_wait_for_approval(mode, script).await
+            }
+            BashMode::Unsafe => self.inner.will_wait_for_approval(mode, script).await,
+        }
     }
 }
 
