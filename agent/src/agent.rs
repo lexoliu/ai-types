@@ -201,6 +201,8 @@ struct SkillInstructionXml {
     instructions: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_tools: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_paths: Option<Vec<String>>,
 }
 
 /// Which model tier to use for the agent's main reasoning loop.
@@ -1489,6 +1491,8 @@ where
     #[cfg(feature = "skills")]
     fn populate_skill_reminders(&mut self) {
         for skill in &self.active_skills {
+            let mut resource_paths = skill.resources.keys().cloned().collect::<Vec<_>>();
+            resource_paths.sort();
             let payload = serialize_xml(
                 "skill_instruction",
                 &SkillInstructionXml {
@@ -1496,6 +1500,7 @@ where
                     description: skill.description.clone(),
                     instructions: skill.instructions.clone(),
                     allowed_tools: skill.allowed_tools.clone(),
+                    resource_paths: (!resource_paths.is_empty()).then_some(resource_paths),
                 },
             );
             self.context
@@ -2735,6 +2740,42 @@ mod tests {
                     .to_string()
                     .contains("skill activation blocked tool 'forbidden_tool'"),
                 "unexpected error: {error}"
+            );
+        });
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn build_live_request_messages_include_skill_resource_catalog() {
+        futures_lite::future::block_on(async {
+            let mut registry = SkillRegistry::new();
+            registry.register(Skill {
+                name: "code-review".to_string(),
+                description: "Review code carefully".to_string(),
+                triggers: vec!["review".to_string()],
+                instructions: "Use a review checklist.".to_string(),
+                allowed_tools: Some(vec!["mock_tool".to_string()]),
+                resources: HashMap::from([(
+                    "templates/review.md".to_string(),
+                    "# Review template".to_string(),
+                )]),
+            });
+
+            let mut agent = Agent::with_config(
+                MockLlm {
+                    context_length: 1000,
+                },
+                AgentConfig::default(),
+            );
+            agent.skill_registry = Some(Arc::new(registry));
+            let _ = agent.activate_skills_for_prompt("please review this patch");
+
+            let messages = agent.build_live_request_messages().await;
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message.content().contains("templates/review.md")),
+                "skill resource catalog should be injected into request messages"
             );
         });
     }
