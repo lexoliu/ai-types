@@ -27,7 +27,7 @@ use crate::{
     context::{Context, serialize_xml},
     context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot},
     error::AgentError,
-    event::AgentEvent,
+    event::{AgentEvent, RunPauseReason},
     handoff::HandoffDocument,
     hook::{
         CheckpointContext, CheckpointReason, Hook, PostToolAction, PreToolAction, StopContext,
@@ -610,6 +610,9 @@ where
                         name: call.name.clone(),
                         arguments: args,
                     };
+                    if let Some(reason) = pause_reason_for_tool(call.name.as_str()) {
+                        yield AgentEvent::run_paused(reason, call.id.clone());
+                    }
                 }
 
                 // Execute tool calls in parallel
@@ -715,6 +718,9 @@ where
                         name: call_name.clone(),
                         result: tool_result.clone(),
                     };
+                    if let Some(reason) = pause_reason_for_tool(call_name.as_str()) {
+                        yield AgentEvent::run_resumed(reason, call_id.clone());
+                    }
 
                     let content = match &tool_result {
                         Ok(content) => content,
@@ -1680,6 +1686,18 @@ where
                 tool_calls.clone(),
             ));
 
+            for call in &tool_calls {
+                let args = call.arguments.to_string();
+                events.push(Ok(AgentEvent::ToolCallStart {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: args,
+                }));
+                if let Some(reason) = pause_reason_for_tool(call.name.as_str()) {
+                    events.push(Ok(AgentEvent::run_paused(reason, call.id.clone())));
+                }
+            }
+
             // Execute tool calls
             let tools = &self.tools;
             #[cfg(feature = "skills")]
@@ -1712,6 +1730,9 @@ where
                 futures::future::join_all(tool_futures).await;
 
             for (call_id, call_name, tool_result) in results {
+                if let Some(reason) = pause_reason_for_tool(call_name.as_str()) {
+                    events.push(Ok(AgentEvent::run_resumed(reason, call_id.clone())));
+                }
                 let is_bash_call = call_name == "bash";
                 events.push(Ok(AgentEvent::ToolCallEnd {
                     id: call_id.clone(),
@@ -2036,6 +2057,14 @@ fn format_todo_items_json(items: &[TodoItem]) -> String {
 
 fn format_builtin_tool_result(tool: &str, result: &str) -> String {
     ["[", tool, "] ", result].concat()
+}
+
+fn pause_reason_for_tool(tool_name: &str) -> Option<RunPauseReason> {
+    match tool_name {
+        "ask_user" => Some(RunPauseReason::AskUser),
+        "request_workspace" => Some(RunPauseReason::WorkspaceRequest),
+        _ => None,
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

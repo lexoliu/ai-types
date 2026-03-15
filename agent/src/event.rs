@@ -4,6 +4,15 @@ use crate::context_window::ContextWindowPhase;
 use crate::error::AgentError;
 use crate::hook::CheckpointReason;
 
+/// Reason why an agent run is paused or resumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunPauseReason {
+    /// Waiting for an `ask_user` response.
+    AskUser,
+    /// Waiting for a `request_workspace` response.
+    WorkspaceRequest,
+}
+
 /// Events emitted during agent execution.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -87,6 +96,22 @@ pub enum AgentEvent {
         task_id: Option<String>,
         /// Human-readable notice explaining why input is needed.
         notice: String,
+    },
+
+    /// The run is now paused waiting for external input.
+    RunPaused {
+        /// Why the run paused.
+        reason: RunPauseReason,
+        /// Tool call identifier responsible for the pause.
+        tool_call_id: String,
+    },
+
+    /// The run resumed after an external input arrived.
+    RunResumed {
+        /// Why the run had paused.
+        reason: RunPauseReason,
+        /// Tool call identifier responsible for the pause.
+        tool_call_id: String,
     },
 
     /// A skill was activated for the current run.
@@ -237,6 +262,24 @@ impl AgentEvent {
         Self::TerminalInputNeeded {
             task_id,
             notice: notice.into(),
+        }
+    }
+
+    /// Creates a run-paused event.
+    #[must_use]
+    pub fn run_paused(reason: RunPauseReason, tool_call_id: impl Into<String>) -> Self {
+        Self::RunPaused {
+            reason,
+            tool_call_id: tool_call_id.into(),
+        }
+    }
+
+    /// Creates a run-resumed event.
+    #[must_use]
+    pub fn run_resumed(reason: RunPauseReason, tool_call_id: impl Into<String>) -> Self {
+        Self::RunResumed {
+            reason,
+            tool_call_id: tool_call_id.into(),
         }
     }
 
