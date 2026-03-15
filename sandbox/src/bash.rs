@@ -926,8 +926,8 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                 })
                 .await;
         }
-        let permission_result = ensure_mode_allowed(self.permission_handler.as_ref(), mode, &script)
-            .await;
+        let permission_result =
+            ensure_mode_allowed(self.permission_handler.as_ref(), mode, &script).await;
         if permission_waits {
             let _ = self
                 .permission_tx

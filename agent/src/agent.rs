@@ -2354,6 +2354,35 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "skills")]
+    #[derive(Clone)]
+    struct ScriptedLlm {
+        context_length: u32,
+        events: Vec<Event>,
+    }
+
+    #[cfg(feature = "skills")]
+    impl LanguageModel for ScriptedLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            futures_lite::stream::iter(self.events.clone().into_iter().map(Ok))
+        }
+
+        async fn profile(&self) -> ModelProfile {
+            ModelProfile::new(
+                "mock",
+                "test",
+                "mock-model",
+                "mock model",
+                self.context_length,
+            )
+        }
+    }
+
     #[test]
     fn snapshot_phase_accounts_for_system_blocks() {
         futures_lite::future::block_on(async {
@@ -2670,5 +2699,43 @@ mod tests {
             error.to_string().contains("unknown skill"),
             "unexpected error: {error}"
         );
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn query_rejects_tool_calls_outside_skill_allowlist() {
+        futures_lite::future::block_on(async {
+            let mut registry = SkillRegistry::new();
+            registry.register(Skill {
+                name: "code-review".to_string(),
+                description: "Review code carefully".to_string(),
+                triggers: vec!["review".to_string()],
+                instructions: "Use a review checklist.".to_string(),
+                allowed_tools: Some(vec!["mock_tool".to_string()]),
+                resources: HashMap::new(),
+            });
+
+            let llm = ScriptedLlm {
+                context_length: 1000,
+                events: vec![Event::tool_call(
+                    "call-1",
+                    "forbidden_tool",
+                    serde_json::json!({}),
+                )],
+            };
+            let mut agent = Agent::with_config(llm, AgentConfig::default());
+            agent.skill_registry = Some(Arc::new(registry));
+
+            let error = agent
+                .query("please review this patch")
+                .await
+                .expect_err("disallowed tool call must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("skill activation blocked tool 'forbidden_tool'"),
+                "unexpected error: {error}"
+            );
+        });
     }
 }
