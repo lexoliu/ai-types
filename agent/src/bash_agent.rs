@@ -964,6 +964,65 @@ fn get_os_info() -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
+
+    use aither_core::LanguageModel;
+    use aither_core::llm::{Event, LLMRequest, Tool, model::Profile as ModelProfile};
+    use aither_sandbox::permission::NoopPermissionHandler;
+    use executor_core::DefaultExecutor;
+    use futures_core::Stream;
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+    use tempfile::tempdir;
+
+    #[derive(Debug)]
+    struct MockError;
+
+    impl std::fmt::Display for MockError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("mock error")
+        }
+    }
+
+    impl std::error::Error for MockError {}
+
+    #[derive(Clone)]
+    struct MockLlm;
+
+    impl LanguageModel for MockLlm {
+        type Error = MockError;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            futures_lite::stream::empty()
+        }
+
+        async fn profile(&self) -> ModelProfile {
+            ModelProfile::new("mock", "test", "mock-model", "mock model", 100_000)
+        }
+    }
+
+    struct MockTool;
+
+    #[derive(Debug, JsonSchema, Deserialize)]
+    struct MockArgs;
+
+    impl Tool for MockTool {
+        fn name(&self) -> Cow<'static, str> {
+            "mock_tool".into()
+        }
+
+        type Arguments = MockArgs;
+
+        async fn call(
+            &self,
+            _args: Self::Arguments,
+        ) -> aither_core::Result<aither_core::llm::ToolOutput> {
+            Ok(aither_core::llm::ToolOutput::text("ok"))
+        }
+    }
 
     // Test that the module compiles and types work
     #[test]
@@ -1032,5 +1091,41 @@ mod tests {
         assert!(prompt.contains("<shell-modes>"));
         assert!(!prompt.contains("<shell-runtime>"));
         assert!(prompt.contains("<unsafe>"));
+    }
+
+    #[test]
+    fn bash_agent_builder_keeps_ipc_tools_out_of_llm_tool_surface() {
+        futures_lite::future::block_on(async {
+            let dir = tempdir().expect("tempdir should exist");
+            let bash_tool = aither_sandbox::BashTool::new_exact(
+                dir.path(),
+                NoopPermissionHandler,
+                DefaultExecutor,
+            )
+            .await
+            .expect("bash tool should initialize");
+
+            let agent = BashAgentBuilder::new(MockLlm, bash_tool)
+                .tool(MockTool)
+                .with_default_prompt()
+                .build();
+
+            let tool_names = agent
+                .tools
+                .definitions()
+                .into_iter()
+                .map(|definition| definition.name().to_string())
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                tool_names,
+                vec![
+                    "kill_terminal".to_string(),
+                    "input_terminal".to_string(),
+                    "read_terminal_delta".to_string(),
+                    "bash".to_string(),
+                ]
+            );
+        });
     }
 }
