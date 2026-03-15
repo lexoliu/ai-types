@@ -43,8 +43,8 @@ use aither_sandbox::{
     BackgroundTaskReceiver, BashArgs, BashExecutionMode, BashMode, CONTAINER_STDIN_BLOCKED_NOTICE,
     JobRegistry, OutputStore, PermissionEvent, PermissionEventReceiver, PermissionEventStage,
 };
-use std::sync::Arc;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]
@@ -158,7 +158,8 @@ impl PermissionPauseTracker {
     fn from_tool_calls(tool_calls: &[aither_core::llm::ToolCall]) -> Self {
         let mut tracker = Self::default();
         for call in tool_calls {
-            let Some(key) = permission_event_key_for_call(call.name.as_str(), &call.arguments) else {
+            let Some(key) = permission_event_key_for_call(call.name.as_str(), &call.arguments)
+            else {
                 continue;
             };
             tracker
@@ -2307,6 +2308,14 @@ mod tests {
     use futures_core::Stream;
 
     use crate::compression::{CompressionLevel, PreserveConfig, SmartCompressionConfig};
+    #[cfg(feature = "skills")]
+    use crate::{AgentCheckpoint, ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
+    #[cfg(feature = "skills")]
+    use aither_skills::{Skill, SkillRegistry};
+    #[cfg(feature = "skills")]
+    use std::collections::HashMap;
+    #[cfg(feature = "skills")]
+    use std::sync::Arc;
 
     #[derive(Debug)]
     struct MockError;
@@ -2566,7 +2575,100 @@ mod tests {
             })
             .expect("resolved event should map to tool call");
 
-        assert_eq!(waiting, (RunPauseReason::PermissionRequest, "tool-1".to_string()));
-        assert_eq!(resolved, (RunPauseReason::PermissionRequest, "tool-1".to_string()));
+        assert_eq!(
+            waiting,
+            (RunPauseReason::PermissionRequest, "tool-1".to_string())
+        );
+        assert_eq!(
+            resolved,
+            (RunPauseReason::PermissionRequest, "tool-1".to_string())
+        );
+    }
+
+    #[cfg(feature = "skills")]
+    fn empty_checkpoint(active_skill_names: Vec<String>) -> AgentCheckpoint {
+        AgentCheckpoint {
+            context_json: serde_json::to_string(&crate::Context::default())
+                .expect("empty context should serialize"),
+            todo_items: Vec::new(),
+            active_skill_names,
+            history_anchor: None,
+            tool_surface_hash: "tool-surface".to_string(),
+            context_window: ContextWindowSnapshot {
+                phase: ContextWindowPhase::Stable,
+                metrics: ContextWindowMetrics {
+                    usage_fraction: 0.0,
+                    selected_model_context_window: None,
+                    fast_model_context_window: None,
+                    effective_context_window: 0,
+                    system_block_count: 0,
+                    reminder_count: 0,
+                    recent_message_count: 0,
+                    recent_system_message_count: 0,
+                    has_handoff: false,
+                },
+                messages: Vec::new(),
+            },
+            has_background_tasks: false,
+        }
+    }
+
+    #[cfg(feature = "skills")]
+    fn review_skill_registry() -> Arc<SkillRegistry> {
+        let mut registry = SkillRegistry::new();
+        registry.register(Skill {
+            name: "code-review".to_string(),
+            description: "Review code carefully".to_string(),
+            triggers: vec!["review".to_string()],
+            instructions: "Use a review checklist.".to_string(),
+            allowed_tools: Some(vec!["mock_tool".to_string()]),
+            resources: HashMap::new(),
+        });
+        Arc::new(registry)
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn restore_checkpoint_restores_active_skills_and_allowlist() {
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 1000,
+            },
+            AgentConfig::default(),
+        );
+        agent.skill_registry = Some(review_skill_registry());
+
+        agent
+            .restore_checkpoint(empty_checkpoint(vec!["code-review".to_string()]))
+            .expect("skill checkpoint should restore");
+
+        assert_eq!(agent.active_skills.len(), 1);
+        assert_eq!(agent.active_skills[0].name, "code-review");
+        assert!(
+            agent
+                .active_allowed_tools
+                .as_ref()
+                .is_some_and(|allowed| allowed.contains("mock_tool"))
+        );
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn restore_checkpoint_rejects_unknown_skill_name() {
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 1000,
+            },
+            AgentConfig::default(),
+        );
+        agent.skill_registry = Some(review_skill_registry());
+
+        let error = agent
+            .restore_checkpoint(empty_checkpoint(vec!["missing-skill".to_string()]))
+            .expect_err("unknown skill must fail");
+        assert!(
+            error.to_string().contains("unknown skill"),
+            "unexpected error: {error}"
+        );
     }
 }
