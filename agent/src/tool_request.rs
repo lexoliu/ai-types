@@ -1,10 +1,10 @@
 //! Generic request/response channel helpers for UI-mediated tools.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_channel::{Receiver, Sender};
+use crossbeam_skiplist::SkipMap;
+use dashmap::DashMap;
 
 const ERR_TOOL_REQUEST_UNAVAILABLE: &str = include_str!("texts/tool_request_unavailable.txt");
 const ERR_TOOL_REQUEST_CANCELLED: &str = include_str!("texts/tool_request_cancelled.txt");
@@ -97,22 +97,9 @@ pub fn bounded_channel<Args, Response>(
 // ── RequestApprover ─────────────────────────────────────────
 
 struct PendingEntry<P, R> {
+    order: u64,
     payload: P,
     tx: Sender<R>,
-}
-
-struct ApproverInner<P, R> {
-    order: VecDeque<String>,
-    pending: HashMap<String, PendingEntry<P, R>>,
-}
-
-impl<P, R> Default for ApproverInner<P, R> {
-    fn default() -> Self {
-        Self {
-            order: VecDeque::new(),
-            pending: HashMap::new(),
-        }
-    }
 }
 
 /// An ID-tracked, multi-request approval queue for server contexts.
@@ -129,14 +116,15 @@ impl<P, R> Default for ApproverInner<P, R> {
 /// - `P`: Payload type (cloneable request data visible to the UI).
 /// - `R`: Response type sent back to the requester.
 pub struct RequestApprover<P, R> {
-    inner: Mutex<ApproverInner<P, R>>,
+    order: SkipMap<u64, String>,
+    pending: DashMap<String, PendingEntry<P, R>>,
     event: event_listener::Event,
     next_id: AtomicU64,
 }
 
 impl<P, R> std::fmt::Debug for RequestApprover<P, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let pending_count = self.inner.lock().map(|s| s.pending.len()).unwrap_or(0);
+        let pending_count = self.pending.len();
         f.debug_struct("RequestApprover")
             .field("pending_count", &pending_count)
             .field("next_id", &self.next_id.load(Ordering::Relaxed))
@@ -155,7 +143,8 @@ impl<P: Clone, R> RequestApprover<P, R> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(ApproverInner::default()),
+            order: SkipMap::new(),
+            pending: DashMap::new(),
             event: event_listener::Event::new(),
             next_id: AtomicU64::new(0),
         }
@@ -166,15 +155,12 @@ impl<P: Clone, R> RequestApprover<P, R> {
     /// The returned [`Receiver`] yields the response once [`respond`](Self::respond)
     /// is called with the matching ID.
     pub fn enqueue(&self, payload: P) -> (String, Receiver<R>) {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
+        let order = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = order.to_string();
         let (tx, rx) = async_channel::bounded(1);
-        {
-            let mut inner = self.inner.lock().expect("RequestApprover lock poisoned");
-            inner.order.push_back(id.clone());
-            inner
-                .pending
-                .insert(id.clone(), PendingEntry { payload, tx });
-        }
+        self.pending
+            .insert(id.clone(), PendingEntry { order, payload, tx });
+        self.order.insert(order, id.clone());
         self.event.notify(usize::MAX);
         (id, rx)
     }
@@ -183,14 +169,8 @@ impl<P: Clone, R> RequestApprover<P, R> {
     ///
     /// Returns `true` if the request was found and the response was sent.
     pub fn respond(&self, id: &str, response: R) -> bool {
-        let entry = {
-            let mut inner = self.inner.lock().expect("RequestApprover lock poisoned");
-            if let Some(pos) = inner.order.iter().position(|i| i == id) {
-                inner.order.remove(pos);
-            }
-            inner.pending.remove(id)
-        };
-        let found = if let Some(entry) = entry {
+        let found = if let Some((_, entry)) = self.pending.remove(id) {
+            self.order.remove(&entry.order);
             entry.tx.try_send(response).is_ok()
         } else {
             false
@@ -202,38 +182,45 @@ impl<P: Clone, R> RequestApprover<P, R> {
     /// Return the oldest pending request (ID + cloned payload) without removing it.
     #[must_use]
     pub fn peek(&self) -> Option<(String, P)> {
-        let inner = self.inner.lock().expect("RequestApprover lock poisoned");
-        let id = inner.order.front()?;
-        let entry = inner.pending.get(id)?;
-        Some((id.clone(), entry.payload.clone()))
+        loop {
+            let front = self.order.front()?;
+            let order = *front.key();
+            let id = front.value().clone();
+            drop(front);
+            if let Some(entry) = self.pending.get(id.as_str()) {
+                return Some((id, entry.payload.clone()));
+            }
+            self.order.remove(&order);
+        }
     }
 
     /// Return the oldest pending request matching a predicate.
     #[must_use]
     pub fn peek_filtered(&self, predicate: impl Fn(&P) -> bool) -> Option<(String, P)> {
-        let inner = self.inner.lock().expect("RequestApprover lock poisoned");
-        inner.order.iter().find_map(|id| {
-            let entry = inner.pending.get(id)?;
+        for item in self.order.iter() {
+            let order = *item.key();
+            let id = item.value().clone();
+            let Some(entry) = self.pending.get(id.as_str()) else {
+                self.order.remove(&order);
+                continue;
+            };
             if predicate(&entry.payload) {
-                Some((id.clone(), entry.payload.clone()))
-            } else {
-                None
+                return Some((id, entry.payload.clone()));
             }
-        })
+        }
+        None
     }
 
     /// Get a cloned payload by request ID.
     #[must_use]
     pub fn get_payload(&self, id: &str) -> Option<P> {
-        let inner = self.inner.lock().expect("RequestApprover lock poisoned");
-        inner.pending.get(id).map(|e| e.payload.clone())
+        self.pending.get(id).map(|entry| entry.payload.clone())
     }
 
     /// Returns `true` if there are no pending requests.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        let inner = self.inner.lock().expect("RequestApprover lock poisoned");
-        inner.pending.is_empty()
+        self.pending.is_empty()
     }
 
     /// Create a listener that resolves when the approver state changes.
@@ -249,5 +236,33 @@ impl<P: Clone, R> RequestApprover<P, R> {
     /// ```
     pub fn listen(&self) -> event_listener::EventListener {
         self.event.listen()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RequestApprover;
+
+    #[test]
+    fn peek_returns_requests_in_fifo_order() {
+        let approver = RequestApprover::<&'static str, ()>::new();
+        let _first = approver.enqueue("first");
+        let _second = approver.enqueue("second");
+
+        let peeked = approver.peek().expect("first request should be visible");
+        assert_eq!(peeked, ("0".to_string(), "first"));
+    }
+
+    #[test]
+    fn peek_skips_resolved_requests() {
+        let approver = RequestApprover::<&'static str, ()>::new();
+        let (first_id, first_rx) = approver.enqueue("first");
+        let _second = approver.enqueue("second");
+
+        assert!(approver.respond(&first_id, ()));
+        drop(first_rx);
+
+        let peeked = approver.peek().expect("second request should remain");
+        assert_eq!(peeked, ("1".to_string(), "second"));
     }
 }
