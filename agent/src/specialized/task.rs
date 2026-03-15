@@ -18,7 +18,7 @@ use aither_core::{
 };
 use aither_sandbox::BashToolFactory;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::AgentBuilder;
 use crate::fs_util::path_exists;
@@ -110,6 +110,13 @@ pub struct SubagentArgs {
     pub subagent: String,
     /// The detailed task prompt for the subagent.
     pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SubagentResult {
+    subagent: String,
+    status: &'static str,
+    result: String,
 }
 
 /// A tool that spawns specialized subagents to handle complex tasks.
@@ -491,9 +498,11 @@ where
 
         tracing::info!(subagent = %subagent_id, "Subagent completed");
 
-        Ok(ToolOutput::text(format!(
-            "[Subagent '{subagent_id}' completed]\n\n{result}"
-        )))
+        ToolOutput::json(&SubagentResult {
+            subagent: subagent_id,
+            status: "completed",
+            result,
+        })
     }
 }
 
@@ -514,6 +523,24 @@ mod tests {
         // Check required order
         let required = value.get("required").expect("should have required");
         assert!(required.is_array());
+    }
+
+    #[test]
+    fn subagent_result_serializes_as_structured_json() {
+        let value = serde_json::to_value(SubagentResult {
+            subagent: "research".to_string(),
+            status: "completed",
+            result: "done".to_string(),
+        })
+        .expect("subagent result should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "subagent": "research",
+                "status": "completed",
+                "result": "done",
+            })
+        );
     }
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
