@@ -246,7 +246,10 @@ impl AgentEvent {
 
     /// Creates a background-task-completed event.
     #[must_use]
-    pub fn background_task_completed(task_id: impl Into<String>, result: impl Into<String>) -> Self {
+    pub fn background_task_completed(
+        task_id: impl Into<String>,
+        result: impl Into<String>,
+    ) -> Self {
         Self::BackgroundTaskCompleted {
             task_id: task_id.into(),
             result: result.into(),
@@ -255,10 +258,7 @@ impl AgentEvent {
 
     /// Creates a terminal-input-needed event.
     #[must_use]
-    pub fn terminal_input_needed(
-        task_id: Option<String>,
-        notice: impl Into<String>,
-    ) -> Self {
+    pub fn terminal_input_needed(task_id: Option<String>, notice: impl Into<String>) -> Self {
         Self::TerminalInputNeeded {
             task_id,
             notice: notice.into(),

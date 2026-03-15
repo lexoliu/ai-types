@@ -77,9 +77,9 @@ pub use bash::{
 };
 pub use bollard_exec::{BollardContainerExec, CONTAINER_STDIN_BLOCKED_NOTICE, is_waiting_on_stdin};
 pub use command::{
-    CommandEnvelope, CommandPayload, DynBashTool, DynToolHandler, IpcToolCommand,
-    ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json,
-    register_ipc_gateway_command, register_tool_command, register_tool_direct, schema_to_help,
+    CommandEnvelope, CommandPayload, DynBashTool, DynToolHandler, IpcToolCommand, ToolCallCommand,
+    ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json, register_ipc_gateway_command,
+    register_tool_command, register_tool_direct, schema_to_help,
 };
 pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerRuntimeKind, MountAccess, MountRoot,
@@ -89,7 +89,7 @@ pub use job_registry::{JobInfo, JobRegistry, JobStatus, TerminalDelta};
 pub use output::{Content, OutputEntry, OutputFormat, OutputStore, PendingUrl};
 pub use permission::{BashMode, PermissionHandler};
 pub use shell_session::{
-    ContainerExec, ContainerExecHandle, ContainerExecOutcome, ContainerShellRuntime,
-    ShellBackend, ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile, SshServer,
+    ContainerExec, ContainerExecHandle, ContainerExecOutcome, ContainerShellRuntime, ShellBackend,
+    ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile, SshServer,
     SshSessionAuthorizer, bootstrap_ssh_runtime,
 };

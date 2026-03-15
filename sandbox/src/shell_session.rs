@@ -1,9 +1,4 @@
-use std::{
-    collections::HashSet,
-    future::Future,
-    pin::Pin,
-    sync::Arc,
-};
+use std::{collections::HashSet, future::Future, pin::Pin, sync::Arc};
 
 use async_channel::{Receiver, Sender};
 use schemars::JsonSchema;
@@ -316,7 +311,9 @@ impl ShellSessionRegistry {
         match self.ssh_servers.as_slice() {
             [] => Err("no ssh servers are configured".to_string()),
             [server] => Ok(server.clone()),
-            _ => Err("ssh_server_id is required because multiple ssh servers are configured".to_string()),
+            _ => Err(
+                "ssh_server_id is required because multiple ssh servers are configured".to_string(),
+            ),
         }
     }
 
@@ -546,7 +543,9 @@ fn normalize_arch(raw: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ShellRuntimeAvailability, ShellSessionRegistry, SshServer, parse_remote_probe_output};
+    use super::{
+        ShellRuntimeAvailability, ShellSessionRegistry, SshServer, parse_remote_probe_output,
+    };
 
     #[test]
     fn parse_remote_probe_detects_local_bin_leash_path() {
@@ -574,9 +573,9 @@ mod tests {
             ssh: true,
         })
         .with_ssh_servers(vec![SshServer {
-                name: "prod".to_string(),
-                target: "root@example.com".to_string(),
-            }])
+            name: "prod".to_string(),
+            target: "root@example.com".to_string(),
+        }])
         .expect("ssh server should configure");
 
         let server = registry
@@ -594,15 +593,15 @@ mod tests {
             ssh: true,
         })
         .with_ssh_servers(vec![
-                SshServer {
-                    name: "prod".to_string(),
-                    target: "root@example.com".to_string(),
-                },
-                SshServer {
-                    name: "staging".to_string(),
-                    target: "root@staging.example.com".to_string(),
-                },
-            ])
+            SshServer {
+                name: "prod".to_string(),
+                target: "root@example.com".to_string(),
+            },
+            SshServer {
+                name: "staging".to_string(),
+                target: "root@staging.example.com".to_string(),
+            },
+        ])
         .expect("ssh servers should configure");
 
         let error = registry

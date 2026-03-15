@@ -12,8 +12,7 @@ pub use aither_gemini::{self as gemini, Gemini, GeminiProvider};
 pub use aither_openai::{self as openai, OpenAI, OpenAIProvider};
 
 use aither_core::{
-    EmbeddingModel,
-    LanguageModel,
+    EmbeddingModel, LanguageModel,
     llm::{
         Event, LLMRequest, LanguageModelProvider, model::Profile,
         provider::Profile as ProviderProfile,
@@ -101,7 +100,7 @@ impl EmbeddingModel for CloudEmbedder {
 #[cfg(test)]
 mod tests {
     use super::{CloudEmbedder, CloudEmbedderError, CloudProvider};
-    use crate::{Claude, Gemini, OpenAI, Copilot};
+    use crate::{Claude, Copilot, Gemini, OpenAI};
 
     #[test]
     fn openai_and_gemini_convert_to_cloud_embedder() {

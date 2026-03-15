@@ -746,48 +746,46 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         let timeout = arguments.timeout;
 
         let (backend, mode, ssh_target, ssh_runtime, container_runtime) = match arguments.mode {
-            BashExecutionMode::Default => {
-                match self.shell_sessions.resolve_local_backend() {
-                    Ok(backend) => {
-                        let container_runtime = if matches!(backend, ShellBackend::Container) {
-                            Some(
-                                self.shell_sessions
-                                    .container_runtime()
-                                    .cloned()
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "missing container runtime for container backend"
-                                        )
-                                    })?,
-                            )
-                        } else {
-                            None
-                        };
-                        (backend, BashMode::Network, None, None, container_runtime)
-                    }
-                    Err(local_error) => {
-                        self.shell_sessions
-                            .ensure_ssh_available()
-                            .map_err(anyhow::Error::msg)?;
-                        let server = self
-                            .shell_sessions
-                            .default_ssh_server()
-                            .map_err(|ssh_error| anyhow::anyhow!("{local_error}; {ssh_error}"))?;
-                        let runtime = bootstrap_ssh_runtime(
-                            &server.target,
-                            &self.shell_sessions.ssh_authorizer(),
+            BashExecutionMode::Default => match self.shell_sessions.resolve_local_backend() {
+                Ok(backend) => {
+                    let container_runtime = if matches!(backend, ShellBackend::Container) {
+                        Some(
+                            self.shell_sessions
+                                .container_runtime()
+                                .cloned()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "missing container runtime for container backend"
+                                    )
+                                })?,
                         )
-                        .await?;
-                        (
-                            ShellBackend::Ssh,
-                            BashMode::Network,
-                            Some(server.target),
-                            Some(runtime),
-                            None,
-                        )
-                    }
+                    } else {
+                        None
+                    };
+                    (backend, BashMode::Network, None, None, container_runtime)
                 }
-            }
+                Err(local_error) => {
+                    self.shell_sessions
+                        .ensure_ssh_available()
+                        .map_err(anyhow::Error::msg)?;
+                    let server = self
+                        .shell_sessions
+                        .default_ssh_server()
+                        .map_err(|ssh_error| anyhow::anyhow!("{local_error}; {ssh_error}"))?;
+                    let runtime = bootstrap_ssh_runtime(
+                        &server.target,
+                        &self.shell_sessions.ssh_authorizer(),
+                    )
+                    .await?;
+                    (
+                        ShellBackend::Ssh,
+                        BashMode::Network,
+                        Some(server.target),
+                        Some(runtime),
+                        None,
+                    )
+                }
+            },
             BashExecutionMode::Sandboxed => {
                 let backend = self
                     .shell_sessions

@@ -38,8 +38,8 @@ use aither_core::llm::{Tool, ToolOutput};
 use askama::Template;
 use leash::IpcCommand;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 // ============================================================================
@@ -154,11 +154,8 @@ impl CommandPayload {
     fn render_for_cli(&self) -> Result<String, String> {
         match self {
             Self::Text { content } => Ok(content.clone()),
-            Self::Json { value } => {
-                serde_json::to_string_pretty(value).map_err(|error| {
-                    prefix_error("failed to encode JSON output: ", &error)
-                })
-            }
+            Self::Json { value } => serde_json::to_string_pretty(value)
+                .map_err(|error| prefix_error("failed to encode JSON output: ", &error)),
         }
     }
 }
@@ -201,7 +198,9 @@ impl CommandEnvelope {
 
 /// Type-erased tool handler function.
 type ToolHandlerFn = Box<
-    dyn Fn(Vec<String>) -> Pin<Box<dyn Future<Output = Result<Option<CommandPayload>, String>> + Send>>
+    dyn Fn(
+            Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<CommandPayload>, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -278,12 +277,13 @@ fn tool_output_to_payload(output: ToolOutput) -> Result<Option<CommandPayload>, 
     match output {
         ToolOutput::Done => Ok(None),
         ToolOutput::Output { mime, content } => {
-            let mime_is_json =
-                mime.subtype().as_str() == "json" || mime.suffix().is_some_and(|suffix| suffix.as_str() == "json");
+            let mime_is_json = mime.subtype().as_str() == "json"
+                || mime
+                    .suffix()
+                    .is_some_and(|suffix| suffix.as_str() == "json");
             if mime_is_json {
-                let value = serde_json::from_slice(&content).map_err(|error| {
-                    prefix_error("invalid JSON tool output: ", &error)
-                })?;
+                let value = serde_json::from_slice(&content)
+                    .map_err(|error| prefix_error("invalid JSON tool output: ", &error))?;
                 return Ok(Some(CommandPayload::Json { value }));
             }
 
@@ -416,7 +416,8 @@ impl ToolRegistryBuilder {
     ) where
         F: Fn(
                 Vec<String>,
-            ) -> Pin<Box<dyn Future<Output = Result<Option<CommandPayload>, String>> + Send>>
+            )
+                -> Pin<Box<dyn Future<Output = Result<Option<CommandPayload>, String>> + Send>>
             + Send
             + Sync
             + 'static,
@@ -513,12 +514,10 @@ impl ToolRegistry {
     pub async fn query_tool_handler(&self, tool_name: &str, args: &[String]) -> CommandEnvelope {
         let entry = self.entries.get(tool_name);
         match entry {
-            Some(entry) => {
-                match (entry.handler)(args.to_vec()).await {
-                    Ok(output) => handle_large_output(output, &self.output_dir).await,
-                    Err(error) => CommandEnvelope::failure(error),
-                }
-            }
+            Some(entry) => match (entry.handler)(args.to_vec()).await {
+                Ok(output) => handle_large_output(output, &self.output_dir).await,
+                Err(error) => CommandEnvelope::failure(error),
+            },
             None => CommandEnvelope::failure(unknown_command_text(tool_name)),
         }
     }
@@ -706,8 +705,7 @@ impl IpcCommand for ToolCallCommand {
         }
 
         tracing::info!(tool = %self.tool_name, "Calling registry.query_tool_handler");
-        self
-            .registry
+        self.registry
             .query_tool_handler(&self.tool_name, &cli_args)
             .await
     }
@@ -789,7 +787,9 @@ impl IpcCommand for IpcGatewayCommand {
 
         let tool_name = &cli_args[0];
         let tool_args = cli_args[1..].to_vec();
-        self.registry.query_tool_handler(tool_name, &tool_args).await
+        self.registry
+            .query_tool_handler(tool_name, &tool_args)
+            .await
     }
 }
 
@@ -2194,7 +2194,14 @@ mod tests {
         assert_eq!(
             cli,
             vec![
-                "--alpha", "first", "--enabled", "--multi", "x", "--multi", "y", "--zebra",
+                "--alpha",
+                "first",
+                "--enabled",
+                "--multi",
+                "x",
+                "--multi",
+                "y",
+                "--zebra",
                 "last"
             ]
         );
@@ -2256,10 +2263,10 @@ mod tests {
             async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
                 // Return the parsed args as JSON so we can inspect
                 ToolOutput::json(&serde_json::json!({
-                        "question": args.question,
-                        "option": args.option,
-                        "multi_select": args.multi_select,
-                    }))
+                    "question": args.question,
+                    "option": args.option,
+                    "multi_select": args.multi_select,
+                }))
             }
         }
 

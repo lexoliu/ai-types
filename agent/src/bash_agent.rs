@@ -37,21 +37,21 @@ use std::sync::Arc;
 use aither_core::LanguageModel;
 use aither_core::llm::Tool;
 use aither_core::llm::tool::ToolDefinition;
+#[cfg(feature = "skills")]
+use aither_skills::SkillRegistry;
 use askama::Template;
 use async_fs as fs;
 use executor_core::Executor;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
-#[cfg(feature = "skills")]
-use aither_skills::SkillRegistry;
 
 use crate::hook::Hook;
 use crate::{Agent, AgentBuilder, config::AgentKind, context::serialize_xml};
 use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool, ReadTerminalDeltaTool};
 use aither_sandbox::{
-    BashTool, BashToolFactory, BashToolFactoryReceiver, ContainerShellRuntime,
-    PermissionHandler, ShellRuntimeAvailability, ShellSessionRegistry, SshServer,
-    SshSessionAuthorizer, ToolRegistryBuilder, Unconfigured, bash_tool_factory_channel,
+    BashTool, BashToolFactory, BashToolFactoryReceiver, ContainerShellRuntime, PermissionHandler,
+    ShellRuntimeAvailability, ShellSessionRegistry, SshServer, SshSessionAuthorizer,
+    ToolRegistryBuilder, Unconfigured, bash_tool_factory_channel,
 };
 
 /// System prompt template for bash-centric agents.
@@ -96,11 +96,7 @@ fn join_text(parts: &[&str]) -> String {
     output
 }
 
-fn path_error_text(
-    prefix: &str,
-    path: &std::path::Path,
-    error: &impl std::fmt::Display,
-) -> String {
+fn path_error_text(prefix: &str, path: &std::path::Path, error: &impl std::fmt::Display) -> String {
     let path_text = path.display().to_string();
     let error_text = error.to_string();
     join_text(&[prefix, path_text.as_str(), "': ", error_text.as_str()])
@@ -369,14 +365,18 @@ where
             .shell_sessions
             .with_ssh_servers(servers)
             .expect("invalid ssh server configuration");
-        self.bash_tool = self.bash_tool.with_shell_sessions(self.shell_sessions.clone());
+        self.bash_tool = self
+            .bash_tool
+            .with_shell_sessions(self.shell_sessions.clone());
         self
     }
 
     /// Sets the SSH session authorizer for interactive connect/install consent prompts.
     pub fn ssh_authorizer(mut self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
         self.shell_sessions = self.shell_sessions.with_ssh_authorizer(authorizer);
-        self.bash_tool = self.bash_tool.with_shell_sessions(self.shell_sessions.clone());
+        self.bash_tool = self
+            .bash_tool
+            .with_shell_sessions(self.shell_sessions.clone());
         self
     }
 

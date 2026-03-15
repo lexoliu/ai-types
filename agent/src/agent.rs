@@ -11,12 +11,12 @@ use aither_core::{
     LanguageModel,
     llm::{Event, LLMRequest, Message, model::Profile as ModelProfile},
 };
+#[cfg(feature = "skills")]
+use aither_skills::Skill;
 use askama::Template;
 use futures_core::Stream;
 use futures_lite::StreamExt;
 use sha2::{Digest, Sha256};
-#[cfg(feature = "skills")]
-use aither_skills::Skill;
 #[cfg(feature = "skills")]
 use std::collections::HashSet;
 
@@ -39,7 +39,9 @@ use crate::{
     working_docs,
 };
 
-use aither_sandbox::{BackgroundTaskReceiver, CONTAINER_STDIN_BLOCKED_NOTICE, JobRegistry, OutputStore};
+use aither_sandbox::{
+    BackgroundTaskReceiver, CONTAINER_STDIN_BLOCKED_NOTICE, JobRegistry, OutputStore,
+};
 use std::sync::Arc;
 
 /// Result of a compaction operation.
@@ -1163,16 +1165,23 @@ where
             self.active_skills.clear();
             self.active_allowed_tools = None;
             if !checkpoint.active_skill_names.is_empty() {
-                let registry = self
-                    .skill_registry
-                    .as_ref()
-                    .ok_or_else(|| AgentError::Config("checkpoint contains active skills but no skill registry is loaded".to_string()))?;
+                let registry = self.skill_registry.as_ref().ok_or_else(|| {
+                    AgentError::Config(
+                        "checkpoint contains active skills but no skill registry is loaded"
+                            .to_string(),
+                    )
+                })?;
                 let mut allowed_tools = HashSet::new();
                 let mut saw_explicit_allowlist = false;
                 for name in checkpoint.active_skill_names {
                     let skill = registry
                         .get(&name)
-                        .ok_or_else(|| AgentError::Config(["checkpoint references unknown skill '", name.as_str(), "'"].concat()))?
+                        .ok_or_else(|| {
+                            AgentError::Config(
+                                ["checkpoint references unknown skill '", name.as_str(), "'"]
+                                    .concat(),
+                            )
+                        })?
                         .clone();
                     if let Some(tools) = &skill.allowed_tools {
                         saw_explicit_allowlist = true;
@@ -1714,7 +1723,8 @@ where
                         return (
                             call.id.clone(),
                             call.name.clone(),
-                            Err(["skill activation blocked tool '", call.name.as_str(), "'"].concat()),
+                            Err(["skill activation blocked tool '", call.name.as_str(), "'"]
+                                .concat()),
                         );
                     }
                     let result = tools
@@ -1920,7 +1930,10 @@ where
     }
 
     /// Formats a reminder and event payload when `bash` has been auto-promoted to background.
-    fn format_background_started_event(&self, tool_content: &str) -> Option<BackgroundTaskStartedEvent> {
+    fn format_background_started_event(
+        &self,
+        tool_content: &str,
+    ) -> Option<BackgroundTaskStartedEvent> {
         let payload: serde_json::Value = serde_json::from_str(tool_content).ok()?;
         let status = payload.get("status")?.as_str()?;
         if status != "running" {
@@ -2205,14 +2218,18 @@ mod tests {
             });
             config.context_assembler.handoff_threshold = 0.1;
 
-            let mut agent = Agent::with_config(MockLlm { context_length: 100 }, config);
+            let mut agent = Agent::with_config(
+                MockLlm {
+                    context_length: 100,
+                },
+                config,
+            );
             agent.push_message(Message::user("hello"));
 
             let before_recent = agent.context().len_recent();
-            agent
-                .maybe_compress()
-                .await
-                .unwrap_or_else(|error| panic!("handoff_due must not compact automatically: {error}"));
+            agent.maybe_compress().await.unwrap_or_else(|error| {
+                panic!("handoff_due must not compact automatically: {error}")
+            });
 
             assert_eq!(agent.context().len_recent(), before_recent);
             assert!(agent.context().handoff().is_none());
@@ -2232,9 +2249,16 @@ mod tests {
             });
             config.context_assembler.handoff_threshold = 10.0;
 
-            let mut agent = Agent::with_config(MockLlm { context_length: 100 }, config);
+            let mut agent = Agent::with_config(
+                MockLlm {
+                    context_length: 100,
+                },
+                config,
+            );
             agent.push_message(Message::user("hello"));
-            agent.push_message(Message::system("<system-reminder>ephemeral</system-reminder>"));
+            agent.push_message(Message::system(
+                "<system-reminder>ephemeral</system-reminder>",
+            ));
 
             let snapshot = agent.snapshot_context_window().await;
             assert_eq!(snapshot.phase, ContextWindowPhase::ReassemblyDue);
@@ -2256,9 +2280,16 @@ mod tests {
             let mut config = AgentConfig::default();
             config.context_assembler.idle_reassemble_after = Duration::from_secs(1);
 
-            let mut agent = Agent::with_config(MockLlm { context_length: 1_000 }, config);
+            let mut agent = Agent::with_config(
+                MockLlm {
+                    context_length: 1_000,
+                },
+                config,
+            );
             agent.push_message(Message::user("hello"));
-            agent.push_message(Message::system("<system-reminder>ephemeral</system-reminder>"));
+            agent.push_message(Message::system(
+                "<system-reminder>ephemeral</system-reminder>",
+            ));
             agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(5));
 
             let _ = agent.build_live_request_messages().await;
