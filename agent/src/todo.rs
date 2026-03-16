@@ -4,7 +4,7 @@
 //! Designed to work like Claude Code's `TodoWrite` for tracking multi-step work.
 
 use std::borrow::Cow;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 #[cfg(test)]
 mod tests {
@@ -55,6 +55,7 @@ mod tests {
 }
 
 use aither_core::llm::{Tool, ToolOutput};
+use arc_swap::ArcSwap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -87,7 +88,7 @@ pub struct TodoItem {
 /// Shared todo list state.
 #[derive(Debug, Clone, Default)]
 pub struct TodoList {
-    items: Arc<RwLock<Vec<TodoItem>>>,
+    items: Arc<ArcSwap<Vec<TodoItem>>>,
 }
 
 impl TodoList {
@@ -100,25 +101,24 @@ impl TodoList {
     /// Returns all items in the list.
     #[must_use]
     pub fn items(&self) -> Vec<TodoItem> {
-        self.items.read().unwrap().clone()
+        self.items.load_full().as_ref().clone()
     }
 
     /// Replaces the entire todo list with new items.
     pub fn write(&self, items: Vec<TodoItem>) {
-        *self.items.write().unwrap() = items;
+        self.items.store(Arc::new(items));
     }
 
     /// Clears all tasks.
     pub fn clear(&self) {
-        self.items.write().unwrap().clear();
+        self.items.store(Arc::new(Vec::new()));
     }
 
     /// Returns the currently in-progress task, if any.
     #[must_use]
     pub fn current_task(&self) -> Option<TodoItem> {
         self.items
-            .read()
-            .unwrap()
+            .load()
             .iter()
             .find(|i| i.status == TodoStatus::InProgress)
             .cloned()
@@ -127,7 +127,7 @@ impl TodoList {
     /// Returns a formatted summary of progress.
     #[must_use]
     pub fn progress_summary(&self) -> String {
-        let items = self.items.read().unwrap();
+        let items = self.items.load();
         if items.is_empty() {
             return String::new();
         }

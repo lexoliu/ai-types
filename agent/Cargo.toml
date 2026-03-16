@@ -30,6 +30,7 @@ async-fs = "2"
 async-channel = "2"
 crossbeam-skiplist = "0.1"
 dashmap = "6"
+arc-swap = "1"
 event-listener = "5"
 aither-websearch = { workspace = true, optional = true }
 aither-webfetch = { workspace = true, optional = true }
