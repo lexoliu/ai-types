@@ -1721,8 +1721,10 @@ fn wrap_container_script(
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
         {
+            let mut message = String::from("invalid ipc command name for container wrapper: ");
+            message.push_str(name);
             return Err(BashError::Execution(
-                ["invalid ipc command name for container wrapper: ", name].concat(),
+                message,
             ));
         }
     }
@@ -1740,13 +1742,10 @@ fn wrap_container_script(
     }
     .render()
     .map_err(|error| {
-        BashError::Execution(
-            [
-                "failed to render container IPC wrapper: ",
-                error.to_string().as_str(),
-            ]
-            .concat(),
-        )
+        let error_text = error.to_string();
+        let mut message = String::from("failed to render container IPC wrapper: ");
+        message.push_str(error_text.as_str());
+        BashError::Execution(message)
     })
 }
 

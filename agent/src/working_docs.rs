@@ -59,7 +59,9 @@ pub fn tasks_md_diff(
         if value.is_empty() {
             continue;
         }
-        lines.push([prefix, value].concat());
+        let mut line = String::from(prefix);
+        line.push_str(value);
+        lines.push(line);
         if lines.len() == 48 {
             lines.push("...".to_string());
             break;

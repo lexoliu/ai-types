@@ -693,9 +693,12 @@ where
                         if let Some(allowed_tools) = &active_allowed_tools
                             && !allowed_tools.contains(&call.name.to_lowercase())
                         {
+                            let mut reason = String::from("skill activation blocked tool '");
+                            reason.push_str(call.name.as_str());
+                            reason.push('\'');
                             return Err(AgentError::HookRejected {
                                 hook: "skill_allowed_tools",
-                                reason: ["skill activation blocked tool '", call.name.as_str(), "'"].concat(),
+                                reason,
                             });
                         }
 
@@ -750,7 +753,12 @@ where
                                 }
                             }
                             PostToolAction::Keep => result
-                                .map_err(|e| ["Error: ", e.to_string().as_str()].concat()),
+                                .map_err(|error| {
+                                    let error_text = error.to_string();
+                                    let mut text = String::from("Error: ");
+                                    text.push_str(error_text.as_str());
+                                    text
+                                }),
                         };
 
                         Ok((call.id.clone(), call.name.clone(), tool_result))
@@ -1291,10 +1299,11 @@ where
                     let skill = registry
                         .get(&name)
                         .ok_or_else(|| {
-                            AgentError::Config(
-                                ["checkpoint references unknown skill '", name.as_str(), "'"]
-                                    .concat(),
-                            )
+                            let mut message =
+                                String::from("checkpoint references unknown skill '");
+                            message.push_str(name.as_str());
+                            message.push('\'');
+                            AgentError::Config(message)
                         })?
                         .clone();
                     if let Some(tools) = &skill.allowed_tools {
@@ -1636,7 +1645,9 @@ where
         let mut note = String::new();
         note.push_str(&self.config.context_assembler.handoff_instruction);
         if let Some(path) = &self.config.transcript_path {
-            note.push_str([" Transcript source: ", path, "."].concat().as_str());
+            note.push_str(" Transcript source: ");
+            note.push_str(path);
+            note.push('.');
         }
         Some(note)
     }
@@ -1650,7 +1661,10 @@ where
             if desc.is_empty() {
                 continue;
             }
-            lines.push([def.name().as_ref(), ": ", desc.as_str()].concat());
+            let mut line = def.name().to_string();
+            line.push_str(": ");
+            line.push_str(desc.as_str());
+            lines.push(line);
         }
 
         lines.join("\n")
@@ -1842,18 +1856,25 @@ where
                     if let Some(allowed_tools) = &active_allowed_tools
                         && !allowed_tools.contains(&call.name.to_lowercase())
                     {
+                        let mut reason = String::from("skill activation blocked tool '");
+                        reason.push_str(call.name.as_str());
+                        reason.push('\'');
                         return (
                             call.id.clone(),
                             call.name.clone(),
-                            Err(["skill activation blocked tool '", call.name.as_str(), "'"]
-                                .concat()),
+                            Err(reason),
                         );
                     }
                     let result = tools
                         .call(&call.name, &args_json)
                         .await
                         .map(|output| output.as_str().unwrap_or("").to_string())
-                        .map_err(|e| ["Error: ", e.to_string().as_str()].concat());
+                        .map_err(|error| {
+                            let error_text = error.to_string();
+                            let mut text = String::from("Error: ");
+                            text.push_str(error_text.as_str());
+                            text
+                        });
                     (call.id.clone(), call.name.clone(), result)
                 }
             });
@@ -2246,7 +2267,11 @@ fn format_todo_items_json(items: &[TodoItem]) -> String {
 }
 
 fn format_builtin_tool_result(tool: &str, result: &str) -> String {
-    ["[", tool, "] ", result].concat()
+    let mut text = String::from("[");
+    text.push_str(tool);
+    text.push_str("] ");
+    text.push_str(result);
+    text
 }
 
 fn permission_event_key_for_call(

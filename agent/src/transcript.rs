@@ -75,13 +75,7 @@ impl Transcript {
     /// Marker written on compaction. Deliberately excludes the summary so the
     /// model knows context was lost and should recover from files.
     pub async fn write_compact_marker(&self) {
-        let marker = concat!(
-            "\n---\n\n",
-            "*[Context was compacted here. Earlier messages were summarized and removed. ",
-            "Details may be missing -- recover from files or re-read this transcript ",
-            "if needed.]*\n\n",
-            "---\n\n",
-        );
+        let marker = "\n---\n\n*[Context was compacted here. Earlier messages were summarized and removed. Details may be missing -- recover from files or re-read this transcript if needed.]*\n\n---\n\n";
         self.append(marker).await;
     }
 
