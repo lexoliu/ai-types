@@ -55,7 +55,7 @@ impl LanguageModelProvider for MistralProvider {
     fn list_models(&self) -> impl Future<Output = Result<Vec<ModelProfile>, Self::Error>> + Send {
         async move {
             let provider = aither_models::Provider::Mistral;
-            aither_models::models_for_provider(&provider)
+            Ok(aither_models::models_for_provider(&provider)
                 .map(|model| {
                     let context_length = model.max_input_tokens().unwrap_or_else(|| {
                         panic!(
@@ -71,7 +71,7 @@ impl LanguageModelProvider for MistralProvider {
                         context_length,
                     )
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>())
         }
     }
 
