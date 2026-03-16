@@ -1469,6 +1469,8 @@ where
         let mut events = Vec::with_capacity(matches.len());
         for matched in matches {
             let skill = matched.skill.clone();
+            let mut resource_paths = skill.resources.keys().cloned().collect::<Vec<_>>();
+            resource_paths.sort();
             if let Some(tools) = &skill.allowed_tools {
                 saw_explicit_allowlist = true;
                 for tool in tools {
@@ -1479,6 +1481,7 @@ where
                 skill.name.clone(),
                 matched.matched_trigger.clone(),
                 skill.allowed_tools.clone(),
+                (!resource_paths.is_empty()).then_some(resource_paths),
             ));
             self.active_skills.push(skill);
         }

@@ -646,6 +646,16 @@ mod tests {
         let events = agent.activate_skills_for_prompt("please review this patch");
 
         assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            crate::AgentEvent::SkillActivated {
+                resource_paths: Some(_),
+                ..
+            } | crate::AgentEvent::SkillActivated {
+                resource_paths: None,
+                ..
+            }
+        ));
         assert_eq!(agent.active_skills.len(), 1);
         assert!(
             agent
@@ -653,5 +663,38 @@ mod tests {
                 .as_ref()
                 .is_some_and(|allowed| allowed.contains("mock_tool"))
         );
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn test_skill_activation_event_includes_resource_catalog() {
+        let mut registry = SkillRegistry::new();
+        registry.register(Skill {
+            name: "code-review".to_string(),
+            description: "Review code carefully".to_string(),
+            triggers: vec!["review".to_string()],
+            instructions: "Use a review checklist.".to_string(),
+            allowed_tools: Some(vec!["mock_tool".to_string()]),
+            resources: std::collections::HashMap::from([(
+                "templates/review.md".to_string(),
+                "# Review template".to_string(),
+            )]),
+        });
+
+        let mut agent = AgentBuilder::new(MockLlm)
+            .skill_registry(Arc::new(registry))
+            .build();
+        let events = agent.activate_skills_for_prompt("please review this patch");
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            crate::AgentEvent::SkillActivated { resource_paths, .. } => {
+                assert_eq!(
+                    resource_paths.as_ref(),
+                    Some(&vec!["templates/review.md".to_string()])
+                );
+            }
+            other => panic!("unexpected skill event: {other:?}"),
+        }
     }
 }
