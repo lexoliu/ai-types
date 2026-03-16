@@ -116,38 +116,10 @@ impl SubagentDefinition {
         })
     }
 
-    /// Load a subagent definition from a file.
-    pub fn from_file(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        Self::parse(&content).map_err(Self::invalid_data_error)
-    }
-
     /// Load a subagent definition from a file asynchronously.
     pub async fn from_file_async(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let content = fs::read_to_string(path).await?;
         Self::parse(&content).map_err(Self::invalid_data_error)
-    }
-
-    /// Load all subagent definitions from a directory.
-    ///
-    /// Looks for `.md` files in the directory.
-    pub fn load_from_dir(dir: impl AsRef<Path>) -> std::io::Result<Vec<Self>> {
-        let mut definitions = Vec::new();
-
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-            Err(e) => return Err(e),
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "md") {
-                definitions.push(Self::from_file(&path)?);
-            }
-        }
-
-        Ok(definitions)
     }
 
     /// Load all subagent definitions from a directory asynchronously.
