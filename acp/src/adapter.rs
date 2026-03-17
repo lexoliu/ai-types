@@ -66,6 +66,14 @@ pub fn agent_event_to_session_update(event: &AgentEvent) -> Option<SessionUpdate
         }
 
         // These events are handled at a higher level
+        AgentEvent::RunStart { .. } => None,
+        AgentEvent::Checkpoint { .. } => None,
+        AgentEvent::BackgroundTaskStarted { .. } => None,
+        AgentEvent::BackgroundTaskCompleted { .. } => None,
+        AgentEvent::TerminalInputNeeded { .. } => None,
+        AgentEvent::RunPaused { .. } => None,
+        AgentEvent::RunResumed { .. } => None,
+        AgentEvent::SkillActivated { .. } => None,
         AgentEvent::TurnComplete { .. } => None,
         AgentEvent::Complete { .. } => None,
         AgentEvent::Error(_) => None,

@@ -65,6 +65,7 @@ mod provider;
 use crate::hook::DebugHook;
 use crate::provider::Provider;
 use aither_cloud::CloudProvider;
+use dashmap::DashSet;
 
 /// Default whitelist of common domains that don't need explicit approval.
 const DEFAULT_DOMAIN_WHITELIST: &[&str] = &[
@@ -100,14 +101,14 @@ struct InteractivePermissionHandler {
     /// Whether network mode has been approved (auto-approves all domains).
     network_approved: std::sync::atomic::AtomicBool,
     /// Cache of approved domains for cases where network mode isn't blanket approved.
-    approved_domains: std::sync::RwLock<std::collections::HashSet<String>>,
+    approved_domains: DashSet<String>,
 }
 
 impl InteractivePermissionHandler {
     fn new() -> Self {
         Self {
             network_approved: std::sync::atomic::AtomicBool::new(false),
-            approved_domains: std::sync::RwLock::new(std::collections::HashSet::new()),
+            approved_domains: DashSet::new(),
         }
     }
 }
@@ -159,11 +160,8 @@ impl PermissionHandler for InteractivePermissionHandler {
         }
 
         // Check if already approved
-        {
-            let approved = self.approved_domains.read().expect("domain cache lock");
-            if approved.contains(domain) {
-                return true;
-            }
+        if self.approved_domains.contains(domain) {
+            return true;
         }
 
         // Prompt user for new domain
@@ -176,8 +174,7 @@ impl PermissionHandler for InteractivePermissionHandler {
 
         if approved {
             // Cache approval for this domain
-            let mut cache = self.approved_domains.write().expect("domain cache lock");
-            cache.insert(domain.to_string());
+            self.approved_domains.insert(domain.to_string());
             true
         } else {
             false
