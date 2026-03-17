@@ -391,7 +391,7 @@ impl LanguageModel for OpenAI {
 
             match cfg.api_kind {
                 ApiKind::ChatCompletions => {
-                    let payload_messages = to_chat_messages(&messages);
+                    let payload_messages = to_chat_messages(&messages).await;
                     let openai_tools = if tool_defs.is_empty() {
                         None
                     } else {

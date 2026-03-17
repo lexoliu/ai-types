@@ -10,6 +10,9 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
+#[cfg(not(target_arch = "wasm32"))]
+use async_fs;
+
 use crate::attachments::parse_openai_file_url;
 use crate::error::OpenAIError;
 #[derive(Clone)]
@@ -257,58 +260,52 @@ struct ReasoningPayload {
     effort: Option<&'static str>,
 }
 
-pub fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
-    messages
-        .iter()
-        .map(|message| {
-            let role = match message.role() {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "system",
-                Role::Tool => "tool",
-            };
+pub async fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
+    let mut payloads = Vec::with_capacity(messages.len());
+    for message in messages {
+        let role = match message.role() {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => "system",
+            Role::Tool => "tool",
+        };
 
-            // Handle tool_call_id for Tool messages
-            let tool_call_id = message.tool_call_id().map(String::from);
+        let tool_call_id = message.tool_call_id().map(String::from);
+        let tool_calls = if message.tool_calls().is_empty() {
+            None
+        } else {
+            Some(
+                message
+                    .tool_calls()
+                    .iter()
+                    .map(|tc| ChatToolCallPayload {
+                        id: tc.id.clone(),
+                        kind: "function",
+                        function: ChatToolFunctionPayload {
+                            name: tc.name.clone(),
+                            arguments: tc.arguments.to_string(),
+                        },
+                    })
+                    .collect(),
+            )
+        };
 
-            // Handle tool_calls for Assistant messages
-            let tool_calls = if message.tool_calls().is_empty() {
-                None
-            } else {
-                Some(
-                    message
-                        .tool_calls()
-                        .iter()
-                        .map(|tc| ChatToolCallPayload {
-                            id: tc.id.clone(),
-                            kind: "function",
-                            function: ChatToolFunctionPayload {
-                                name: tc.name.clone(),
-                                arguments: tc.arguments.to_string(),
-                            },
-                        })
-                        .collect(),
-                )
-            };
-
-            // Build content - use multimodal format if there are attachments
-            let content = build_content(message);
-
-            ChatMessagePayload {
-                role,
-                content,
-                tool_calls,
-                tool_call_id,
-            }
-        })
-        .collect()
+        let content = build_content(message).await;
+        payloads.push(ChatMessagePayload {
+            role,
+            content,
+            tool_calls,
+            tool_call_id,
+        });
+    }
+    payloads
 }
 
 /// Build content payload for a message.
 ///
 /// Returns simple text for messages without attachments,
 /// or multimodal content parts for messages with attachments.
-fn build_content(message: &Message) -> ContentPayload {
+async fn build_content(message: &Message) -> ContentPayload {
     let attachments = message.attachments();
 
     if attachments.is_empty() {
@@ -319,7 +316,7 @@ fn build_content(message: &Message) -> ContentPayload {
 
     // Add image parts first
     for attachment in attachments {
-        if let Some(data_url) = url_to_data_url(attachment) {
+        if let Some(data_url) = url_to_data_url(attachment).await {
             parts.push(ContentPart::ImageUrl {
                 image_url: ImageUrlPayload { url: data_url },
             });
@@ -349,14 +346,14 @@ fn flatten_content(message: &Message) -> String {
 /// - `data:...` URLs - passed through as-is
 /// - `file:///path` URLs - reads file and converts to base64 data URL
 /// - HTTP/HTTPS URLs - passed through as-is (`OpenAI` can fetch them)
-fn url_to_data_url(url: &url::Url) -> Option<String> {
+async fn url_to_data_url(url: &url::Url) -> Option<String> {
     match url.scheme() {
         "data" => Some(url.as_str().to_string()),
         "http" | "https" => Some(url.as_str().to_string()),
         "file" => {
             #[cfg(not(target_arch = "wasm32"))]
             {
-                read_file_to_data_url(url)
+                read_file_to_data_url(url).await
             }
             #[cfg(target_arch = "wasm32")]
             {
@@ -373,11 +370,11 @@ fn url_to_data_url(url: &url::Url) -> Option<String> {
 
 /// Read a file:// URL and convert to a data URL.
 #[cfg(not(target_arch = "wasm32"))]
-fn read_file_to_data_url(url: &url::Url) -> Option<String> {
+async fn read_file_to_data_url(url: &url::Url) -> Option<String> {
     use base64::Engine;
 
     let path = url.to_file_path().ok()?;
-    let data = std::fs::read(&path).ok()?;
+    let data = async_fs::read(&path).await.ok()?;
     let mime_type = mime_from_path(&path)?;
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
 
