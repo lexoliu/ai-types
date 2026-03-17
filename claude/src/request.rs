@@ -8,6 +8,7 @@ use aither_core::llm::{
     },
     tool::ToolDefinition,
 };
+use async_fs;
 use base64::Engine;
 use serde::Serialize;
 use serde_json::Value;
@@ -254,7 +255,7 @@ impl From<&Parameters> for ParameterSnapshot {
 ///
 /// Returns (`system_prompt`, messages). A single system message is emitted as
 /// plain text, while multiple system messages are preserved as system blocks.
-pub fn to_claude_messages(messages: &[Message]) -> (Option<SystemPayload>, Vec<MessagePayload>) {
+pub async fn to_claude_messages(messages: &[Message]) -> (Option<SystemPayload>, Vec<MessagePayload>) {
     let mut system_parts: Vec<String> = Vec::new();
     let mut claude_messages: Vec<MessagePayload> = Vec::new();
 
@@ -267,7 +268,7 @@ pub fn to_claude_messages(messages: &[Message]) -> (Option<SystemPayload>, Vec<M
                 let content = if matches!(message.role(), Role::Tool) {
                     build_tool_result_content(message)
                 } else {
-                    build_user_content(message)
+                    build_user_content(message).await
                 };
                 claude_messages.push(MessagePayload {
                     role: "user",
@@ -304,7 +305,7 @@ pub fn to_claude_messages(messages: &[Message]) -> (Option<SystemPayload>, Vec<M
 }
 
 /// Build content for a user message, handling vision attachments.
-fn build_user_content(message: &Message) -> ContentPayload {
+async fn build_user_content(message: &Message) -> ContentPayload {
     let attachments = message.attachments();
 
     if attachments.is_empty() {
@@ -316,7 +317,7 @@ fn build_user_content(message: &Message) -> ContentPayload {
     // Process image attachments
     for attachment in attachments {
         let url_str = attachment.as_str();
-        if let Some(source) = parse_image_source(url_str) {
+        if let Some(source) = parse_image_source(url_str).await {
             blocks.push(ContentBlock::Image {
                 source,
                 cache_control: None,
@@ -886,7 +887,7 @@ fn set_cache_control(
 /// - `data:image/...;base64,...` - already base64 encoded
 /// - `file:///path/to/file` - reads file and converts to base64
 /// - `http://` or `https://` URLs - passed through as URL source
-fn parse_image_source(url: &str) -> Option<ImageSource> {
+async fn parse_image_source(url: &str) -> Option<ImageSource> {
     if url.starts_with("data:image/") {
         // Parse data URL: data:image/jpeg;base64,/9j/4AAQ...
         let after_data = url.strip_prefix("data:")?;
@@ -898,7 +899,7 @@ fn parse_image_source(url: &str) -> Option<ImageSource> {
         })
     } else if url.starts_with("file://") {
         // Read local file and convert to base64
-        read_file_to_base64_source(url)
+        read_file_to_base64_source(url).await
     } else if is_image_url(url) {
         Some(ImageSource::Url {
             url: url.to_string(),
@@ -909,12 +910,12 @@ fn parse_image_source(url: &str) -> Option<ImageSource> {
 }
 
 /// Read a file:// URL and convert to base64 image source.
-fn read_file_to_base64_source(file_url: &str) -> Option<ImageSource> {
+async fn read_file_to_base64_source(file_url: &str) -> Option<ImageSource> {
     let url = url::Url::parse(file_url).ok()?;
     let path = url.to_file_path().ok()?;
 
     // Read the file
-    let data = std::fs::read(&path).ok()?;
+    let data = async_fs::read(&path).await.ok()?;
 
     // Determine media type from extension
     let media_type = mime_from_path(&path)?;

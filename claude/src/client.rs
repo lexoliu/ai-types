@@ -94,7 +94,6 @@ impl LanguageModel for Claude {
     ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         let cfg = self.config();
         let (core_messages, parameters, tool_definitions) = request.into_parts();
-        let (mut system_prompt, mut claude_messages) = to_claude_messages(&core_messages);
         let snapshot = ParameterSnapshot::from(&parameters);
         let filtered_tool_definitions =
             filter_tool_definitions(tool_definitions, &snapshot.tool_choice);
@@ -109,6 +108,8 @@ impl LanguageModel for Claude {
         let max_tokens = snapshot.max_tokens.unwrap_or(cfg.default_max_tokens);
 
         async_stream::stream! {
+            let (mut system_prompt, mut claude_messages) = to_claude_messages(&core_messages).await;
+
             if parameters.cache.openai.is_some() || parameters.cache.gemini.is_some() {
                 yield Err(ClaudeError::Api(
                     "Claude provider only accepts cache.claude settings".to_string(),
