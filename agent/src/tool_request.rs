@@ -1,10 +1,10 @@
 //! Generic request/response channel helpers for UI-mediated tools.
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use arc_swap::{ArcSwap, Guard};
 use async_channel::{Receiver, Sender};
-use crossbeam_skiplist::SkipMap;
-use dashmap::DashMap;
 
 const ERR_TOOL_REQUEST_UNAVAILABLE: &str = include_str!("texts/tool_request_unavailable.txt");
 const ERR_TOOL_REQUEST_CANCELLED: &str = include_str!("texts/tool_request_cancelled.txt");
@@ -102,6 +102,30 @@ struct PendingEntry<P, R> {
     tx: Sender<R>,
 }
 
+struct RequestApproverState<P, R> {
+    order: BTreeMap<u64, String>,
+    pending: HashMap<String, PendingEntry<P, R>>,
+}
+
+impl<P: Clone, R> Clone for PendingEntry<P, R> {
+    fn clone(&self) -> Self {
+        Self {
+            order: self.order,
+            payload: self.payload.clone(),
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+impl<P: Clone, R> Clone for RequestApproverState<P, R> {
+    fn clone(&self) -> Self {
+        Self {
+            order: self.order.clone(),
+            pending: self.pending.clone(),
+        }
+    }
+}
+
 /// An ID-tracked, multi-request approval queue for server contexts.
 ///
 /// Each request is assigned a unique ID, stored in FIFO order, and awaits
@@ -116,15 +140,14 @@ struct PendingEntry<P, R> {
 /// - `P`: Payload type (cloneable request data visible to the UI).
 /// - `R`: Response type sent back to the requester.
 pub struct RequestApprover<P, R> {
-    order: SkipMap<u64, String>,
-    pending: DashMap<String, PendingEntry<P, R>>,
+    state: ArcSwap<RequestApproverState<P, R>>,
     event: event_listener::Event,
     next_id: AtomicU64,
 }
 
 impl<P, R> std::fmt::Debug for RequestApprover<P, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let pending_count = self.pending.len();
+        let pending_count = self.state.load().pending.len();
         f.debug_struct("RequestApprover")
             .field("pending_count", &pending_count)
             .field("next_id", &self.next_id.load(Ordering::Relaxed))
@@ -143,8 +166,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            order: SkipMap::new(),
-            pending: DashMap::new(),
+            state: ArcSwap::from_pointee(RequestApproverState {
+                order: BTreeMap::new(),
+                pending: HashMap::new(),
+            }),
             event: event_listener::Event::new(),
             next_id: AtomicU64::new(0),
         }
@@ -158,9 +183,13 @@ impl<P: Clone, R> RequestApprover<P, R> {
         let order = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = order.to_string();
         let (tx, rx) = async_channel::bounded(1);
-        self.pending
-            .insert(id.clone(), PendingEntry { order, payload, tx });
-        self.order.insert(order, id.clone());
+        let entry = PendingEntry { order, payload, tx };
+        self.state.rcu(|state| {
+            let mut next = state.as_ref().clone();
+            next.order.insert(order, id.clone());
+            next.pending.insert(id.clone(), entry.clone());
+            next
+        });
         self.event.notify(usize::MAX);
         (id, rx)
     }
@@ -169,43 +198,49 @@ impl<P: Clone, R> RequestApprover<P, R> {
     ///
     /// Returns `true` if the request was found and the response was sent.
     pub fn respond(&self, id: &str, response: R) -> bool {
-        let found = if let Some((_, entry)) = self.pending.remove(id) {
-            self.order.remove(&entry.order);
-            entry.tx.try_send(response).is_ok()
-        } else {
-            false
-        };
+        let mut found = None;
+        loop {
+            let current = self.state.load_full();
+            let Some(entry) = current.pending.get(id).cloned() else {
+                break;
+            };
+            let mut next = current.as_ref().clone();
+            next.pending.remove(id);
+            next.order.remove(&entry.order);
+            let previous = Guard::into_inner(
+                self.state
+                    .compare_and_swap(&current, std::sync::Arc::new(next)),
+            );
+            if std::sync::Arc::ptr_eq(&current, &previous) {
+                found = Some(entry);
+                break;
+            }
+        }
         self.event.notify(usize::MAX);
-        found
+        found.is_some_and(|entry| entry.tx.try_send(response).is_ok())
     }
 
     /// Return the oldest pending request (ID + cloned payload) without removing it.
     #[must_use]
     pub fn peek(&self) -> Option<(String, P)> {
-        loop {
-            let front = self.order.front()?;
-            let order = *front.key();
-            let id = front.value().clone();
-            drop(front);
-            if let Some(entry) = self.pending.get(id.as_str()) {
-                return Some((id, entry.payload.clone()));
-            }
-            self.order.remove(&order);
-        }
+        let state = self.state.load();
+        let (_order, id) = state.order.iter().next()?;
+        state
+            .pending
+            .get(id.as_str())
+            .map(|entry| (id.clone(), entry.payload.clone()))
     }
 
     /// Return the oldest pending request matching a predicate.
     #[must_use]
     pub fn peek_filtered(&self, predicate: impl Fn(&P) -> bool) -> Option<(String, P)> {
-        for item in self.order.iter() {
-            let order = *item.key();
-            let id = item.value().clone();
-            let Some(entry) = self.pending.get(id.as_str()) else {
-                self.order.remove(&order);
+        let state = self.state.load();
+        for id in state.order.values() {
+            let Some(entry) = state.pending.get(id.as_str()) else {
                 continue;
             };
             if predicate(&entry.payload) {
-                return Some((id, entry.payload.clone()));
+                return Some((id.clone(), entry.payload.clone()));
             }
         }
         None
@@ -214,13 +249,17 @@ impl<P: Clone, R> RequestApprover<P, R> {
     /// Get a cloned payload by request ID.
     #[must_use]
     pub fn get_payload(&self, id: &str) -> Option<P> {
-        self.pending.get(id).map(|entry| entry.payload.clone())
+        self.state
+            .load()
+            .pending
+            .get(id)
+            .map(|entry| entry.payload.clone())
     }
 
     /// Returns `true` if there are no pending requests.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pending.is_empty()
+        self.state.load().pending.is_empty()
     }
 
     /// Create a listener that resolves when the approver state changes.
