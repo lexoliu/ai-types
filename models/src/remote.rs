@@ -4,8 +4,8 @@
 
 use std::path::Path;
 
-use async_fs;
 use crate::registry::ModelRegistry;
+use async_fs;
 
 const LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";

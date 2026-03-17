@@ -1097,13 +1097,14 @@ mod tests {
     fn bash_agent_builder_keeps_ipc_tools_out_of_llm_tool_surface() {
         futures_lite::future::block_on(async {
             let dir = tempdir().expect("tempdir should exist");
-            let bash_tool = aither_sandbox::BashTool::<NoopPermissionHandler, DefaultExecutor>::new_exact(
-                dir.path(),
-                NoopPermissionHandler,
-                DefaultExecutor,
-            )
-            .await
-            .expect("bash tool should initialize");
+            let bash_tool =
+                aither_sandbox::BashTool::<NoopPermissionHandler, DefaultExecutor>::new_exact(
+                    dir.path(),
+                    NoopPermissionHandler,
+                    DefaultExecutor,
+                )
+                .await
+                .expect("bash tool should initialize");
 
             let agent = BashAgentBuilder::new(MockLlm, bash_tool)
                 .tool(MockTool)

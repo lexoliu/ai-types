@@ -1299,8 +1299,7 @@ where
                     let skill = registry
                         .get(&name)
                         .ok_or_else(|| {
-                            let mut message =
-                                String::from("checkpoint references unknown skill '");
+                            let mut message = String::from("checkpoint references unknown skill '");
                             message.push_str(name.as_str());
                             message.push('\'');
                             AgentError::Config(message)
@@ -1859,11 +1858,7 @@ where
                         let mut reason = String::from("skill activation blocked tool '");
                         reason.push_str(call.name.as_str());
                         reason.push('\'');
-                        return (
-                            call.id.clone(),
-                            call.name.clone(),
-                            Err(reason),
-                        );
+                        return (call.id.clone(), call.name.clone(), Err(reason));
                     }
                     let result = tools
                         .call(&call.name, &args_json)

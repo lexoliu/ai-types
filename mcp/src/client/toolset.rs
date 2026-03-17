@@ -424,18 +424,16 @@ impl McpToolService {
 }
 
 fn run_service(rx: Receiver<McpCommand>, conn: &mut McpConnection) {
-    async_io::block_on(async {
-        while let Ok(cmd) = rx.recv().await {
-            match cmd {
-                McpCommand::Call {
-                    name,
-                    arguments,
-                    reply,
-                } => {
-                    let result = conn.call(&name, arguments).await;
-                    let _ = reply.send(result).await;
-                }
+    while let Ok(cmd) = rx.recv_blocking() {
+        match cmd {
+            McpCommand::Call {
+                name,
+                arguments,
+                reply,
+            } => {
+                let result = async_io::block_on(conn.call(&name, arguments));
+                let _ = reply.send_blocking(result);
             }
         }
-    });
+    }
 }

@@ -1723,9 +1723,7 @@ fn wrap_container_script(
         {
             let mut message = String::from("invalid ipc command name for container wrapper: ");
             message.push_str(name);
-            return Err(BashError::Execution(
-                message,
-            ));
+            return Err(BashError::Execution(message));
         }
     }
 

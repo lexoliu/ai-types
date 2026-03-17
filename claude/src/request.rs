@@ -255,7 +255,9 @@ impl From<&Parameters> for ParameterSnapshot {
 ///
 /// Returns (`system_prompt`, messages). A single system message is emitted as
 /// plain text, while multiple system messages are preserved as system blocks.
-pub async fn to_claude_messages(messages: &[Message]) -> (Option<SystemPayload>, Vec<MessagePayload>) {
+pub async fn to_claude_messages(
+    messages: &[Message],
+) -> (Option<SystemPayload>, Vec<MessagePayload>) {
     let mut system_parts: Vec<String> = Vec::new();
     let mut claude_messages: Vec<MessagePayload> = Vec::new();
 
