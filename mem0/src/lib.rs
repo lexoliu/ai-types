@@ -88,12 +88,15 @@ impl Default for Config {
 
 /// Mem0 memory manager.
 struct Mem0Inner<L, E, S> {
-    new_facts: async_lock::RwLock<Vec<String>>, // Store new facts temporarily
-    extraction_in_progress: async_lock::Mutex<()>, // If this is locked, fact extraction is in progress
     llm: L,
-    embedder: async_lock::Mutex<E>,
-    store: async_lock::RwLock<S>,
+    runtime: async_lock::Mutex<Mem0Runtime<E, S>>,
     config: Config,
+}
+
+struct Mem0Runtime<E, S> {
+    pending_facts: Vec<String>,
+    embedder: E,
+    store: S,
 }
 
 pub struct Mem0<L, E, S> {
@@ -118,12 +121,13 @@ where
     pub fn new(llm: L, embedder: E, store: S, config: Config) -> Self {
         Self {
             inner: Arc::new(Mem0Inner {
-                new_facts: async_lock::RwLock::new(Vec::new()),
                 llm,
-                embedder: async_lock::Mutex::new(embedder),
-                store: async_lock::RwLock::new(store),
+                runtime: async_lock::Mutex::new(Mem0Runtime {
+                    pending_facts: Vec::new(),
+                    embedder,
+                    store,
+                }),
                 config,
-                extraction_in_progress: async_lock::Mutex::new(()),
             }),
         }
     }
@@ -151,51 +155,35 @@ where
     ///
     /// So if you doesn't mind the result of adding facts, you can spawn a task to call this method.
     pub async fn add_fact(&self, facts: Vec<String>) -> Result<()> {
-        self.inner.new_facts.write().await.extend(facts);
-
-        // Waiting for any ongoing extraction to finish
-        let lock = self.inner.extraction_in_progress.lock().await;
-        // let's take all facts yet
-
-        let facts = {
-            let mut nf = self.inner.new_facts.write().await;
-            std::mem::take(&mut *nf)
-        };
+        let mut runtime = self.inner.runtime.lock().await;
+        runtime.pending_facts.extend(facts);
+        let facts = std::mem::take(&mut runtime.pending_facts);
 
         for fact in facts {
-            // 2. Embed the fact for search
-            let embedding = self
-                .inner
+            let embedding = runtime
                 .embedder
-                .lock()
-                .await
                 .embed(&fact)
                 .await
                 .map_err(Mem0Error::Embedding)?;
 
             debug!("Embedding generated for fact: {}", fact);
 
-            // 3. Retrieve similar memories
             let filters = SearchFilters {
                 user_id: self.inner.config.user_id.clone(),
                 agent_id: self.inner.config.agent_id.clone(),
             };
-            let existing_memories = {
-                let store = self.inner.store.read().await;
-                store
-                    .search(&embedding, self.inner.config.retrieve_count, filters)
-                    .await?
-            };
+            let existing_memories = runtime
+                .store
+                .search(&embedding, self.inner.config.retrieve_count, filters)
+                .await?;
 
             debug!(
                 "Found {} similar existing memories for fact.",
                 existing_memories.len()
             );
 
-            // 4. Decide operation
             let decision = self.decide_operation(&fact, &existing_memories).await?;
 
-            // 5. Execute operation
             match decision.action {
                 Action::Add => {
                     let mut memory = Memory::new(fact, embedding);
@@ -206,63 +194,46 @@ where
                         memory = memory.with_agent_id(aid);
                     }
 
-                    let mut store = self.inner.store.write().await;
-                    store.add(memory).await?;
+                    runtime.store.add(memory).await?;
                 }
                 Action::Update => {
                     if let (Some(id_str), Some(content)) =
                         (decision.memory_id, decision.new_content)
+                        && let Ok(id) = Uuid::from_str(&id_str)
                     {
-                        if let Ok(id) = Uuid::from_str(&id_str) {
-                            // For update, we usually re-embed the new content.
-                            let new_embedding = self
-                                .inner
-                                .embedder
-                                .lock()
-                                .await
-                                .embed(&content)
-                                .await
-                                .map_err(Mem0Error::Llm)?;
+                        let new_embedding = runtime
+                            .embedder
+                            .embed(&content)
+                            .await
+                            .map_err(Mem0Error::Llm)?;
 
-                            // Fetch existing to check existence
-                            let existing = {
-                                let store = self.inner.store.read().await;
-                                store.get(id).await?
-                            };
-                            if let Some(mut existing) = existing {
-                                existing.content = content;
-                                existing.embedding = new_embedding;
-                                existing.updated_at = time::OffsetDateTime::now_utc();
-                                let mut store = self.inner.store.write().await;
-                                store.update(existing).await?;
-                            }
+                        if let Some(mut existing) = runtime.store.get(id).await? {
+                            existing.content = content;
+                            existing.embedding = new_embedding;
+                            existing.updated_at = time::OffsetDateTime::now_utc();
+                            runtime.store.update(existing).await?;
                         }
                     }
                 }
                 Action::Delete => {
-                    if let Some(id_str) = decision.memory_id {
-                        if let Ok(id) = Uuid::from_str(&id_str) {
-                            let mut store = self.inner.store.write().await;
-                            store.delete(id).await?;
-                        }
+                    if let Some(id_str) = decision.memory_id
+                        && let Ok(id) = Uuid::from_str(&id_str)
+                    {
+                        runtime.store.delete(id).await?;
                     }
                 }
-                Action::Noop => {} // No operation needed
+                Action::Noop => {}
             }
         }
-
-        drop(lock); // release the lock
 
         Ok(())
     }
 
     /// Search for relevant memories.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<store::SearchResult>> {
-        let embedding = self
-            .inner
+        let runtime = self.inner.runtime.lock().await;
+        let embedding = runtime
             .embedder
-            .lock()
-            .await
             .embed(query)
             .await
             .map_err(Mem0Error::Llm)?;
@@ -270,8 +241,7 @@ where
             user_id: self.inner.config.user_id.clone(),
             agent_id: self.inner.config.agent_id.clone(),
         };
-        let store = self.inner.store.read().await;
-        store.search(&embedding, limit, filters).await
+        runtime.store.search(&embedding, limit, filters).await
     }
 
     pub fn add_fact_tool(&self) -> AddFactTool<L, E, S> {
@@ -288,8 +258,8 @@ where
 
     /// Return all stored memories.
     pub async fn memories(&self) -> Result<Vec<Memory>> {
-        let store = self.inner.store.read().await;
-        store.all().await
+        let runtime = self.inner.runtime.lock().await;
+        runtime.store.all().await
     }
 
     /// Retrieve relevant memories and format them for context injection.
