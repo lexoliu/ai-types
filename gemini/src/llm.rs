@@ -124,7 +124,7 @@ fn respond_stream_inner(
         };
         #[cfg(target_arch = "wasm32")]
         let messages = messages;
-        let (system_instruction, contents) = messages_to_gemini(&messages);
+        let (system_instruction, contents) = messages_to_gemini(&messages).await;
         let mut gemini_tools_payload: Vec<GeminiTool> = Vec::new();
         let tool_defs = match &parameters.tool_choice {
             ToolChoice::None => Vec::new(),
@@ -370,7 +370,7 @@ fn usage_from_metadata(meta: &UsageMetadata) -> Usage {
     }
 }
 
-fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<GeminiContent>) {
+async fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<GeminiContent>) {
     use std::collections::HashMap;
 
     let mut system_parts = Vec::new();
@@ -397,7 +397,7 @@ fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<Gemin
 
                     // Add attachment parts first
                     for attachment in attachments {
-                        if let Some(part) = url_to_part(attachment) {
+                        if let Some(part) = url_to_part(attachment).await {
                             parts.push(part);
                         }
                     }
@@ -609,10 +609,10 @@ fn convert_tool_definitions(defs: Vec<ToolDefinition>) -> Vec<FunctionDeclaratio
 /// - `file:///path/to/file` - reads file and converts to base64
 /// - Gemini file URI (<https://generativelanguage.googleapis.com>/...) - uses file reference
 /// - Other HTTP/HTTPS URLs - not currently supported (would need download)
-fn url_to_part(url: &url::Url) -> Option<Part> {
+async fn url_to_part(url: &url::Url) -> Option<Part> {
     match url.scheme() {
         "data" => parse_data_url(url.as_str()),
-        "file" => read_file_to_part(url),
+        "file" => read_file_to_part(url).await,
         "http" | "https" => {
             // Check if this is a Gemini Files API URI
             if is_gemini_file_uri(url) {
@@ -670,16 +670,16 @@ fn parse_data_url(url: &str) -> Option<Part> {
 
 /// Read a file:// URL and convert to a Part with inline data.
 #[cfg(not(target_arch = "wasm32"))]
-fn read_file_to_part(url: &url::Url) -> Option<Part> {
+async fn read_file_to_part(url: &url::Url) -> Option<Part> {
     let path = url.to_file_path().ok()?;
-    let data = std::fs::read(&path).ok()?;
+    let data = async_fs::read(&path).await.ok()?;
     let mime_type = mime_from_path(&path)?;
 
     Some(Part::inline_media(mime_type, data))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn read_file_to_part(_url: &url::Url) -> Option<Part> {
+async fn read_file_to_part(_url: &url::Url) -> Option<Part> {
     None
 }
 
