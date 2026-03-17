@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use async_fs;
 use crate::registry::ModelRegistry;
 
 const LITELLM_URL: &str =
@@ -68,11 +69,11 @@ impl From<std::io::Error> for FetchError {
 async fn fetch_with_cache(url: &str, cache_path: Option<&Path>) -> Result<Vec<u8>, FetchError> {
     // Check cache freshness
     if let Some(path) = cache_path {
-        if let Ok(meta) = std::fs::metadata(path) {
+        if let Ok(meta) = async_fs::metadata(path).await {
             if let Ok(modified) = meta.modified() {
                 let age = modified.elapsed().unwrap_or_default();
                 if age.as_secs() < CACHE_MAX_AGE_SECS {
-                    return Ok(std::fs::read(path)?);
+                    return Ok(async_fs::read(path).await?);
                 }
             }
         }
@@ -85,9 +86,9 @@ async fn fetch_with_cache(url: &str, cache_path: Option<&Path>) -> Result<Vec<u8
     // Write cache
     if let Some(path) = cache_path {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            async_fs::create_dir_all(parent).await?;
         }
-        std::fs::write(path, &bytes)?;
+        async_fs::write(path, &bytes).await?;
     }
 
     Ok(bytes)

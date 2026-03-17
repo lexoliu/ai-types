@@ -14,6 +14,7 @@ categories = ["data-structures"]
 aither-core.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+async-fs = { version = "2", optional = true }
 zenwave = { workspace = true, optional = true }
 
 [build-dependencies]
@@ -23,4 +24,4 @@ ureq = "3"
 
 [features]
 default = []
-remote = ["zenwave"]
+remote = ["zenwave", "dep:async-fs"]
