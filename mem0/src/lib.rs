@@ -151,18 +151,16 @@ where
     ///
     /// So if you doesn't mind the result of adding facts, you can spawn a task to call this method.
     pub async fn add_fact(&self, facts: Vec<String>) -> Result<()> {
-        self.inner.new_facts.write_blocking().extend(facts); // very fast operation
+        self.inner.new_facts.write().await.extend(facts);
 
         // Waiting for any ongoing extraction to finish
         let lock = self.inner.extraction_in_progress.lock().await;
         // let's take all facts yet
 
         let facts = {
-            let mut nf = self.inner.new_facts.write_blocking();
+            let mut nf = self.inner.new_facts.write().await;
             std::mem::take(&mut *nf)
         };
-
-        let store = &self.inner.store;
 
         for fact in facts {
             // 2. Embed the fact for search
@@ -182,10 +180,12 @@ where
                 user_id: self.inner.config.user_id.clone(),
                 agent_id: self.inner.config.agent_id.clone(),
             };
-            let existing_memories = store
-                .read_blocking()
-                .search(&embedding, self.inner.config.retrieve_count, filters)
-                .await?;
+            let existing_memories = {
+                let store = self.inner.store.read().await;
+                store
+                    .search(&embedding, self.inner.config.retrieve_count, filters)
+                    .await?
+            };
 
             debug!(
                 "Found {} similar existing memories for fact.",
@@ -206,7 +206,8 @@ where
                         memory = memory.with_agent_id(aid);
                     }
 
-                    store.write_blocking().add(memory).await?;
+                    let mut store = self.inner.store.write().await;
+                    store.add(memory).await?;
                 }
                 Action::Update => {
                     if let (Some(id_str), Some(content)) =
@@ -224,11 +225,16 @@ where
                                 .map_err(Mem0Error::Llm)?;
 
                             // Fetch existing to check existence
-                            if let Some(mut existing) = store.read_blocking().get(id).await? {
+                            let existing = {
+                                let store = self.inner.store.read().await;
+                                store.get(id).await?
+                            };
+                            if let Some(mut existing) = existing {
                                 existing.content = content;
                                 existing.embedding = new_embedding;
                                 existing.updated_at = time::OffsetDateTime::now_utc();
-                                store.write_blocking().update(existing).await?;
+                                let mut store = self.inner.store.write().await;
+                                store.update(existing).await?;
                             }
                         }
                     }
@@ -236,7 +242,8 @@ where
                 Action::Delete => {
                     if let Some(id_str) = decision.memory_id {
                         if let Ok(id) = Uuid::from_str(&id_str) {
-                            store.write_blocking().delete(id).await?;
+                            let mut store = self.inner.store.write().await;
+                            store.delete(id).await?;
                         }
                     }
                 }
@@ -263,11 +270,8 @@ where
             user_id: self.inner.config.user_id.clone(),
             agent_id: self.inner.config.agent_id.clone(),
         };
-        self.inner
-            .store
-            .read_blocking()
-            .search(&embedding, limit, filters)
-            .await
+        let store = self.inner.store.read().await;
+        store.search(&embedding, limit, filters).await
     }
 
     pub fn add_fact_tool(&self) -> AddFactTool<L, E, S> {
@@ -284,7 +288,8 @@ where
 
     /// Return all stored memories.
     pub async fn memories(&self) -> Result<Vec<Memory>> {
-        self.inner.store.read_blocking().all().await
+        let store = self.inner.store.read().await;
+        store.all().await
     }
 
     /// Retrieve relevant memories and format them for context injection.
