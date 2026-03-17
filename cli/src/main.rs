@@ -37,8 +37,10 @@
 
 mod hook;
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aither_agent::sandbox::{
@@ -52,12 +54,12 @@ use aither_core::LanguageModel;
 use aither_core::llm::Role;
 use aither_mcp::{McpConnection, McpServersConfig};
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use async_lock::Mutex as AsyncMutex;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use executor_core::tokio::TokioGlobal;
-use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 mod provider;
@@ -65,7 +67,6 @@ mod provider;
 use crate::hook::DebugHook;
 use crate::provider::Provider;
 use aither_cloud::CloudProvider;
-use dashmap::DashSet;
 
 /// Default whitelist of common domains that don't need explicit approval.
 const DEFAULT_DOMAIN_WHITELIST: &[&str] = &[
@@ -101,14 +102,14 @@ struct InteractivePermissionHandler {
     /// Whether network mode has been approved (auto-approves all domains).
     network_approved: std::sync::atomic::AtomicBool,
     /// Cache of approved domains for cases where network mode isn't blanket approved.
-    approved_domains: DashSet<String>,
+    approved_domains: ArcSwap<HashSet<String>>,
 }
 
 impl InteractivePermissionHandler {
     fn new() -> Self {
         Self {
             network_approved: std::sync::atomic::AtomicBool::new(false),
-            approved_domains: DashSet::new(),
+            approved_domains: ArcSwap::from_pointee(HashSet::new()),
         }
     }
 }
@@ -160,7 +161,7 @@ impl PermissionHandler for InteractivePermissionHandler {
         }
 
         // Check if already approved
-        if self.approved_domains.contains(domain) {
+        if self.approved_domains.load().contains(domain) {
             return true;
         }
 
@@ -174,7 +175,11 @@ impl PermissionHandler for InteractivePermissionHandler {
 
         if approved {
             // Cache approval for this domain
-            self.approved_domains.insert(domain.to_string());
+            self.approved_domains.rcu(|domains| {
+                let mut next = HashSet::clone(domains);
+                next.insert(domain.to_string());
+                next
+            });
             true
         } else {
             false
