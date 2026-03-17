@@ -1,9 +1,10 @@
 //! HNSW-based vector index using instant-distance.
 
+use arc_swap::{ArcSwap, Guard};
 use instant_distance::{Builder, HnswMap, Point, Search};
 use ordered_float::OrderedFloat;
-use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::{RagError, Result};
 use crate::types::{Chunk, IndexEntry, SearchResult};
@@ -63,26 +64,39 @@ impl IndexState {
         }
     }
 
-    fn rebuild_hnsw(&mut self) {
-        if self.entries.is_empty() {
-            self.hnsw = None;
-            self.dirty = false;
-            return;
+    fn build_hnsw(entries: &[IndexEntry]) -> Option<HnswMap<EmbeddingPoint, usize>> {
+        if entries.is_empty() {
+            return None;
         }
 
-        let points: Vec<EmbeddingPoint> = self
-            .entries
+        let points: Vec<EmbeddingPoint> = entries
             .iter()
             .map(|e| EmbeddingPoint {
                 embedding: e.embedding.clone(),
             })
             .collect();
 
-        let indices: Vec<usize> = (0..self.entries.len()).collect();
-
-        self.hnsw = Some(Builder::default().build(points, indices));
-        self.dirty = false;
+        let indices: Vec<usize> = (0..entries.len()).collect();
+        Some(Builder::default().build(points, indices))
     }
+
+    fn rebuilt(&self) -> Self {
+        let mut next = self.clone_without_index();
+        next.hnsw = Self::build_hnsw(&next.entries);
+        next.dirty = false;
+        next
+    }
+
+    fn clone_without_index(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            id_to_index: self.id_to_index.clone(),
+            content_hashes: self.content_hashes.clone(),
+            hnsw: None,
+            dirty: true,
+        }
+    }
+
 }
 
 /// HNSW-based vector index for approximate nearest neighbor search.
@@ -102,12 +116,12 @@ impl IndexState {
 /// ```
 pub struct HnswIndex {
     dimension: usize,
-    state: RwLock<IndexState>,
+    state: ArcSwap<IndexState>,
 }
 
 impl std::fmt::Debug for HnswIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let state = self.state.read();
+        let state = self.state.load();
         f.debug_struct("HnswIndex")
             .field("dimension", &self.dimension)
             .field("len", &state.entries.len())
@@ -121,7 +135,7 @@ impl HnswIndex {
     pub fn new(dimension: usize) -> Self {
         Self {
             dimension,
-            state: RwLock::new(IndexState::new()),
+            state: ArcSwap::from_pointee(IndexState::new()),
         }
     }
 }
@@ -135,53 +149,48 @@ impl VectorIndex for HnswIndex {
             });
         }
 
-        let mut state = self.state.write();
-
-        // Check if this chunk ID already exists
-        if let Some(&idx) = state.id_to_index.get(&chunk.id) {
-            // Update existing entry
-            let old_hash = state.entries[idx].chunk.content_hash;
-            state.content_hashes.remove(&old_hash);
-            state
-                .content_hashes
-                .insert(chunk.content_hash, chunk.id.clone());
-            state.entries[idx] = IndexEntry::new(chunk, embedding);
-        } else {
-            // Insert new entry
-            let idx = state.entries.len();
-            state.id_to_index.insert(chunk.id.clone(), idx);
-            state
-                .content_hashes
-                .insert(chunk.content_hash, chunk.id.clone());
-            state.entries.push(IndexEntry::new(chunk, embedding));
-        }
-
-        state.dirty = true;
+        self.state.rcu(|state| {
+            let mut next = state.clone_without_index();
+            if let Some(&idx) = next.id_to_index.get(&chunk.id) {
+                let old_hash = next.entries[idx].chunk.content_hash;
+                next.content_hashes.remove(&old_hash);
+                next.content_hashes
+                    .insert(chunk.content_hash, chunk.id.clone());
+                next.entries[idx] = IndexEntry::new(chunk.clone(), embedding.clone());
+            } else {
+                let idx = next.entries.len();
+                next.id_to_index.insert(chunk.id.clone(), idx);
+                next.content_hashes
+                    .insert(chunk.content_hash, chunk.id.clone());
+                next.entries
+                    .push(IndexEntry::new(chunk.clone(), embedding.clone()));
+            }
+            next
+        });
         Ok(())
     }
 
     fn remove(&self, chunk_id: &str) -> bool {
-        let mut state = self.state.write();
-
-        let Some(&idx) = state.id_to_index.get(chunk_id) else {
+        let current = self.state.load();
+        let Some(&idx) = current.id_to_index.get(chunk_id) else {
             return false;
         };
 
-        // Remove from content hashes
-        let hash = state.entries[idx].chunk.content_hash;
-        state.content_hashes.remove(&hash);
+        self.state.rcu(|state| {
+            let mut next = state.clone_without_index();
+            let hash = next.entries[idx].chunk.content_hash;
+            next.content_hashes.remove(&hash);
 
-        // Remove from entries (swap-remove for efficiency)
-        let removed = state.entries.swap_remove(idx);
-        state.id_to_index.remove(&removed.chunk.id);
+            let removed = next.entries.swap_remove(idx);
+            next.id_to_index.remove(&removed.chunk.id);
 
-        // Update index of swapped element if any
-        if idx < state.entries.len() {
-            let swapped_id = state.entries[idx].chunk.id.clone();
-            state.id_to_index.insert(swapped_id, idx);
-        }
+            if idx < next.entries.len() {
+                let swapped_id = next.entries[idx].chunk.id.clone();
+                next.id_to_index.insert(swapped_id, idx);
+            }
 
-        state.dirty = true;
+            next
+        });
         true
     }
 
@@ -193,21 +202,30 @@ impl VectorIndex for HnswIndex {
             });
         }
 
-        let mut state = self.state.write();
-
-        if state.entries.is_empty() || top_k == 0 {
+        if top_k == 0 {
             return Ok(Vec::new());
         }
 
-        // Rebuild HNSW if dirty
-        if state.dirty || state.hnsw.is_none() {
-            state.rebuild_hnsw();
-        }
+        let state = loop {
+            let current = self.state.load_full();
+            if current.entries.is_empty() {
+                return Ok(Vec::new());
+            }
+            if !current.dirty && current.hnsw.is_some() {
+                break current;
+            }
+
+            let rebuilt = Arc::new(current.rebuilt());
+            let previous =
+                Guard::into_inner(self.state.compare_and_swap(&current, Arc::clone(&rebuilt)));
+            if Arc::ptr_eq(&current, &previous) {
+                break rebuilt;
+            }
+        };
 
         let Some(ref hnsw) = state.hnsw else {
             return Ok(Vec::new());
         };
-
         let query_point = EmbeddingPoint {
             embedding: query.to_vec(),
         };
@@ -241,28 +259,19 @@ impl VectorIndex for HnswIndex {
     }
 
     fn len(&self) -> usize {
-        self.state.read().entries.len()
+        self.state.load().entries.len()
     }
 
     fn clear(&self) {
-        let mut state = self.state.write();
-        state.entries.clear();
-        state.id_to_index.clear();
-        state.content_hashes.clear();
-        state.hnsw = None;
-        state.dirty = false;
+        self.state.store(Arc::new(IndexState::new()));
     }
 
     fn entries(&self) -> Vec<IndexEntry> {
-        self.state.read().entries.clone()
+        self.state.load().entries.clone()
     }
 
     fn load(&self, entries: Vec<IndexEntry>) -> Result<()> {
-        let mut state = self.state.write();
-
-        state.entries.clear();
-        state.id_to_index.clear();
-        state.content_hashes.clear();
+        let mut state = IndexState::new();
 
         for (idx, entry) in entries.into_iter().enumerate() {
             if entry.embedding.len() != self.dimension {
@@ -279,11 +288,12 @@ impl VectorIndex for HnswIndex {
         }
 
         state.dirty = true;
+        self.state.store(Arc::new(state));
         Ok(())
     }
 
     fn contains_hash(&self, hash: u64) -> bool {
-        self.state.read().content_hashes.contains_key(&hash)
+        self.state.load().content_hashes.contains_key(&hash)
     }
 }
 

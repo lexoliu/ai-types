@@ -26,7 +26,7 @@ tree-sitter-rust = "0.21.2"
 
 # HNSW Index
 instant-distance = "0.6"
-parking_lot = "0.12"
+arc-swap = "1.7"
 ordered-float = "4.6"
 
 # Persistence
