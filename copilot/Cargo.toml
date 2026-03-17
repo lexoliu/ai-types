@@ -14,6 +14,7 @@ categories = ["api-bindings"]
 [dependencies]
 aither-core.workspace = true
 aither-models.workspace = true
+async-fs = "2"
 async-io = "2"
 base64 = "0.22"
 url = { version = "2.5", default-features = false }

@@ -14,6 +14,7 @@ use aither_core::{
         tool::ToolDefinition,
     },
 };
+use async_fs;
 use async_io::Timer;
 use futures_core::Stream;
 use futures_lite::StreamExt;
@@ -87,7 +88,7 @@ impl LanguageModel for Copilot {
                 return;
             }
 
-            let payload_messages = to_chat_messages(&messages);
+            let payload_messages = to_chat_messages(&messages).await;
             let openai_tools = if tool_defs.is_empty() {
                 None
             } else {
@@ -380,50 +381,49 @@ struct ChunkToolFunction {
 
 // === Conversion Functions ===
 
-fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
-    messages
-        .iter()
-        .map(|msg| {
-            let (role, tool_calls, tool_call_id) = match msg.role() {
-                Role::System => ("system", None, None),
-                Role::User => ("user", None, None),
-                Role::Assistant => {
-                    let calls = if msg.tool_calls().is_empty() {
-                        None
-                    } else {
-                        Some(
-                            msg.tool_calls()
-                                .iter()
-                                .map(|tc| ChatToolCallPayload {
-                                    id: tc.id.clone(),
-                                    kind: "function",
-                                    function: ChatToolCallFunction {
-                                        name: tc.name.clone(),
-                                        arguments: tc.arguments.to_string(),
-                                    },
-                                })
-                                .collect(),
-                        )
-                    };
-                    ("assistant", calls, None)
-                }
-                Role::Tool => (
-                    "tool",
-                    None,
-                    Some(msg.tool_call_id().unwrap_or_default().to_string()),
-                ),
-            };
-            ChatMessagePayload {
-                role,
-                content: build_content(msg),
-                tool_calls,
-                tool_call_id,
+async fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
+    let mut payloads = Vec::with_capacity(messages.len());
+    for msg in messages {
+        let (role, tool_calls, tool_call_id) = match msg.role() {
+            Role::System => ("system", None, None),
+            Role::User => ("user", None, None),
+            Role::Assistant => {
+                let calls = if msg.tool_calls().is_empty() {
+                    None
+                } else {
+                    Some(
+                        msg.tool_calls()
+                            .iter()
+                            .map(|tc| ChatToolCallPayload {
+                                id: tc.id.clone(),
+                                kind: "function",
+                                function: ChatToolCallFunction {
+                                    name: tc.name.clone(),
+                                    arguments: tc.arguments.to_string(),
+                                },
+                            })
+                            .collect(),
+                    )
+                };
+                ("assistant", calls, None)
             }
-        })
-        .collect()
+            Role::Tool => (
+                "tool",
+                None,
+                Some(msg.tool_call_id().unwrap_or_default().to_string()),
+            ),
+        };
+        payloads.push(ChatMessagePayload {
+            role,
+            content: build_content(msg).await,
+            tool_calls,
+            tool_call_id,
+        });
+    }
+    payloads
 }
 
-fn build_content(message: &Message) -> ContentPayload {
+async fn build_content(message: &Message) -> ContentPayload {
     let attachments = message.attachments();
 
     if attachments.is_empty() {
@@ -433,7 +433,7 @@ fn build_content(message: &Message) -> ContentPayload {
     let mut parts = Vec::new();
 
     for attachment in attachments {
-        if let Some(data_url) = url_to_data_url(attachment) {
+        if let Some(data_url) = url_to_data_url(attachment).await {
             parts.push(ContentPart::ImageUrl {
                 image_url: ImageUrlPayload { url: data_url },
             });
@@ -449,11 +449,11 @@ fn build_content(message: &Message) -> ContentPayload {
     ContentPayload::Parts(parts)
 }
 
-fn url_to_data_url(url: &url::Url) -> Option<String> {
+async fn url_to_data_url(url: &url::Url) -> Option<String> {
     match url.scheme() {
         "data" => Some(url.as_str().to_string()),
         "http" | "https" => Some(url.as_str().to_string()),
-        "file" => read_file_to_data_url(url),
+        "file" => read_file_to_data_url(url).await,
         _ => {
             tracing::warn!("Unsupported attachment URL scheme: {}", url.scheme());
             None
@@ -461,11 +461,11 @@ fn url_to_data_url(url: &url::Url) -> Option<String> {
     }
 }
 
-fn read_file_to_data_url(url: &url::Url) -> Option<String> {
+async fn read_file_to_data_url(url: &url::Url) -> Option<String> {
     use base64::Engine;
 
     let path = url.to_file_path().ok()?;
-    let data = std::fs::read(&path).ok()?;
+    let data = async_fs::read(&path).await.ok()?;
     let mime_type = mime_from_path(&path)?;
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
 
