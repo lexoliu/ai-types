@@ -196,8 +196,6 @@ pub struct ContainerLaunchSpec {
     pub mounts: Vec<MountSpec>,
     #[serde(default)]
     pub env: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ipc_socket: Option<PathBuf>,
 }
 
 impl ContainerLaunchSpec {
@@ -213,7 +211,6 @@ impl ContainerLaunchSpec {
             workspace: workspace.into(),
             mounts: Vec::new(),
             env: Vec::new(),
-            ipc_socket: None,
         }
     }
 
@@ -226,12 +223,6 @@ impl ContainerLaunchSpec {
     #[must_use]
     pub fn with_env(mut self, value: impl Into<String>) -> Self {
         self.env.push(value.into());
-        self
-    }
-
-    #[must_use]
-    pub fn with_ipc_socket(mut self, socket_path: impl Into<PathBuf>) -> Self {
-        self.ipc_socket = Some(socket_path.into());
         self
     }
 }
