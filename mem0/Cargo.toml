@@ -20,7 +20,8 @@ time = { version = "0.3", features = ["formatting", "macros", "serde"] }
 thiserror = "2.0"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 tracing.workspace = true
-async-lock = "3.4.1"
+async-channel = "2.5"
+futures-lite = "2.6"
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["rt", "rt-multi-thread", "macros"] }
