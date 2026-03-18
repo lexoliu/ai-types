@@ -96,7 +96,6 @@ impl IndexState {
             dirty: true,
         }
     }
-
 }
 
 /// HNSW-based vector index for approximate nearest neighbor search.

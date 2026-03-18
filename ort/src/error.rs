@@ -42,6 +42,10 @@ pub enum OrtError {
     /// Ndarray shape error.
     #[error("shape error: {0}")]
     Shape(String),
+
+    /// Background worker error.
+    #[error("worker error: {0}")]
+    Worker(String),
 }
 
 impl From<ort::Error> for OrtError {
