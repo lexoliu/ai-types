@@ -29,6 +29,7 @@ pub trait ContainerExec: Send + Sync {
         script: &str,
         working_dir: &str,
         kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
         stdin_blocked_notice: Option<Sender<String>>,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
 }
@@ -40,6 +41,7 @@ pub(crate) trait ContainerExecObject: Send + Sync {
         script: &'a str,
         working_dir: &'a str,
         kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
         stdin_blocked_notice: Option<Sender<String>>,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>>;
 }
@@ -79,6 +81,7 @@ impl ContainerExec for ContainerExecHandle {
         script: &str,
         working_dir: &str,
         kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
         stdin_blocked_notice: Option<Sender<String>>,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
         let inner = Arc::clone(&self.inner);
@@ -93,6 +96,7 @@ impl ContainerExec for ContainerExecHandle {
                     &script,
                     &working_dir,
                     kill_rx,
+                    stdin_rx,
                     stdin_blocked_notice,
                 )
                 .await
@@ -162,6 +166,7 @@ impl<T: ContainerExec> ContainerExecObject for T {
         script: &'a str,
         working_dir: &'a str,
         kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
         stdin_blocked_notice: Option<Sender<String>>,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>> {
         Box::pin(self.exec(
@@ -169,6 +174,7 @@ impl<T: ContainerExec> ContainerExecObject for T {
             script,
             working_dir,
             kill_rx,
+            stdin_rx,
             stdin_blocked_notice,
         ))
     }

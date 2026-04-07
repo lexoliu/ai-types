@@ -19,7 +19,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -419,6 +419,7 @@ pub struct PermissionEvent {
 #[derive(Clone)]
 pub struct BackgroundTaskReceiver {
     rx: Receiver<CompletedTask>,
+    running_tasks: Arc<AtomicUsize>,
 }
 
 impl BackgroundTaskReceiver {
@@ -446,7 +447,7 @@ impl BackgroundTaskReceiver {
     /// and each running background task holds a cloned sender.
     #[must_use]
     pub fn has_running(&self) -> bool {
-        self.rx.sender_count() > 1
+        self.running_tasks.load(Ordering::Acquire) > 0
     }
 
     /// Waits for the next completed task.
@@ -603,6 +604,8 @@ pub struct TerminalTool<P, E, State = Unconfigured> {
     completed_rx: Receiver<CompletedTask>,
     /// Channel for sending completed background tasks (cloned for each background task).
     completed_tx: Sender<CompletedTask>,
+    /// Number of still-running spawned executions associated with this tool.
+    running_tasks: Arc<AtomicUsize>,
     /// Channel for permission lifecycle events.
     permission_rx: Receiver<PermissionEvent>,
     /// Channel sender for permission lifecycle events.
@@ -627,6 +630,7 @@ impl<P, E: Clone, State: Clone> Clone for TerminalTool<P, E, State> {
             job_registry: self.job_registry.clone(),
             completed_rx: self.completed_rx.clone(),
             completed_tx: self.completed_tx.clone(),
+            running_tasks: self.running_tasks.clone(),
             permission_rx: self.permission_rx.clone(),
             permission_tx: self.permission_tx.clone(),
             writable_paths: self.writable_paths.clone(),
@@ -697,6 +701,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
 
         // Create channel for background task completion (unbounded to not block spawned tasks)
         let (completed_tx, completed_rx) = async_channel::unbounded();
+        let running_tasks = Arc::new(AtomicUsize::new(0));
         let (permission_tx, permission_rx) = async_channel::unbounded();
 
         Ok(Self {
@@ -708,6 +713,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             job_registry,
             completed_rx,
             completed_tx,
+            running_tasks,
             permission_rx,
             permission_tx,
             writable_paths: Vec::new(),
@@ -747,6 +753,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
 
         // Create channel for background task completion (unbounded to not block spawned tasks)
         let (completed_tx, completed_rx) = async_channel::unbounded();
+        let running_tasks = Arc::new(AtomicUsize::new(0));
         let (permission_tx, permission_rx) = async_channel::unbounded();
 
         Ok(Self {
@@ -758,6 +765,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             job_registry,
             completed_rx,
             completed_tx,
+            running_tasks,
             permission_rx,
             permission_tx,
             writable_paths: Vec::new(),
@@ -778,6 +786,7 @@ impl<P, E: Executor + Clone + 'static> TerminalTool<P, E, Unconfigured> {
             job_registry: self.job_registry,
             completed_rx: self.completed_rx,
             completed_tx: self.completed_tx,
+            running_tasks: self.running_tasks,
             permission_rx: self.permission_rx,
             permission_tx: self.permission_tx,
             writable_paths: self.writable_paths,
@@ -826,6 +835,7 @@ where
     /// - Have independent completion channels (no message mixup)
     pub fn child(&self) -> Self {
         let (completed_tx, completed_rx) = async_channel::unbounded();
+        let running_tasks = Arc::new(AtomicUsize::new(0));
         let (permission_tx, permission_rx) = async_channel::unbounded();
         Self {
             working_dir: self.working_dir.clone(),
@@ -836,6 +846,7 @@ where
             job_registry: self.job_registry.clone(),
             completed_rx,
             completed_tx,
+            running_tasks,
             permission_rx,
             permission_tx,
             writable_paths: self.writable_paths.clone(),
@@ -872,6 +883,7 @@ where
     pub fn background_receiver(&self) -> BackgroundTaskReceiver {
         BackgroundTaskReceiver {
             rx: self.completed_rx.clone(),
+            running_tasks: self.running_tasks.clone(),
         }
     }
 
@@ -896,9 +908,7 @@ where
 
     /// Checks if there are any pending background tasks.
     pub fn has_pending_tasks(&self) -> bool {
-        // If the sender is the only reference, no tasks are pending
-        // But since we clone the sender for each task, we check if channel is empty
-        !self.completed_rx.is_empty() || self.completed_tx.sender_count() > 1
+        !self.completed_rx.is_empty() || self.running_tasks.load(Ordering::Acquire) > 0
     }
 }
 
@@ -1137,6 +1147,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         let store_dir_for_spawn = store_dir.clone();
         let completed_tx = self.completed_tx.clone();
         let job_registry = self.job_registry.clone();
+        let running_tasks = self.running_tasks.clone();
         let background_mode = Arc::new(AtomicBool::new(timeout == 0));
         let (result_tx, result_rx) = async_channel::bounded(1);
         let (startup_tx, startup_rx) = async_channel::bounded(1);
@@ -1152,6 +1163,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         let background_mode_for_spawn = background_mode.clone();
         let background_mode_for_completion = background_mode.clone();
         let background_startup_for_spawn = background_startup.clone();
+        running_tasks.fetch_add(1, Ordering::AcqRel);
         self.executor
             .spawn(async move {
                 let result = execute_script_standalone(
@@ -1195,6 +1207,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                         })
                         .await;
                 }
+                running_tasks.fetch_sub(1, Ordering::AcqRel);
             })
             .detach();
 
@@ -1854,9 +1867,11 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
     // Use lower 32 bits of a UUID as a synthetic PID for job tracking.
     let pid = uuid::Uuid::new_v4().as_u128() as u32;
     let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
+    let (input_tx, input_rx) = async_channel::unbounded::<Vec<u8>>();
     job_registry
         .register(pid, task_id, execution_id, script, mode, None)
         .await;
+    job_registry.attach_terminal_input(pid, input_tx).await;
     background_startup.report_ready().await;
     job_registry.attach_kill_switch(pid, kill_tx).await;
 
@@ -1880,6 +1895,7 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
             &wrapped_script,
             "/workspace",
             kill_rx,
+            input_rx,
             stdin_blocked_notice,
         )
         .await;

@@ -127,6 +127,7 @@ async fn kill_exec_pid_inside_container(
 
 enum StreamEvent {
     Output(Option<Result<LogOutput, bollard::errors::Error>>),
+    Stdin(Result<Vec<u8>, async_channel::RecvError>),
     WatchdogTick,
     Cancel,
 }
@@ -138,6 +139,7 @@ impl ContainerExec for BollardContainerExec {
         script: &str,
         working_dir: &str,
         kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
         stdin_blocked_notice: Option<Sender<String>>,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
         let container_id = container_id.to_string();
@@ -148,6 +150,7 @@ impl ContainerExec for BollardContainerExec {
         async move {
             let config = CreateExecOptions {
                 cmd: Some(vec!["sh", "-c", &script]),
+                attach_stdin: Some(true),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 working_dir: Some(working_dir.as_str()),
@@ -165,8 +168,8 @@ impl ContainerExec for BollardContainerExec {
                 .await
                 .map_err(|e| format!("failed to start exec: {e}"))?;
 
-            let mut output = match start {
-                bollard::exec::StartExecResults::Attached { output, .. } => output,
+            let (mut output, mut input) = match start {
+                bollard::exec::StartExecResults::Attached { output, input } => (output, input),
                 bollard::exec::StartExecResults::Detached => {
                     return Err("exec started in detached mode unexpectedly".to_string());
                 }
@@ -176,32 +179,16 @@ impl ContainerExec for BollardContainerExec {
             let mut stderr = Vec::new();
             let mut watchdog_active = stdin_blocked_notice.is_some();
             let mut notice_sent = false;
+            let mut stdin_open = true;
 
             loop {
-                let event = if watchdog_active && !notice_sent {
-                    futures_lite::future::or(
-                        futures_lite::future::or(
-                            async { StreamEvent::Output(output.next().await) },
-                            async {
-                                let _ = kill_rx.recv().await;
-                                StreamEvent::Cancel
-                            },
-                        ),
-                        async {
-                            async_io::Timer::after(STDIN_WATCH_INTERVAL).await;
-                            StreamEvent::WatchdogTick
-                        },
-                    )
-                    .await
-                } else {
-                    futures_lite::future::or(
-                        async { StreamEvent::Output(output.next().await) },
-                        async {
-                            let _ = kill_rx.recv().await;
-                            StreamEvent::Cancel
-                        },
-                    )
-                    .await
+                let event = tokio::select! {
+                    output = async { output.next().await } => StreamEvent::Output(output),
+                    _ = async {
+                        let _ = kill_rx.recv().await;
+                    } => StreamEvent::Cancel,
+                    bytes = async { stdin_rx.recv().await }, if stdin_open => StreamEvent::Stdin(bytes),
+                    _ = async_io::Timer::after(STDIN_WATCH_INTERVAL), if watchdog_active && !notice_sent => StreamEvent::WatchdogTick,
                 };
 
                 match event {
@@ -221,7 +208,40 @@ impl ContainerExec for BollardContainerExec {
                     StreamEvent::Output(None) => {
                         break;
                     }
+                    StreamEvent::Stdin(Ok(bytes)) => {
+                        use tokio::io::AsyncWriteExt;
+
+                        input
+                            .write_all(&bytes)
+                            .await
+                            .map_err(|error| {
+                                format!("container exec stdin write failed: {error}")
+                            })?;
+                        input
+                            .flush()
+                            .await
+                            .map_err(|error| {
+                                format!("container exec stdin flush failed: {error}")
+                            })?;
+                    }
+                    StreamEvent::Stdin(Err(_)) => {
+                        use tokio::io::AsyncWriteExt;
+
+                        input
+                            .shutdown()
+                            .await
+                            .map_err(|error| {
+                                format!("container exec stdin shutdown failed: {error}")
+                            })?;
+                        stdin_open = false;
+                    }
                     StreamEvent::Cancel => {
+                        if stdin_open {
+                            use tokio::io::AsyncWriteExt;
+
+                            let _ = input.shutdown().await;
+                            stdin_open = false;
+                        }
                         if let Err(error) =
                             kill_exec_pid_inside_container(&client, &container_id, &exec_id).await
                         {
@@ -239,6 +259,12 @@ impl ContainerExec for BollardContainerExec {
                         })?;
 
                         if !inspect.running.unwrap_or(false) {
+                            if stdin_open {
+                                use tokio::io::AsyncWriteExt;
+
+                                let _ = input.shutdown().await;
+                                stdin_open = false;
+                            }
                             watchdog_active = false;
                             continue;
                         }
