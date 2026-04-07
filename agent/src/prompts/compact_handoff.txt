@@ -16,10 +16,10 @@ Populate them as follows:
 - `files_paths`: every file path you have read, written, or plan to modify
 - `errors_fixes`: errors encountered and how they were resolved or remain pending
 - `pending_work`: remaining work in order, including the immediate next action
-- `recovery_hints`: transcript path and any other important state locations
+- `recovery_hints`: database-backed session history/context snapshot recovery hints and any other important state locations
 
 Rules:
 - Be concise but complete -- every detail you omit is permanently lost.
 - Prefer file paths over inline content (the new instance can read them).
 - Do NOT include markdown, code fences, commentary, or any text outside the JSON object.
-- The full conversation transcript is available at: {transcript_path}
+

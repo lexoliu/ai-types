@@ -142,6 +142,8 @@ mod server;
 pub mod transport;
 
 // Re-export main types
-pub use client::{McpConnection, McpServerConfig, McpServersConfig, McpToolService};
+pub use client::{
+    McpConnection, McpServerConfig, McpServersConfig, McpToolService, register_terminal_commands,
+};
 pub use protocol::{CallToolResult, Content, McpError};
 pub use server::McpServer;

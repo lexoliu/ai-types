@@ -198,12 +198,12 @@ where
         self
     }
 
-    /// Registers a dynamic bash tool (type-erased).
+    /// Registers a dynamic terminal tool (type-erased).
     ///
-    /// This is used for child bash tools in subagents where the concrete type
+    /// This is used for child terminal tools in subagents where the concrete type
     /// is not known at compile time.
-    pub fn dyn_bash(mut self, dyn_tool: aither_sandbox::DynBashTool) -> Self {
-        self.tools.register_dyn_bash(dyn_tool);
+    pub fn dyn_terminal(mut self, dyn_tool: aither_sandbox::DynTerminalTool) -> Self {
+        self.tools.register_dyn_terminal(dyn_tool);
         self
     }
 
@@ -365,9 +365,9 @@ where
         self
     }
 
-    /// Registers a bash tool for script execution in a sandbox.
+    /// Registers the terminal tool for command execution in a sandbox.
     ///
-    /// The bash tool enables script execution with configurable permission modes
+    /// The terminal tool enables command execution with configurable permission modes
     /// (sandboxed, network, unsafe). It creates its own working directory with
     /// four random words and manages output storage internally.
     ///
@@ -377,31 +377,34 @@ where
     /// # Example
     ///
     /// ```rust,ignore
-    /// use aither_sandbox::{BashTool, ToolRegistryBuilder, permission::DenyUnsafe};
+    /// use aither_sandbox::{TerminalTool, ToolRegistryBuilder, permission::DenyUnsafe};
     /// use std::sync::Arc;
     ///
-    /// // Create bash tool (creates random working dir like amber-forest-thunder-pearl/)
-    /// let bash_tool = BashTool::new_in(parent, DenyUnsafe, executor).await?;
-    /// let registry = Arc::new(ToolRegistryBuilder::new().build(bash_tool.outputs_dir()));
-    /// let bash_tool = bash_tool.with_registry(registry);
+    /// // Create terminal tool (creates random working dir like amber-forest-thunder-pearl/)
+    /// let terminal_tool = TerminalTool::new_in(parent, DenyUnsafe, executor).await?;
+    /// let registry = Arc::new(ToolRegistryBuilder::new().build(terminal_tool.outputs_dir()));
+    /// let terminal_tool = terminal_tool.with_registry(registry);
     ///
     /// let agent = Agent::builder(llm)
-    ///     .bash(bash_tool)
+    ///     .terminal(terminal_tool)
     ///     .build();
     /// ```
-    pub fn bash<P, E, State>(mut self, bash_tool: aither_sandbox::BashTool<P, E, State>) -> Self
+    pub fn terminal<P, E, State>(
+        mut self,
+        terminal_tool: aither_sandbox::TerminalTool<P, E, State>,
+    ) -> Self
     where
         P: aither_sandbox::PermissionHandler + 'static,
         E: executor_core::Executor + Clone + 'static,
         State: Clone + 'static,
-        aither_sandbox::BashTool<P, E, State>: Tool + 'static,
+        aither_sandbox::TerminalTool<P, E, State>: Tool + 'static,
     {
-        let output_store = bash_tool.output_store().clone();
-        let background_receiver = bash_tool.background_receiver();
-        let permission_receiver = bash_tool.permission_receiver();
-        let job_registry = bash_tool.job_registry();
-        self.sandbox_dir = Some(bash_tool.working_dir().clone());
-        self.tools.register(bash_tool);
+        let output_store = terminal_tool.output_store().clone();
+        let background_receiver = terminal_tool.background_receiver();
+        let permission_receiver = terminal_tool.permission_receiver();
+        let job_registry = terminal_tool.job_registry();
+        self.sandbox_dir = Some(terminal_tool.working_dir().clone());
+        self.tools.register(terminal_tool);
         self.output_store = Some(output_store);
         self.background_receiver = Some(background_receiver);
         self.permission_receiver = Some(permission_receiver);
@@ -470,6 +473,7 @@ where
             sandbox_dir: self.sandbox_dir,
             last_working_docs: None,
             last_request_started_at: None,
+            transient_system_messages: Vec::new(),
             #[cfg(feature = "skills")]
             skill_registry: self.skill_registry,
             #[cfg(feature = "skills")]
@@ -541,12 +545,10 @@ mod tests {
         }
 
         type Arguments = MockArgs;
+        type Res = aither_core::llm::ToolResult;
 
-        async fn call(
-            &self,
-            _args: Self::Arguments,
-        ) -> aither_core::Result<aither_core::llm::ToolOutput> {
-            Ok(aither_core::llm::ToolOutput::text("ok"))
+        async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
+            Ok(aither_core::llm::ToolResult::text("ok"))
         }
     }
 

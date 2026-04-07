@@ -34,9 +34,10 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use aither_core::llm::{Tool, ToolOutput};
+use aither_core::llm::{IntoToolResult, Tool, ToolResult};
 use askama::Template;
-use leash::IpcCommand;
+use base64::Engine as _;
+use heel::IpcCommand;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,7 @@ use serde_json::Value;
 pub enum CommandPayload {
     Text { content: String },
     Json { value: Value },
+    Binary { mime: String, data_base64: String },
 }
 
 #[derive(Template)]
@@ -156,6 +158,15 @@ impl CommandPayload {
             Self::Text { content } => Ok(content.clone()),
             Self::Json { value } => serde_json::to_string_pretty(value)
                 .map_err(|error| prefix_error("failed to encode JSON output: ", &error)),
+            Self::Binary { mime, data_base64 } => {
+                let mut rendered = String::new();
+                rendered.push_str("[binary payload: ");
+                rendered.push_str(mime);
+                rendered.push_str(", ");
+                rendered.push_str(data_base64.len().to_string().as_str());
+                rendered.push_str(" base64 chars]");
+                Ok(rendered)
+            }
         }
     }
 }
@@ -273,56 +284,45 @@ async fn handle_large_output(
     })
 }
 
-fn tool_output_to_payload(output: ToolOutput) -> Result<Option<CommandPayload>, String> {
-    match output {
-        ToolOutput::Done => Ok(None),
-        ToolOutput::Output { mime, content } => {
-            let mime_is_json = mime.subtype().as_str() == "json"
-                || mime
-                    .suffix()
-                    .is_some_and(|suffix| suffix.as_str() == "json");
-            if mime_is_json {
-                let value = serde_json::from_slice(&content)
-                    .map_err(|error| prefix_error("invalid JSON tool output: ", &error))?;
-                return Ok(Some(CommandPayload::Json { value }));
-            }
-
-            let text = String::from_utf8(content).map_err(|error| {
-                let error_text = error.to_string();
-                let mut message =
-                    String::with_capacity(mime.essence_str().len() + error_text.len() + 40);
-                message.push_str("unsupported non-UTF8 CLI tool output for MIME ");
-                message.push_str(mime.essence_str());
-                message.push_str(": ");
-                message.push_str(error_text.as_str());
-                message
-            })?;
+fn tool_output_to_payload(output: impl IntoToolResult) -> Result<Option<CommandPayload>, String> {
+    match output
+        .into_tool_result()
+        .map_err(|error| prefix_error("failed to convert tool result: ", &error))?
+    {
+        ToolResult::Done => Ok(None),
+        ToolResult::Text { text } | ToolResult::Tsv { text } => {
             Ok(Some(CommandPayload::Text { content: text }))
         }
+        ToolResult::Json { value } => Ok(Some(CommandPayload::Json { value })),
+        ToolResult::Binary { mime, content } => Ok(Some(CommandPayload::Binary {
+            mime,
+            data_base64: base64::engine::general_purpose::STANDARD.encode(content),
+        })),
+        ToolResult::Error { message } => Err(message),
     }
 }
 
 // ============================================================================
-// Bash Tool Factory (for creating child bash tools for subagents)
+// Terminal Tool Factory (for creating child terminal tools for subagents)
 // ============================================================================
 
 use aither_core::llm::tool::ToolDefinition;
 
-/// A type-erased handler function for bash tools.
+/// A type-erased handler function for terminal tools.
 pub type DynToolHandler =
-    Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>;
+    Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = ToolResult> + Send>> + Send + Sync>;
 
-/// A type-erased bash tool that can be registered with `AgentTools`.
-pub struct DynBashTool {
+/// A type-erased terminal tool that can be registered with `AgentTools`.
+pub struct DynTerminalTool {
     /// Tool definition (name, description, schema).
     pub definition: ToolDefinition,
     /// Handler that takes JSON args and returns result.
     pub handler: DynToolHandler,
 }
 
-impl std::fmt::Debug for DynBashTool {
+impl std::fmt::Debug for DynTerminalTool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DynBashTool")
+        f.debug_struct("DynTerminalTool")
             .field("definition", &self.definition)
             .finish_non_exhaustive()
     }
@@ -404,6 +404,68 @@ impl ToolRegistryBuilder {
         );
     }
 
+    /// Configures a schema-defined handler to be callable from the sandbox.
+    ///
+    /// This is the dynamic counterpart to [`Self::configure_tool`]. The CLI
+    /// wrapper is derived entirely from the provided [`ToolDefinition`]'s JSON
+    /// schema, so external tools such as MCP definitions get the same
+    /// positional arguments, `--help`, and usage validation behavior as native
+    /// `Tool` implementations.
+    pub fn configure_definition_handler<F>(&mut self, definition: ToolDefinition, handler: F)
+    where
+        F: Fn(
+                Value,
+            )
+                -> Pin<Box<dyn Future<Output = Result<Option<CommandPayload>, String>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let name = definition.name().to_string();
+        let description = definition.description().to_string();
+        let schema = definition.arguments_openai_schema();
+        let positional_args = detect_positional_args(&schema);
+        let stdin_arg = detect_stdin_arg(&schema);
+        let help_text = if description.is_empty() {
+            schema_to_help(&schema)
+        } else {
+            let mut help = String::with_capacity(description.len() + 2);
+            help.push_str(description.as_str());
+            help.push_str("\n\n");
+            help.push_str(schema_to_help(&schema).as_str());
+            help
+        };
+
+        let schema_for_handler = schema.clone();
+        let name_for_handler = name.clone();
+        let handler = Arc::new(handler);
+        let raw_handler: ToolHandlerFn = Box::new(move |args: Vec<String>| {
+            let schema = schema_for_handler.clone();
+            let name = name_for_handler.clone();
+            let handler = handler.clone();
+            Box::pin(async move {
+                let json_args = match cli_to_json(&schema, &args) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let message = error.to_string();
+                        return Err(tool_usage_error(message.as_str(), name.as_str()));
+                    }
+                };
+                handler(json_args).await
+            })
+        });
+
+        self.entries.insert(
+            name,
+            ToolEntry {
+                handler: raw_handler,
+                help: help_text,
+                positional_args,
+                stdin_arg,
+            },
+        );
+    }
+
     /// Registers a raw handler function as an IPC command.
     ///
     /// This is useful for dynamic tools like MCP tools that are discovered at runtime.
@@ -474,7 +536,7 @@ fn detect_positional_args(schema: &Value) -> Vec<String> {
             // Exclude array-typed fields -- they require repeated --flag syntax
             if let Some(props) = properties {
                 if let Some(prop_schema) = props.get(name) {
-                    return get_instance_type(prop_schema) != Some("array");
+                    return get_instance_type(prop_schema, prop_schema) != Some("array");
                 }
             }
             true
@@ -565,7 +627,7 @@ impl ToolRegistry {
 /// IPC command for invoking tools from the sandbox.
 ///
 /// The `tool_name` comes from the IPC method name, and args are flattened
-/// from the key-value pairs sent by leash-ipc.
+/// from the key-value pairs sent by `heel ipc`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolCallCommand {
     /// Shared tool registry.
@@ -683,10 +745,10 @@ impl IpcCommand for ToolCallCommand {
         self.tool_name = name.to_string();
     }
 
-    fn apply_args(&mut self, params: &[u8]) -> Result<(), leash::rmp_serde::decode::Error> {
+    fn apply_args(&mut self, params: &[u8]) -> Result<(), heel::rmp_serde::decode::Error> {
         // Params are a flattened HashMap that maps directly to args.
         // tool_name is set via set_method_name and preserved here.
-        self.args = leash::rmp_serde::from_slice(params)?;
+        self.args = heel::rmp_serde::from_slice(params)?;
         Ok(())
     }
 
@@ -719,7 +781,7 @@ impl IpcCommand for ToolCallCommand {
 ///
 /// ```rust,ignore
 /// use aither_sandbox::command::register_tool_command;
-/// use leash::IpcRouter;
+/// use heel::IpcRouter;
 ///
 /// let router = IpcRouter::new();
 /// let registry = std::sync::Arc::new(ToolRegistryBuilder::new().build("./outputs"));
@@ -727,10 +789,10 @@ impl IpcCommand for ToolCallCommand {
 /// ```
 #[must_use]
 pub fn register_tool_command(
-    router: leash::IpcRouter,
+    router: heel::IpcRouter,
     registry: Arc<ToolRegistry>,
     tool_name: &str,
-) -> leash::IpcRouter {
+) -> heel::IpcRouter {
     router.register(ToolCallCommand::new(tool_name, registry))
 }
 
@@ -761,8 +823,8 @@ impl IpcCommand for IpcGatewayCommand {
 
     fn set_method_name(&mut self, _name: &str) {}
 
-    fn apply_args(&mut self, params: &[u8]) -> Result<(), leash::rmp_serde::decode::Error> {
-        self.args = leash::rmp_serde::from_slice(params)?;
+    fn apply_args(&mut self, params: &[u8]) -> Result<(), heel::rmp_serde::decode::Error> {
+        self.args = heel::rmp_serde::from_slice(params)?;
         Ok(())
     }
 
@@ -796,9 +858,9 @@ impl IpcCommand for IpcGatewayCommand {
 /// Registers the generic `ipc` gateway command that dispatches to any tool by name.
 #[must_use]
 pub fn register_ipc_gateway_command(
-    router: leash::IpcRouter,
+    router: heel::IpcRouter,
     registry: Arc<ToolRegistry>,
-) -> leash::IpcRouter {
+) -> heel::IpcRouter {
     router.register(IpcGatewayCommand::new(registry))
 }
 
@@ -959,9 +1021,9 @@ where
         self.name = name.to_string();
     }
 
-    fn apply_args(&mut self, params: &[u8]) -> Result<(), leash::rmp_serde::decode::Error> {
+    fn apply_args(&mut self, params: &[u8]) -> Result<(), heel::rmp_serde::decode::Error> {
         // Only update args, preserve the tool instance with its state
-        self.args = leash::rmp_serde::from_slice(params)?;
+        self.args = heel::rmp_serde::from_slice(params)?;
         Ok(())
     }
 
@@ -1031,12 +1093,12 @@ where
 ///
 /// ```rust,ignore
 /// use aither_sandbox::command::register_tool_direct;
-/// use leash::IpcRouter;
+/// use heel::IpcRouter;
 ///
 /// let router = IpcRouter::new();
 /// let router = register_tool_direct(router, my_tool);
 /// ```
-pub fn register_tool_direct<T>(router: leash::IpcRouter, tool: T) -> leash::IpcRouter
+pub fn register_tool_direct<T>(router: heel::IpcRouter, tool: T) -> heel::IpcRouter
 where
     T: Tool + Send + Sync + Clone + Default + 'static,
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
@@ -1067,7 +1129,7 @@ pub fn cli_to_json(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
     }
 
     // Otherwise treat as a simple object
-    parse_object(schema, args)
+    parse_object(schema, schema, args)
 }
 
 /// Finds the serde tag field name from schema extensions.
@@ -1098,7 +1160,7 @@ fn find_serde_tag(schema: &Value) -> Option<String> {
 
 /// Parses a tagged enum from CLI arguments.
 fn parse_tagged_enum(
-    _root_schema: &Value,
+    root_schema: &Value,
     variants: &[Value],
     tag: &str,
     args: &[String],
@@ -1127,7 +1189,7 @@ fn parse_tagged_enum(
                 let mut variant_schema = variant.clone();
                 remove_required_field(&mut variant_schema, tag);
                 // Parse the variant's fields
-                let mut result = parse_object(&variant_schema, remaining)?;
+                let mut result = parse_object(root_schema, &variant_schema, remaining)?;
 
                 // Add the tag field
                 if let Value::Object(ref mut map) = result {
@@ -1250,8 +1312,8 @@ fn find_similar_option<'a>(input: &str, options: impl Iterator<Item = &'a str>) 
 }
 
 /// Parses an object schema from CLI arguments.
-fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
-    // Strip leading "--" separator (from leash-ipc wrapper) without disabling flag parsing.
+fn parse_object(root_schema: &Value, schema: &Value, args: &[String]) -> anyhow::Result<Value> {
+    // Strip leading "--" separator (from `heel ipc`) without disabling flag parsing.
     // A standalone "--" later in the args still acts as end-of-options.
     let args = if args.first().map(std::string::String::as_str) == Some("--") {
         &args[1..]
@@ -1265,13 +1327,13 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
     let mut positional_idx = 0;
 
     // Get object properties
-    let properties = schema
+    let properties = resolved_schema(root_schema, schema)
         .get("properties")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
 
-    let required: Vec<String> = schema
+    let required: Vec<String> = resolved_schema(root_schema, schema)
         .get("required")
         .and_then(Value::as_array)
         .map(|arr| {
@@ -1287,7 +1349,7 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
         .iter()
         .filter(|name| {
             if let Some(prop_schema) = properties.get(name.as_str()) {
-                get_instance_type(prop_schema) != Some("array")
+                get_instance_type(root_schema, prop_schema) != Some("array")
             } else {
                 true
             }
@@ -1296,7 +1358,7 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
         .collect();
     let command_capture_enabled = properties
         .get("command")
-        .is_some_and(|schema| get_instance_type(schema) == Some("string"));
+        .is_some_and(|schema| get_instance_type(root_schema, schema) == Some("string"));
     let mut seen_positionals: Vec<String> = Vec::new();
     let (short_to_field, _) = build_short_option_maps(&properties);
     let long_names: Vec<String> = properties.keys().map(|k| k.replace('_', "-")).collect();
@@ -1316,7 +1378,7 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
             if positional_idx < positional_fields.len() {
                 let field_name = &positional_fields[positional_idx];
                 if let Some(prop_schema) = properties.get(field_name) {
-                    let prop_type = get_instance_type(prop_schema);
+                    let prop_type = get_instance_type(root_schema, prop_schema);
                     result.insert(field_name.clone(), parse_value(arg, prop_type));
                 }
                 positional_idx += 1;
@@ -1355,7 +1417,7 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
             let field_name = name.replace('-', "_");
 
             if let Some(prop_schema) = properties.get(&field_name) {
-                let prop_type = get_instance_type(prop_schema);
+                let prop_type = get_instance_type(root_schema, prop_schema);
 
                 if negated && prop_type != Some("boolean") {
                     anyhow::bail!("--no-{name} is only valid for boolean options");
@@ -1381,7 +1443,13 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
                     }
                 };
 
-                insert_value(&mut result, &field_name, parsed_value, prop_schema);
+                insert_value(
+                    root_schema,
+                    &mut result,
+                    &field_name,
+                    parsed_value,
+                    prop_schema,
+                );
             } else {
                 let suggestion = find_similar_option(&name, long_names.iter().map(String::as_str));
                 if let Some(similar) = suggestion {
@@ -1390,13 +1458,21 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
                 anyhow::bail!("unknown option: --{name}");
             }
         } else if !end_of_options && arg.starts_with('-') && arg.len() > 1 {
-            parse_short_options(arg, args, &mut i, &properties, &short_to_field, &mut result)?;
+            parse_short_options(
+                root_schema,
+                arg,
+                args,
+                &mut i,
+                &properties,
+                &short_to_field,
+                &mut result,
+            )?;
         } else {
             // Positional argument
             if positional_idx < positional_fields.len() {
                 let field_name = &positional_fields[positional_idx];
                 if let Some(prop_schema) = properties.get(field_name) {
-                    let prop_type = get_instance_type(prop_schema);
+                    let prop_type = get_instance_type(root_schema, prop_schema);
                     result.insert(field_name.clone(), parse_value(arg, prop_type));
                 }
                 positional_idx += 1;
@@ -1429,6 +1505,7 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
 }
 
 fn parse_short_options(
+    root_schema: &Value,
     arg: &str,
     args: &[String],
     i: &mut usize,
@@ -1452,21 +1529,33 @@ fn parse_short_options(
         let prop_schema = properties
             .get(&field_name)
             .ok_or_else(|| anyhow::anyhow!("unknown option: -{ch}"))?;
-        let prop_type = get_instance_type(prop_schema);
+        let prop_type = get_instance_type(root_schema, prop_schema);
 
         if prop_type == Some("boolean") {
             if chars.peek().is_none() {
                 if let Some(v) = value_from_eq.take() {
                     let parsed = parse_value(&v, prop_type);
-                    insert_value(result, &field_name, parsed, prop_schema);
+                    insert_value(root_schema, result, &field_name, parsed, prop_schema);
                 } else {
-                    insert_value(result, &field_name, Value::Bool(true), prop_schema);
+                    insert_value(
+                        root_schema,
+                        result,
+                        &field_name,
+                        Value::Bool(true),
+                        prop_schema,
+                    );
                 }
             } else {
                 if value_from_eq.is_some() {
                     anyhow::bail!("unexpected value for -{ch}");
                 }
-                insert_value(result, &field_name, Value::Bool(true), prop_schema);
+                insert_value(
+                    root_schema,
+                    result,
+                    &field_name,
+                    Value::Bool(true),
+                    prop_schema,
+                );
             }
             continue;
         }
@@ -1487,7 +1576,7 @@ fn parse_short_options(
         };
 
         let parsed = parse_value(&value, prop_type);
-        insert_value(result, &field_name, parsed, prop_schema);
+        insert_value(root_schema, result, &field_name, parsed, prop_schema);
         break;
     }
 
@@ -1495,12 +1584,13 @@ fn parse_short_options(
 }
 
 fn insert_value(
+    root_schema: &Value,
     result: &mut HashMap<String, Value>,
     field_name: &str,
     value: Value,
     prop_schema: &Value,
 ) {
-    if get_instance_type(prop_schema) == Some("array") {
+    if get_instance_type(root_schema, prop_schema) == Some("array") {
         if let Some(Value::Array(existing)) = result.get_mut(field_name) {
             match value {
                 Value::Array(mut items) => existing.append(&mut items),
@@ -1521,7 +1611,8 @@ fn insert_value(
 
 /// Gets the instance type from a schema.
 /// Handles both simple types and Option<T>.
-fn get_instance_type(schema: &Value) -> Option<&str> {
+fn get_instance_type<'a>(root_schema: &'a Value, schema: &'a Value) -> Option<&'a str> {
+    let schema = resolved_schema(root_schema, schema);
     match schema.get("type") {
         // Direct string type: "type": "integer"
         Some(Value::String(t)) => Some(t.as_str()),
@@ -1558,6 +1649,30 @@ fn get_instance_type(schema: &Value) -> Option<&str> {
 
         _ => None,
     }
+}
+
+fn resolved_schema<'a>(root_schema: &'a Value, schema: &'a Value) -> &'a Value {
+    let mut current = schema;
+    while let Some(reference) = current.get("$ref").and_then(Value::as_str) {
+        let Some(next) = resolve_local_ref(root_schema, reference) else {
+            break;
+        };
+        if std::ptr::eq(current, next) {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+fn resolve_local_ref<'a>(root_schema: &'a Value, reference: &str) -> Option<&'a Value> {
+    let pointer = reference.strip_prefix("#/")?;
+    let mut current = root_schema;
+    for segment in pointer.split('/') {
+        let segment = segment.replace("~1", "/").replace("~0", "~");
+        current = current.get(segment.as_str())?;
+    }
+    Some(current)
 }
 
 /// Parses a string value according to expected type.
@@ -1640,7 +1755,7 @@ pub fn schema_to_help(schema: &Value) -> String {
             .filter(|n| {
                 props
                     .get(**n)
-                    .is_none_or(|s| get_instance_type(s) != Some("array"))
+                    .is_none_or(|s| get_instance_type(s, s) != Some("array"))
             })
             .map(|n| render_positional_usage(n))
             .collect();
@@ -1650,7 +1765,7 @@ pub fn schema_to_help(schema: &Value) -> String {
             .filter(|n| {
                 props
                     .get(**n)
-                    .is_some_and(|s| get_instance_type(s) == Some("array"))
+                    .is_some_and(|s| get_instance_type(s, s) == Some("array"))
             })
             .map(|n| render_repeatable_usage(n))
             .collect();
@@ -1674,7 +1789,7 @@ pub fn schema_to_help(schema: &Value) -> String {
 
         for (name, prop) in props {
             let is_required = required.contains(&name.as_str());
-            let is_array = get_instance_type(prop) == Some("array");
+            let is_array = get_instance_type(prop, prop) == Some("array");
             let flag = name.replace('_', "-");
 
             let short = field_to_short.get(name).copied();
@@ -1784,7 +1899,7 @@ mod tests {
         let schema = schemars::schema_for!(SimpleArgs);
         let schema = serde_json::to_value(schema).unwrap();
 
-        // Leading "--" from leash-ipc is stripped; flags still work after it
+        // Leading "--" from `heel ipc` is stripped; flags still work after it
         let result = cli_to_json(
             &schema,
             &[
@@ -1802,7 +1917,7 @@ mod tests {
         let schema = schemars::schema_for!(SimpleArgs);
         let schema = serde_json::to_value(schema).unwrap();
 
-        // Double "--": first is leash-ipc separator, second is end-of-options
+        // Double "--": first is the `heel ipc` separator, second is end-of-options
         let result = cli_to_json(
             &schema,
             &["--".to_string(), "--".to_string(), "-dash.txt".to_string()],
@@ -1824,6 +1939,19 @@ mod tests {
     enum TaggedOperationArgs {
         Read { path: String },
         Write { path: String, content: String },
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum NestedTriggerArgs {
+        Webhook,
+        Event { event_name: String },
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    struct NestedObjectArgs {
+        name: String,
+        trigger: NestedTriggerArgs,
     }
 
     #[test]
@@ -1885,6 +2013,26 @@ mod tests {
     }
 
     #[test]
+    fn test_nested_ref_object_flag_parsing() {
+        let schema = schemars::schema_for!(NestedObjectArgs);
+        let schema = serde_json::to_value(schema).unwrap();
+
+        let result = cli_to_json(
+            &schema,
+            &[
+                "--name".to_string(),
+                "demo".to_string(),
+                "--trigger".to_string(),
+                "{\"kind\":\"webhook\"}".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(result["name"], "demo");
+        assert_eq!(result["trigger"]["kind"], "webhook");
+    }
+
+    #[test]
     fn test_typo_suggestion() {
         let schema = schemars::schema_for!(SimpleArgs);
         let schema = serde_json::to_value(schema).unwrap();
@@ -1909,7 +2057,7 @@ mod tests {
 
     #[test]
     fn test_tool_call_command_serialization() {
-        // Simulate IPC params (key-value pairs from leash-ipc)
+        // Simulate IPC params (key-value pairs from `heel ipc`)
         let json = r#"{"query": "rust async", "max": 5}"#;
         let tmp = tempfile::tempdir().unwrap();
         let registry = ToolRegistryBuilder::new().build(tmp.path());
@@ -2167,7 +2315,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let registry = ToolRegistryBuilder::new().build(tmp.path());
         let mut cmd = ToolCallCommand::new("ask_user", Arc::new(registry));
-        // Simulates what leash-ipc sends
+        // Simulates what `heel ipc` sends
         cmd.args = serde_json::from_value(serde_json::json!({
             "args": ["--question", "Pick one", "--options", "A", "--options", "B"]
         }))
@@ -2229,7 +2377,7 @@ mod tests {
 
     #[test]
     fn test_ask_user_e2e_repeated_option() {
-        use aither_core::llm::{Tool, ToolOutput};
+        use aither_core::llm::{Tool, ToolResult};
         use std::borrow::Cow;
 
         #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -2260,9 +2408,11 @@ mod tests {
                 "ask_user".into()
             }
             type Arguments = AskUserArgs;
-            async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+            type Res = ToolResult;
+
+            async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
                 // Return the parsed args as JSON so we can inspect
-                ToolOutput::json(&serde_json::json!({
+                ToolResult::json(&serde_json::json!({
                     "question": args.question,
                     "option": args.option,
                     "multi_select": args.multi_select,
@@ -2275,7 +2425,7 @@ mod tests {
         builder.configure_tool(FakeAskUser);
         let registry = std::sync::Arc::new(builder.build(tmp.path()));
 
-        // Simulate what leash-ipc sends: all args in an "args" array
+        // Simulate what `heel ipc` sends: all args in an "args" array
         let mut cmd = ToolCallCommand::new("ask_user", registry);
         cmd.args = serde_json::from_value(serde_json::json!({
             "args": [

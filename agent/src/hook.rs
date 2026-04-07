@@ -24,6 +24,8 @@
 
 use std::time::Duration;
 
+use aither_core::llm::ToolResult;
+
 use crate::context_window::ContextWindowSnapshot;
 
 /// Context provided to hooks before a tool is called.
@@ -46,8 +48,8 @@ pub struct ToolResultContext<'a> {
     pub tool_name: &'a str,
     /// JSON-encoded arguments that were passed.
     pub arguments: &'a str,
-    /// Result of the tool execution.
-    pub result: Result<&'a str, &'a str>,
+    /// Structured result of the tool execution.
+    pub result: &'a ToolResult,
     /// Time taken to execute the tool.
     pub duration: Duration,
 }
@@ -138,7 +140,7 @@ pub enum PostToolAction {
     /// Keep the original tool result.
     Keep,
     /// Replace the tool result with a custom value.
-    Replace(String),
+    Replace(ToolResult),
     /// Abort the agent run entirely with an error.
     Abort(String),
 }

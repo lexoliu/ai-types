@@ -1,6 +1,6 @@
 use std::{borrow::Cow, path::PathBuf};
 
-use aither_core::llm::{Tool, ToolOutput, tool::json};
+use aither_core::llm::{Tool, ToolResult, tool::json};
 use anyhow::{Context, Result, bail};
 use async_process::Command;
 use schemars::JsonSchema;
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 /// and exit code. Use this for executing system commands when you need
 /// fine-grained control over arguments.
 ///
-/// For complex scripts with pipelines, use `bash` instead.
+/// For complex scripts with pipelines, use `terminal` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CommandArgs {
     /// Program name to execute (e.g., "ls", "grep", "git", "cargo").
@@ -96,8 +96,9 @@ impl Tool for CommandTool {
     }
 
     type Arguments = CommandArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
         self.ensure_allowed(&arguments.program)?;
 
         let working_dir = arguments.cwd.unwrap_or_else(|| self.default_cwd.clone());
@@ -121,6 +122,6 @@ impl Tool for CommandTool {
             stderr: self.truncate(String::from_utf8_lossy(&output.stderr).to_string()),
         };
 
-        Ok(ToolOutput::text(json(&response)))
+        Ok(ToolResult::text(json(&response)))
     }
 }

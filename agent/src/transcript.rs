@@ -12,6 +12,7 @@
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+use aither_core::llm::ToolResult;
 use async_fs::OpenOptions;
 use futures_lite::AsyncWriteExt;
 
@@ -57,17 +58,16 @@ impl Transcript {
         self.append(&block).await;
     }
 
-    pub async fn write_tool_result(&self, name: &str, result: &Result<String, String>) {
+    pub async fn write_tool_result(&self, name: &str, result: &ToolResult) {
         let mut block = String::new();
-        match result {
-            Ok(output) => {
-                let truncated = truncate_lines(output, 200);
-                let _ = writeln!(block, "-> {name}: {truncated}\n");
-            }
-            Err(err) => {
-                let truncated = truncate_lines(err, 200);
-                let _ = writeln!(block, "-> {name} (error): {truncated}\n");
-            }
+        let rendered = result
+            .render_for_cli()
+            .unwrap_or_else(|error| format!("failed to render tool result: {error}"));
+        let truncated = truncate_lines(&rendered, 200);
+        if result.is_error() {
+            let _ = writeln!(block, "-> {name} (error): {truncated}\n");
+        } else {
+            let _ = writeln!(block, "-> {name}: {truncated}\n");
         }
         self.append(&block).await;
     }

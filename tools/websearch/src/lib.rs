@@ -42,7 +42,7 @@ pub use providers::*;
 use std::borrow::Cow;
 
 use aither_core::llm::tool::json;
-use aither_core::llm::{Tool, ToolOutput};
+use aither_core::llm::{Tool, ToolResult};
 use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -136,15 +136,16 @@ where
     }
 
     type Arguments = WebSearchArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
         let limit = arguments.limit.clamp(1, 10);
 
         // Retry on empty results (search engines may temporarily fail)
         for attempt in 0..MAX_RETRIES {
             match self.provider.search(&arguments.query, limit).await {
                 Ok(results) if !results.is_empty() => {
-                    return Ok(ToolOutput::text(json(&results)));
+                    return Ok(ToolResult::text(json(&results)));
                 }
                 Ok(_empty) if attempt < MAX_RETRIES - 1 => {
                     // Empty results, retry after delay
@@ -152,7 +153,7 @@ where
                 }
                 Ok(empty) => {
                     // Final attempt still empty, return empty results
-                    return Ok(ToolOutput::text(json(&empty)));
+                    return Ok(ToolResult::text(json(&empty)));
                 }
                 Err(e) if is_non_retryable(&e) => {
                     // Non-retryable error (e.g., CAPTCHA), fail immediately

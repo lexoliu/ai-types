@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use aither_core::llm::tool::{Tool, ToolOutput};
+use aither_core::llm::tool::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -91,8 +91,9 @@ impl Tool for RequestWorkspaceTool {
     }
 
     type Arguments = RequestWorkspaceArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
         let approved = self
             .broker
             .request(WorkspaceRequestPayload {
@@ -105,6 +106,6 @@ impl Tool for RequestWorkspaceTool {
             reason: args.reason,
             approved,
         };
-        ToolOutput::json(&access)
+        ToolResult::json(&access)
     }
 }

@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use aither_core::llm::tool::{Tool, ToolOutput};
+use aither_core::llm::tool::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -151,8 +151,9 @@ impl Tool for AskUserTool {
     }
 
     type Arguments = AskUserArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
         let response = self
             .broker
             .request(AskUserRequestPayload {
@@ -160,7 +161,7 @@ impl Tool for AskUserTool {
                 request: args,
             })
             .await?;
-        ToolOutput::json(&response)
+        ToolResult::json(&response)
     }
 }
 

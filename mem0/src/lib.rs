@@ -2,7 +2,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use aither_core::embedding::EmbeddingModel;
-use aither_core::llm::{LLMRequest, LanguageModel, Message, Tool, ToolOutput};
+use aither_core::llm::{LLMRequest, LanguageModel, Message, Tool, ToolResult};
 use anyhow::Context;
 use async_channel::Sender;
 use llm::{Action, ExtractedFacts, MemoryDecision};
@@ -28,17 +28,18 @@ where
     S: MemoryStore + 'static,
 {
     type Arguments = String;
+    type Res = ToolResult;
     fn name(&self) -> std::borrow::Cow<'static, str> {
         "search_memories".into()
     }
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
         let result = self
             .inner
             .retrieve_formatted(&arguments, 50)
             .await
             .context("Fail to retrive memory")?;
-        Ok(ToolOutput::text(result))
+        Ok(ToolResult::text(result))
     }
 }
 
@@ -53,16 +54,17 @@ where
     S: MemoryStore + 'static,
 {
     type Arguments = Vec<String>;
+    type Res = ToolResult;
     fn name(&self) -> std::borrow::Cow<'static, str> {
         "add_fact".into()
     }
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
         self.inner
             .add_fact(arguments)
             .await
             .context("Fail to add fact")?;
-        Ok(ToolOutput::Done)
+        Ok(ToolResult::Done)
     }
 }
 

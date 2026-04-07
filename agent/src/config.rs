@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use aither_core::llm::model::Parameters;
+
 use crate::compression::ContextStrategy;
 
 /// Agent specialization mode.
@@ -61,6 +63,9 @@ pub struct AgentConfig {
 
     /// Context assembly behavior.
     pub context_assembler: ContextAssemblerConfig,
+
+    /// Request-level model parameters applied to each LLM call.
+    pub request_parameters: Parameters,
 }
 
 impl Default for AgentConfig {
@@ -73,6 +78,7 @@ impl Default for AgentConfig {
             agent_kind: AgentKind::default(),
             transcript_path: None,
             context_assembler: ContextAssemblerConfig::default(),
+            request_parameters: Parameters::default(),
         }
     }
 }
@@ -130,6 +136,13 @@ impl AgentConfig {
     #[must_use]
     pub fn with_idle_reassemble_after(mut self, idle_reassemble_after: Duration) -> Self {
         self.context_assembler.idle_reassemble_after = idle_reassemble_after;
+        self
+    }
+
+    /// Sets default request-level model parameters for each LLM call.
+    #[must_use]
+    pub fn with_request_parameters(mut self, parameters: Parameters) -> Self {
+        self.request_parameters = parameters;
         self
     }
 }

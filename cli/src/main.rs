@@ -2,16 +2,16 @@
 //!
 //! A REPL-style interface for testing agents with `OpenAI`, Claude, or Gemini.
 //!
-//! # Bash-First Design
+//! # Terminal-First Design
 //!
-//! The agent has a single `bash` tool. All other capabilities are exposed as
-//! terminal commands that can be run within bash scripts:
+//! The agent has a single `terminal` tool. All other capabilities are exposed as
+//! terminal commands that can be run within terminal sessions:
 //!
 //! - `websearch "query"` - Search the web
 //! - `webfetch "url"` - Fetch and read web pages
 //! - `todo ...` - Track tasks
 //!
-//! Standard bash commands (ls, cat, grep, find, etc.) work normally.
+//! Standard shell commands (ls, cat, grep, find, etc.) work normally.
 //!
 //! # Usage
 //!
@@ -45,11 +45,11 @@ use std::time::Duration;
 
 use aither_agent::sandbox::{
     CommandPayload, ToolRegistryBuilder, cli_to_json,
-    permission::{BashMode, PermissionError, PermissionHandler, StatefulPermissionHandler},
+    permission::{PermissionError, PermissionHandler, StatefulPermissionHandler, TerminalMode},
     schema_to_help,
 };
 use aither_agent::specialized::SubagentTool;
-use aither_agent::{Agent, BashAgentBuilder, Hook};
+use aither_agent::{Agent, Hook, TerminalAgentBuilder};
 use aither_core::LanguageModel;
 use aither_core::llm::Role;
 use aither_mcp::{McpConnection, McpServersConfig};
@@ -115,11 +115,11 @@ impl InteractivePermissionHandler {
 }
 
 impl PermissionHandler for InteractivePermissionHandler {
-    async fn check(&self, mode: BashMode, script: &str) -> Result<bool, PermissionError> {
+    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
         // This will be wrapped in StatefulPermissionHandler for network mode
         match mode {
-            BashMode::Sandboxed => Ok(true), // Always allow
-            BashMode::Network | BashMode::Unsafe => {
+            TerminalMode::Sandboxed => Ok(true), // Always allow
+            TerminalMode::Network | TerminalMode::Unsafe => {
                 // Display script and ask for permission (show full script, no truncation)
                 let mode_desc = mode.description();
                 let display_script = script.trim().replace('\n', "; ");
@@ -134,7 +134,7 @@ impl PermissionHandler for InteractivePermissionHandler {
 
                 if approved {
                     // Mark network as approved to skip domain prompts
-                    if mode == BashMode::Network {
+                    if mode == TerminalMode::Network {
                         self.network_approved
                             .store(true, std::sync::atomic::Ordering::Release);
                     }
@@ -234,9 +234,9 @@ fn read_yes_no() -> Result<bool> {
     }
 }
 
-/// Register MCP tools as bash IPC commands.
+/// Register MCP tools as terminal IPC commands.
 ///
-/// This makes MCP tools available as bash commands (e.g., `resolve-library-id "tokio"`)
+/// This makes MCP tools available as terminal commands (e.g., `resolve-library-id "tokio"`)
 /// instead of direct LLM tool calls.
 fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
     let tools: Vec<_> = conn
@@ -433,20 +433,23 @@ async fn build_agent(
     args: &Args,
 ) -> Result<Agent<CloudProvider, CloudProvider, CloudProvider, aither_agent::HCons<DebugHook, ()>>>
 {
-    // Create bash tool (creates random four-word working dir under system temp)
+    // Create terminal tool (creates random four-word working dir under system temp)
     // Uses interactive permission handler:
     // - Sandboxed: always allow (no prompt)
     // - Network: ask once, then remember
     // - Unsafe: always ask for each script
     let workdir_parent = std::env::temp_dir().join("aither");
     let permission_handler = StatefulPermissionHandler::new(InteractivePermissionHandler::new());
-    let bash_tool =
-        aither_agent::sandbox::BashTool::new_in(&workdir_parent, permission_handler, TokioGlobal)
-            .await?;
+    let terminal_tool = aither_agent::sandbox::TerminalTool::new_in(
+        &workdir_parent,
+        permission_handler,
+        TokioGlobal,
+    )
+    .await?;
 
-    // Create bash-centric agent builder
-    // All tools become IPC commands accessible via bash
-    let mut builder = BashAgentBuilder::new(cloud.clone(), bash_tool)
+    // Create terminal-first agent builder
+    // All tools become IPC commands accessible via terminal
+    let mut builder = TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
         .tool(aither_agent::websearch::WebSearchTool::default())
         .tool(aither_agent::webfetch::WebFetchTool::new())
         .tool(aither_agent::TodoTool::new())
@@ -532,12 +535,12 @@ async fn build_agent(
         }
     }
 
-    // Create SubagentTool and register as bash IPC command
+    // Create SubagentTool and register as a terminal IPC command
     // Set base_dir to sandbox directory so paths like .subagents/ resolve correctly
     let subagent_tool = SubagentTool::new(cloud)
         .with_builtins()
         .with_base_dir(builder.sandbox_dir().to_string())
-        .with_bash_tool_factory(builder.bash_tool_factory());
+        .with_terminal_tool_factory(builder.terminal_tool_factory());
     let mut subagent_desc = String::from("Spawn subagent for complex tasks (types: ");
     let subagent_names: Vec<_> = subagent_tool
         .type_descriptions()

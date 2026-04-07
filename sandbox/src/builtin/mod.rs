@@ -9,7 +9,7 @@ pub use terminal::{
     ReadTerminalDeltaArgs, ReadTerminalDeltaTool,
 };
 
-use leash::IpcRouter;
+use heel::IpcRouter;
 
 /// Creates an IPC router with built-in commands (excluding ask, which needs LLM).
 #[must_use]

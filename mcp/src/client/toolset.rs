@@ -7,6 +7,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use aither_core::llm::tool::ToolDefinition;
+use aither_sandbox::{CommandPayload, ToolRegistryBuilder};
 use async_channel::{Receiver, Sender};
 use serde::Deserialize;
 
@@ -359,6 +360,71 @@ impl McpConnection {
             Self::Stdio { client, .. } => client.close().await,
         }
     }
+}
+
+fn call_result_to_terminal_payload(
+    result: CallToolResult,
+) -> Result<Option<CommandPayload>, String> {
+    let CallToolResult { content, is_error } = result;
+    let all_text = content
+        .iter()
+        .all(|item| matches!(item, crate::Content::Text(_)));
+
+    if all_text {
+        let text = content
+            .into_iter()
+            .filter_map(|item| match item {
+                crate::Content::Text(text_content) => Some(text_content.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if is_error {
+            Err(text)
+        } else {
+            Ok(Some(CommandPayload::Text { content: text }))
+        }
+    } else {
+        let value = serde_json::to_value(CallToolResult { content, is_error })
+            .map_err(|error| format!("failed to encode MCP tool result: {error}"))?;
+        if is_error {
+            Err(value.to_string())
+        } else {
+            Ok(Some(CommandPayload::Json { value }))
+        }
+    }
+}
+
+/// Registers all tools from an MCP connection as schema-driven terminal commands.
+///
+/// Each command derives its help text, positional arguments, and validation
+/// behavior from the MCP tool's JSON schema via
+/// [`aither_sandbox::ToolRegistryBuilder::configure_definition_handler`].
+pub fn register_terminal_commands(
+    registry: &mut ToolRegistryBuilder,
+    conn: McpConnection,
+) -> Vec<ToolDefinition> {
+    let definitions = conn.definitions();
+    let conn = std::sync::Arc::new(async_lock::Mutex::new(conn));
+
+    for definition in definitions.iter().cloned() {
+        let tool_name = definition.name().to_string();
+        let conn = conn.clone();
+        registry.configure_definition_handler(definition, move |arguments| {
+            let conn = conn.clone();
+            let tool_name = tool_name.clone();
+            Box::pin(async move {
+                let mut conn = conn.lock().await;
+                let result = conn
+                    .call(tool_name.as_str(), arguments)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                call_result_to_terminal_payload(result)
+            })
+        });
+    }
+
+    definitions
 }
 
 impl McpToolService {

@@ -34,12 +34,16 @@ pub enum ResponsesStreamEvent {
     OutputItemAdded {
         item: ResponsesOutputItem,
         #[serde(default)]
+        item_id: Option<String>,
+        #[serde(default)]
         output_index: usize,
     },
     /// Output item done
     #[serde(rename = "response.output_item.done")]
     OutputItemDone {
         item: ResponsesOutputItem,
+        #[serde(default)]
+        item_id: Option<String>,
         #[serde(default)]
         output_index: usize,
     },

@@ -1,4 +1,4 @@
-//! Background job registry for tracking and managing background bash tasks.
+//! Background job registry for tracking and managing background terminal tasks.
 //!
 //! Uses an internal command channel to avoid shared locks.
 
@@ -9,7 +9,7 @@ use std::time::Instant;
 use async_channel::{Receiver, Sender};
 use futures_lite::io::AsyncWriteExt;
 
-use crate::permission::BashMode;
+use crate::permission::TerminalMode;
 
 /// Information about a running or completed background job.
 #[derive(Debug, Clone)]
@@ -23,7 +23,7 @@ pub struct JobInfo {
     /// The script that was executed.
     pub script: String,
     /// The permission mode used.
-    pub mode: BashMode,
+    pub mode: TerminalMode,
     /// When the job was started.
     pub started_at: Instant,
     /// Current status of the job.
@@ -95,7 +95,7 @@ enum JobCommand {
         task_id: String,
         execution_key: String,
         script: String,
-        mode: BashMode,
+        mode: TerminalMode,
         output_path: Option<PathBuf>,
     },
     AttachTerminalInput {
@@ -204,7 +204,7 @@ impl JobRegistry {
         task_id: &str,
         execution_key: &str,
         script: &str,
-        mode: BashMode,
+        mode: TerminalMode,
         output_path: Option<PathBuf>,
     ) {
         self.tx
@@ -283,7 +283,7 @@ impl JobRegistry {
     }
 
     /// Sends bytes to a running task terminal stdin.
-    pub async fn input_terminal(&self, task_id: &str, bytes: Vec<u8>) -> Result<(), String> {
+    pub async fn terminal_input(&self, task_id: &str, bytes: Vec<u8>) -> Result<(), String> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
             .send(JobCommand::InputTerminal {
@@ -353,7 +353,7 @@ impl JobRegistry {
     }
 
     /// Returns terminal output added since the provided cursor.
-    pub async fn read_terminal_delta(
+    pub async fn terminal_read(
         &self,
         task_id: &str,
         cursor: usize,
@@ -776,7 +776,7 @@ impl JobRegistryService {
                 } => {
                     let result = if let Some(pid) = find_pid_by_task_id(&jobs, &task_id) {
                         if let Some(job) = jobs.get(&pid) {
-                            read_terminal_delta(job, cursor, max_bytes)
+                            terminal_read(job, cursor, max_bytes)
                         } else {
                             Err(format!("unknown task_id: {task_id}"))
                         }
@@ -1007,11 +1007,7 @@ fn format_running_jobs(jobs: &HashMap<u32, JobState>) -> String {
     output
 }
 
-fn read_terminal_delta(
-    job: &JobState,
-    cursor: usize,
-    max_bytes: usize,
-) -> Result<TerminalDelta, String> {
+fn terminal_read(job: &JobState, cursor: usize, max_bytes: usize) -> Result<TerminalDelta, String> {
     let total_bytes = job.terminal_buffer.len();
     if cursor > total_bytes {
         return Err(format!(
@@ -1050,7 +1046,7 @@ mod tests {
                 "amber-forest-thunder-pearl",
                 "exec-test",
                 "sleep 10",
-                BashMode::Network,
+                TerminalMode::Network,
                 Some(PathBuf::from("outputs/12345.txt")),
             )
             .await;
@@ -1075,10 +1071,24 @@ mod tests {
             .detach();
 
         registry
-            .register(1, "task-a", "exec-a", "echo hello", BashMode::Network, None)
+            .register(
+                1,
+                "task-a",
+                "exec-a",
+                "echo hello",
+                TerminalMode::Network,
+                None,
+            )
             .await;
         registry
-            .register(2, "task-b", "exec-b", "sleep 5", BashMode::Network, None)
+            .register(
+                2,
+                "task-b",
+                "exec-b",
+                "sleep 5",
+                TerminalMode::Network,
+                None,
+            )
             .await;
         registry.complete(2, 0, None).await;
 
@@ -1103,7 +1113,7 @@ mod tests {
                 "task-stream",
                 "exec-stream",
                 "printf one",
-                BashMode::Network,
+                TerminalMode::Network,
                 None,
             )
             .await;
@@ -1142,24 +1152,21 @@ mod tests {
                 "task-delta",
                 "exec-delta",
                 "tail -f log",
-                BashMode::Network,
+                TerminalMode::Network,
                 None,
             )
             .await;
         registry.append_stdout(202, b"hello ".to_vec()).await;
         registry.append_stderr(202, b"world".to_vec()).await;
 
-        let first = registry
-            .read_terminal_delta("task-delta", 0, 6)
-            .await
-            .unwrap();
+        let first = registry.terminal_read("task-delta", 0, 6).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&first.bytes), "hello ");
         assert_eq!(first.cursor, 6);
         assert_eq!(first.total_bytes, 11);
         assert!(matches!(first.status, JobStatus::Running));
 
         let second = registry
-            .read_terminal_delta("task-delta", first.cursor, 32)
+            .terminal_read("task-delta", first.cursor, 32)
             .await
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&second.bytes), "world");
@@ -1175,7 +1182,14 @@ mod tests {
             .detach();
 
         registry
-            .register(1, "task-a", "exec-a", "echo hello", BashMode::Network, None)
+            .register(
+                1,
+                "task-a",
+                "exec-a",
+                "echo hello",
+                TerminalMode::Network,
+                None,
+            )
             .await;
         registry.complete(1, 0, None).await;
 
@@ -1196,7 +1210,7 @@ mod tests {
                 "task-kill-switch",
                 "exec-kill-switch",
                 "sleep 10",
-                BashMode::Network,
+                TerminalMode::Network,
                 None,
             )
             .await;
@@ -1222,7 +1236,7 @@ mod tests {
                 "task-killed-complete",
                 "exec-killed-complete",
                 "sleep 10",
-                BashMode::Network,
+                TerminalMode::Network,
                 None,
             )
             .await;

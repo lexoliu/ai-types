@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-use aither_core::llm::{Tool, ToolOutput, tool::json};
+use aither_core::llm::{Tool, ToolResult, tool::json};
 use anyhow::{Result, anyhow};
 use arc_swap::ArcSwap;
 use async_fs::{
@@ -176,8 +176,9 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
     }
 
     type Arguments = FsOperation;
+    type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
         match arguments {
             FsOperation::Read { path } => {
                 let content = self
@@ -185,7 +186,7 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                     .read_file(Path::new(&path))
                     .await
                     .map_err(anyhow::Error::new)?;
-                Ok(ToolOutput::text(content))
+                Ok(ToolResult::text(content))
             }
             FsOperation::Write { path, content } => {
                 self.ensure_writable()?;
@@ -193,7 +194,7 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                     .write_file(Path::new(&path), content)
                     .await
                     .map_err(anyhow::Error::new)?;
-                Ok(ToolOutput::Done)
+                Ok(ToolResult::Done)
             }
             FsOperation::Append { path, content } => {
                 self.ensure_writable()?;
@@ -201,7 +202,7 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                     .append_file(Path::new(&path), content)
                     .await
                     .map_err(anyhow::Error::new)?;
-                Ok(ToolOutput::Done)
+                Ok(ToolResult::Done)
             }
             FsOperation::Delete { path } => {
                 self.ensure_writable()?;
@@ -209,7 +210,7 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                     .remove_file(Path::new(&path))
                     .await
                     .map_err(anyhow::Error::new)?;
-                Ok(ToolOutput::Done)
+                Ok(ToolResult::Done)
             }
             FsOperation::List { path } => {
                 let listing = self
@@ -217,11 +218,11 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                     .list_dir(path.as_deref().map_or(Path::new(""), Path::new))
                     .await
                     .map_err(anyhow::Error::new)?;
-                Ok(ToolOutput::text(json(&listing)))
+                Ok(ToolResult::text(json(&listing)))
             }
             FsOperation::Glob { pattern } => {
                 let matches = self.filesystem.glob(&pattern)?;
-                Ok(ToolOutput::text(json(&matches)))
+                Ok(ToolResult::text(json(&matches)))
             }
         }
     }

@@ -1,7 +1,7 @@
 <system-reminder>
-A bash command is running in background (task_id={{ task_id }}).
+A terminal command is running in background (task_id={{ task_id }}).
 Current output snapshot (first max_lines):
 {{ output_preview }}
 Full redirected output file: {{ output_file }}
-Use read_terminal_delta for incremental reads, read the stored file via bash when needed, use input_terminal for stdin, and kill_terminal to stop it.
+Use terminal_read for incremental reads, read the stored file via terminal commands when needed, use terminal_input for stdin, and terminal_kill to stop it.
 </system-reminder>

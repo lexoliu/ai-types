@@ -51,7 +51,7 @@ use std::borrow::Cow;
 use std::io::Cursor;
 use std::time::{Duration, Instant};
 
-use aither_core::llm::{Tool, ToolOutput};
+use aither_core::llm::{Tool, ToolResult};
 use anyhow::{Result, anyhow};
 use regex::Regex;
 use schemars::JsonSchema;
@@ -1357,8 +1357,9 @@ impl Tool for WebFetchTool {
     }
 
     type Arguments = WebFetchArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
         let WebFetchArgs {
             url,
             jina_api_key,
@@ -1367,13 +1368,13 @@ impl Tool for WebFetchTool {
 
         // Check whitelist/blacklist
         if !self.is_url_allowed(&url) {
-            return Ok(ToolOutput::text(format!("URL not allowed: {url}")));
+            return Ok(ToolResult::text(format!("URL not allowed: {url}")));
         }
 
         // Check if URL looks like an image
         if is_image_url(&url) {
             let (jpeg_data, mime) = fetch_image(&url).await?;
-            return Ok(ToolOutput::image(jpeg_data, &mime));
+            return Ok(ToolResult::image(jpeg_data, &mime));
         }
 
         let mut request = FetchRequest::new(url.clone());
@@ -1420,7 +1421,7 @@ impl Tool for WebFetchTool {
         }
         output.push_str(&result.content);
 
-        Ok(ToolOutput::text(output))
+        Ok(ToolResult::text(output))
     }
 }
 

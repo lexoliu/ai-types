@@ -220,6 +220,19 @@ impl Context {
     /// 4. Recent conversation
     #[must_use]
     pub fn build_messages(&self) -> Vec<Message> {
+        self.build_messages_with_transient_system(&[])
+    }
+
+    /// Builds the full LLM message list with additional transient system messages.
+    ///
+    /// Transient system messages are appended after persistent system blocks,
+    /// reminders, and handoff, but before recent conversation. They are not
+    /// stored inside the context and therefore are not checkpointed.
+    #[must_use]
+    pub fn build_messages_with_transient_system(
+        &self,
+        transient_system: &[String],
+    ) -> Vec<Message> {
         let mut messages = Vec::new();
 
         if !self.system_blocks.is_empty() {
@@ -238,6 +251,10 @@ impl Context {
 
         if let Some(handoff) = &self.handoff {
             messages.push(Message::system(handoff));
+        }
+
+        for content in transient_system {
+            messages.push(Message::system(content.clone()));
         }
 
         messages.extend(self.recent.iter().cloned());
@@ -435,6 +452,27 @@ mod tests {
         assert!(messages[1].content().contains("todo"));
         assert!(messages[2].content().contains("handoff"));
         assert!(messages[3].content().contains("hello"));
+    }
+
+    #[test]
+    fn transient_system_messages_are_inserted_before_recent_conversation() {
+        let mut context = Context::new();
+        context.insert_system(&Memory {
+            content: "base".to_string(),
+        });
+        context.insert_reminder(&Reminder {
+            content: "todo".to_string(),
+        });
+        context.set_handoff("summary");
+        context.push(Message::user("hello"));
+
+        let messages = context.build_messages_with_transient_system(&["hidden".to_string()]);
+        assert_eq!(messages.len(), 5);
+        assert!(messages[0].content().contains("base"));
+        assert!(messages[1].content().contains("todo"));
+        assert!(messages[2].content().contains("handoff"));
+        assert_eq!(messages[3].content(), "hidden");
+        assert!(messages[4].content().contains("hello"));
     }
 
     #[test]

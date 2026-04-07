@@ -736,10 +736,32 @@ fn responses_stream(
 /// Accumulated function call state for Responses API streaming.
 #[derive(Debug, Default)]
 struct FunctionCallAccumulator {
+    item_id: Option<String>,
     call_id: Option<String>,
     name: Option<String>,
     arguments: String,
     emitted: bool,
+}
+
+fn normalize_response_call_id(call_id: Option<String>, fallback: &str) -> String {
+    match call_id {
+        Some(call_id) if !call_id.trim().is_empty() => call_id,
+        _ => fallback.to_string(),
+    }
+}
+
+fn non_empty_response_id(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        if value.trim().is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    })
+}
+
+fn fallback_response_item_id(output_index: usize) -> String {
+    format!("response_output_{output_index}")
 }
 
 fn parse_tool_call_arguments(arguments: &str) -> serde_json::Value {
@@ -789,15 +811,22 @@ fn usage_from_responses(raw: &ResponsesUsage) -> Usage {
 }
 
 fn mark_and_emit_done_function_call(
-    function_calls: &mut HashMap<String, FunctionCallAccumulator>,
-    id: String,
+    function_calls: &mut HashMap<usize, FunctionCallAccumulator>,
+    output_index: usize,
+    item_id: Option<String>,
+    response_id: String,
     call_id: Option<String>,
     name: String,
     arguments: String,
 ) -> ToolCall {
-    let resolved_call_id = call_id.unwrap_or_else(|| id.clone());
+    let fallback_id = non_empty_response_id(item_id.clone())
+        .or_else(|| non_empty_response_id(Some(response_id.clone())))
+        .unwrap_or_else(|| fallback_response_item_id(output_index));
+    let resolved_call_id = normalize_response_call_id(call_id, &fallback_id);
 
-    let acc = function_calls.entry(id).or_default();
+    let acc = function_calls.entry(output_index).or_default();
+    acc.item_id =
+        non_empty_response_id(item_id).or_else(|| non_empty_response_id(Some(response_id)));
     acc.call_id = Some(resolved_call_id.clone());
     acc.name = Some(name.clone());
     acc.arguments = arguments.clone();
@@ -811,15 +840,20 @@ fn mark_and_emit_done_function_call(
 }
 
 fn drain_pending_function_calls(
-    function_calls: HashMap<String, FunctionCallAccumulator>,
+    function_calls: HashMap<usize, FunctionCallAccumulator>,
 ) -> Vec<ToolCall> {
     function_calls
-        .into_values()
-        .filter(|acc| !acc.emitted)
-        .filter_map(|acc| {
-            let (Some(call_id), Some(name)) = (acc.call_id, acc.name) else {
+        .into_iter()
+        .filter(|(_, acc)| !acc.emitted)
+        .filter_map(|(output_index, acc)| {
+            let Some(name) = acc.name else {
                 return None;
             };
+            let fallback_id = acc
+                .item_id
+                .clone()
+                .unwrap_or_else(|| fallback_response_item_id(output_index));
+            let call_id = normalize_response_call_id(acc.call_id, &fallback_id);
             Some(ToolCall {
                 id: call_id,
                 name,
@@ -829,8 +863,63 @@ fn drain_pending_function_calls(
         .collect()
 }
 
+fn validate_serialized_responses_request(request: &ResponsesRequest) -> Result<(), OpenAIError> {
+    let request_value = serde_json::to_value(request).map_err(OpenAIError::Json)?;
+    let Some(items) = request_value
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+
+    fn find_blank_call_id(value: &serde_json::Value, path: &str) -> Option<(String, String)> {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    let child_path = format!("{path}.{key}");
+                    if key == "call_id"
+                        && let Some(call_id) = child.as_str()
+                        && call_id.trim().is_empty()
+                    {
+                        return Some((child_path, call_id.to_string()));
+                    }
+                    if let Some(found) = find_blank_call_id(child, &child_path) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    let child_path = format!("{path}[{index}]");
+                    if let Some(found) = find_blank_call_id(child, &child_path) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => None,
+        }
+    }
+
+    for (index, item) in items.iter().enumerate() {
+        if let Some((path, call_id)) = find_blank_call_id(item, &format!("input[{index}]")) {
+            let snippet = serde_json::to_string(item).map_err(OpenAIError::Json)?;
+            return Err(OpenAIError::Api(format!(
+                "responses request serialized blank call_id at {path}: {call_id:?}; item={snippet}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Make a responses API SSE request (single attempt).
 async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStreamResult {
+    validate_serialized_responses_request(request)?;
+    let serialized_request = serde_json::to_string(request).map_err(OpenAIError::Json)?;
     let endpoint = cfg.request_url("/responses");
     let mut backend = client();
 
@@ -855,7 +944,14 @@ async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStrea
     .await
     {
         Ok(stream) => Ok(stream),
-        Err(error) => return Err(error),
+        Err(error) => {
+            if error.to_string().contains("call_id") {
+                return Err(OpenAIError::Api(format!(
+                    "{error}\nSerialized responses request: {serialized_request}"
+                )));
+            }
+            Err(error)
+        }
     }
 }
 
@@ -894,6 +990,7 @@ fn responses_stream_inner(
             tool_choice,
             true, // stream: true
         );
+        let serialized_request = serde_json::to_string(&request).unwrap_or_default();
 
         tracing::debug!(request = %serde_json::to_string_pretty(&request).unwrap_or_default(), "Sending responses request");
 
@@ -907,8 +1004,9 @@ fn responses_stream_inner(
         };
         futures_lite::pin!(sse_stream);
 
-        // Accumulate function calls by item_id
-        let mut function_calls: HashMap<String, FunctionCallAccumulator> = HashMap::new();
+        // Accumulate function calls by output_index because provider item identifiers can be
+        // absent or empty on some streamed events.
+        let mut function_calls: HashMap<usize, FunctionCallAccumulator> = HashMap::new();
         let mut usage: Option<Usage> = None;
         let mut usage_emitted = false;
 
@@ -930,7 +1028,13 @@ fn responses_stream_inner(
                             let msg = error.get("message")
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("Unknown API error");
-                            yield Err(OpenAIError::Api(msg.to_string()));
+                            if msg.contains("call_id") {
+                                yield Err(OpenAIError::Api(format!(
+                                    "{msg}\nSerialized responses request: {serialized_request}"
+                                )));
+                            } else {
+                                yield Err(OpenAIError::Api(msg.to_string()));
+                            }
                             return;
                         }
                     }
@@ -954,27 +1058,34 @@ fn responses_stream_inner(
                                         yield Ok(Event::Reasoning(delta));
                                     }
                                 }
-                                ResponsesStreamEvent::OutputItemAdded { item, .. } => {
+                                ResponsesStreamEvent::OutputItemAdded { item, item_id, output_index } => {
                                     // When a function_call item is added, capture id and name
                                     if let ResponsesOutputItem::FunctionCall { id, call_id, name, .. } = item {
-                                        let acc = function_calls.entry(id.clone()).or_default();
-                                        acc.call_id = call_id.or(Some(id));
+                                        let fallback_id = non_empty_response_id(item_id.clone())
+                                            .or_else(|| non_empty_response_id(Some(id.clone())))
+                                            .unwrap_or_else(|| fallback_response_item_id(output_index));
+                                        let acc = function_calls.entry(output_index).or_default();
+                                        acc.item_id = non_empty_response_id(item_id)
+                                            .or_else(|| non_empty_response_id(Some(id)));
+                                        acc.call_id = Some(normalize_response_call_id(call_id, &fallback_id));
                                         acc.name = Some(name);
                                     }
                                 }
-                                ResponsesStreamEvent::FunctionCallArgumentsDelta { delta, item_id, .. } => {
-                                    let acc = function_calls.entry(item_id).or_default();
+                                ResponsesStreamEvent::FunctionCallArgumentsDelta { delta, output_index, .. } => {
+                                    let acc = function_calls.entry(output_index).or_default();
                                     acc.arguments.push_str(&delta);
                                 }
-                                ResponsesStreamEvent::FunctionCallArgumentsDone { arguments, item_id, .. } => {
-                                    let acc = function_calls.entry(item_id).or_default();
+                                ResponsesStreamEvent::FunctionCallArgumentsDone { arguments, output_index, .. } => {
+                                    let acc = function_calls.entry(output_index).or_default();
                                     acc.arguments = arguments;
                                 }
-                                ResponsesStreamEvent::OutputItemDone { item, .. } => {
+                                ResponsesStreamEvent::OutputItemDone { item, item_id, output_index } => {
                                     // Emit function call when item is done
                                     if let ResponsesOutputItem::FunctionCall { id, call_id, name, arguments } = item {
                                         let tool_call = mark_and_emit_done_function_call(
                                             &mut function_calls,
+                                            output_index,
+                                            item_id,
                                             id,
                                             call_id,
                                             name,
@@ -995,12 +1106,24 @@ fn responses_stream_inner(
                                     let msg = error
                                         .and_then(|e| e.message)
                                         .unwrap_or_else(|| "Response failed".to_string());
-                                    yield Err(OpenAIError::Api(msg));
+                                    if msg.contains("call_id") {
+                                        yield Err(OpenAIError::Api(format!(
+                                            "{msg}\nSerialized responses request: {serialized_request}"
+                                        )));
+                                    } else {
+                                        yield Err(OpenAIError::Api(msg));
+                                    }
                                     return;
                                 }
                                 ResponsesStreamEvent::Error { message, .. } => {
                                     let msg = message.unwrap_or_else(|| "Unknown error".to_string());
-                                    yield Err(OpenAIError::Api(msg));
+                                    if msg.contains("call_id") {
+                                        yield Err(OpenAIError::Api(format!(
+                                            "{msg}\nSerialized responses request: {serialized_request}"
+                                        )));
+                                    } else {
+                                        yield Err(OpenAIError::Api(msg));
+                                    }
                                     return;
                                 }
                                 // Ignore other events
@@ -1044,6 +1167,8 @@ mod tests {
         let mut function_calls = HashMap::new();
         let emitted = mark_and_emit_done_function_call(
             &mut function_calls,
+            1,
+            Some("item_1".to_string()),
             "item_1".to_string(),
             Some("call_1".to_string()),
             "search".to_string(),
@@ -1058,8 +1183,9 @@ mod tests {
     fn pending_function_call_is_emitted_once_via_fallback() {
         let mut function_calls = HashMap::new();
         function_calls.insert(
-            "item_2".to_string(),
+            2,
             FunctionCallAccumulator {
+                item_id: Some("item_2".to_string()),
                 call_id: Some("call_2".to_string()),
                 name: Some("lookup".to_string()),
                 arguments: r#"{"id":42}"#.to_string(),
@@ -1070,6 +1196,114 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "call_2");
         assert_eq!(pending[0].name, "lookup");
+    }
+
+    #[test]
+    fn empty_done_call_id_falls_back_to_item_id() {
+        let mut function_calls = HashMap::new();
+        let emitted = mark_and_emit_done_function_call(
+            &mut function_calls,
+            3,
+            Some("item_3".to_string()),
+            "item_3".to_string(),
+            Some(String::new()),
+            "search".to_string(),
+            r#"{"q":"terminal first"}"#.to_string(),
+        );
+        assert_eq!(emitted.id, "item_3");
+    }
+
+    #[test]
+    fn empty_pending_call_id_falls_back_to_item_id() {
+        let mut function_calls = HashMap::new();
+        function_calls.insert(
+            4,
+            FunctionCallAccumulator {
+                item_id: Some("item_4".to_string()),
+                call_id: Some("   ".to_string()),
+                name: Some("lookup".to_string()),
+                arguments: r#"{"id":7}"#.to_string(),
+                emitted: false,
+            },
+        );
+        let pending = drain_pending_function_calls(function_calls);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "item_4");
+        assert_eq!(pending[0].name, "lookup");
+    }
+
+    #[test]
+    fn empty_stream_identifiers_fall_back_to_output_index() {
+        let mut function_calls = HashMap::new();
+        function_calls.insert(
+            12,
+            FunctionCallAccumulator {
+                item_id: None,
+                call_id: None,
+                name: None,
+                arguments: r#"{"q":"may"}"#.to_string(),
+                emitted: false,
+            },
+        );
+        let emitted = mark_and_emit_done_function_call(
+            &mut function_calls,
+            12,
+            None,
+            String::new(),
+            Some(String::new()),
+            "search".to_string(),
+            r#"{"q":"may"}"#.to_string(),
+        );
+        assert_eq!(emitted.id, "response_output_12");
+    }
+
+    #[test]
+    fn serialized_responses_request_rejects_empty_call_id() {
+        let snapshot = ParameterSnapshot::from(&aither_core::llm::model::Parameters::default());
+        let request = ResponsesRequest::new(
+            "gpt-5.4".to_string(),
+            vec![ResponsesInputItem::FunctionCall {
+                kind: "function_call",
+                call_id: String::new(),
+                name: "search".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            &snapshot,
+            None,
+            responses_tool_choice(&snapshot, false),
+            false,
+        );
+
+        let error = validate_serialized_responses_request(&request)
+            .expect_err("empty serialized call_id must fail");
+        assert!(
+            error.to_string().contains("input[0]"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn serialized_responses_request_rejects_whitespace_call_id() {
+        let snapshot = ParameterSnapshot::from(&aither_core::llm::model::Parameters::default());
+        let request = ResponsesRequest::new(
+            "gpt-5.4".to_string(),
+            vec![ResponsesInputItem::FunctionCallOutput {
+                kind: "function_call_output",
+                call_id: "   ".to_string(),
+                output: "{}".to_string(),
+            }],
+            &snapshot,
+            None,
+            responses_tool_choice(&snapshot, false),
+            false,
+        );
+
+        let error = validate_serialized_responses_request(&request)
+            .expect_err("whitespace serialized call_id must fail");
+        assert!(
+            error.to_string().contains("blank call_id"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

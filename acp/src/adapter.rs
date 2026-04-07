@@ -110,7 +110,7 @@ pub const fn todo_status_to_plan_status(status: TodoStatus) -> PlanEntryStatus {
 fn format_tool_title(name: &str, arguments: &str) -> String {
     // Try to extract relevant info from arguments for better titles
     match name {
-        "bash" => {
+        "terminal" => {
             if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
                 if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
                     // Truncate long commands
@@ -163,7 +163,7 @@ fn infer_tool_kind(name: &str) -> ToolKind {
         "read" | "glob" | "grep" | "webfetch" => ToolKind::Read,
         "write" | "edit" => ToolKind::Edit,
         "websearch" => ToolKind::Search,
-        "bash" | "command" => ToolKind::Execute,
+        "terminal" | "command" => ToolKind::Execute,
         _ => ToolKind::Other,
     }
 }
@@ -192,7 +192,7 @@ mod tests {
     fn test_tool_call_conversion() {
         let event = AgentEvent::ToolCallStart {
             id: "123".to_string(),
-            name: "bash".to_string(),
+            name: "terminal".to_string(),
             arguments: r#"{"command": "ls -la"}"#.to_string(),
         };
         let update = agent_event_to_session_update(&event).unwrap();

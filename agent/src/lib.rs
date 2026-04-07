@@ -32,7 +32,6 @@
 // Core modules
 mod agent;
 pub mod ask_user;
-mod bash_agent;
 mod browser_backend;
 mod builder;
 mod checkpoint;
@@ -48,6 +47,7 @@ mod hook;
 mod model_group;
 mod stream;
 mod subagent_file;
+mod terminal_agent;
 mod todo;
 pub mod tool_request;
 mod tools;
@@ -71,12 +71,11 @@ pub use aither_webfetch as webfetch;
 #[cfg(feature = "websearch")]
 pub use aither_websearch as websearch;
 
-// Sandbox is always available (bash-first design)
+// Sandbox is always available (terminal-first design)
 pub use aither_sandbox as sandbox;
 
 // Public API
 pub use agent::{Agent, CompactResult};
-pub use bash_agent::BashAgentBuilder;
 pub use browser_backend::{BrowserBackend, BrowserBackendError, StaticCdpBrowser};
 pub use builder::AgentBuilder;
 pub use checkpoint::AgentCheckpoint;
@@ -94,6 +93,7 @@ pub use hook::{
     StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
 };
 pub use stream::AgentStream;
+pub use terminal_agent::TerminalAgentBuilder;
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoTool, TodoWriteArgs};
 pub use tools::AgentTools;
 
@@ -106,19 +106,19 @@ pub use model_group::{
 pub use aither_attachments::{CacheEntry, FileCache};
 pub use aither_core::llm::Tool;
 
-/// Default system prompt for bash-centric agents.
+/// Default system prompt for terminal-first agents.
 ///
-/// This prompt teaches the LLM to use bash as the primary tool interface,
+/// This prompt teaches the LLM to use `terminal` as the primary tool interface,
 /// with all capabilities exposed as CLI commands that can be piped and composed.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use aither_agent::{Agent, BASH_SYSTEM_PROMPT};
+/// use aither_agent::{Agent, TERMINAL_SYSTEM_PROMPT};
 ///
 /// let agent = Agent::builder(llm)
-///     .system_prompt(BASH_SYSTEM_PROMPT)
-///     .bash(permission_handler, config, output_store)
+///     .system_prompt(TERMINAL_SYSTEM_PROMPT)
+///     .terminal(permission_handler, config, output_store)
 ///     .build();
 /// ```
-pub const BASH_SYSTEM_PROMPT: &str = include_str!("prompts/system.md");
+pub const TERMINAL_SYSTEM_PROMPT: &str = include_str!("prompts/system.md");

@@ -7,7 +7,7 @@ use std::borrow::Cow;
 
 use aither_core::{
     LanguageModel,
-    llm::{Tool, ToolOutput},
+    llm::{Tool, ToolResult},
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -96,8 +96,9 @@ where
     }
 
     type Arguments = SubAgentQuery;
+    type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
         // Create a fresh agent for this call
         let mut builder = Agent::builder(self.llm.clone());
 
@@ -111,7 +112,7 @@ where
             .query(&args.task)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        Ok(ToolOutput::text(result))
+        Ok(ToolResult::text(result))
     }
 }
 

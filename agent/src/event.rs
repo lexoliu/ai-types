@@ -3,11 +3,12 @@
 use crate::context_window::ContextWindowPhase;
 use crate::error::AgentError;
 use crate::hook::CheckpointReason;
+use aither_core::llm::ToolResult;
 
 /// Reason why an agent run is paused or resumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunPauseReason {
-    /// Waiting for a bash permission approval.
+    /// Waiting for a terminal permission approval.
     PermissionRequest,
     /// Waiting for an `ask_user` response.
     AskUser,
@@ -48,8 +49,8 @@ pub enum AgentEvent {
         id: String,
         /// Name of the tool that was called.
         name: String,
-        /// Result of the tool execution (Ok = success text, Err = error text).
-        result: Result<String, String>,
+        /// Structured result of the tool execution.
+        result: ToolResult,
     },
 
     /// Agent turn completed (may have more turns if tools were called).
@@ -74,7 +75,7 @@ pub enum AgentEvent {
         message_count: usize,
     },
 
-    /// A bash command was promoted to a background task.
+    /// A terminal command was promoted to a background task.
     BackgroundTaskStarted {
         /// Background task identifier.
         task_id: String,
@@ -189,7 +190,7 @@ impl AgentEvent {
         Self::ToolCallEnd {
             id: id.into(),
             name: name.into(),
-            result: Ok(result.into()),
+            result: ToolResult::text(result),
         }
     }
 
@@ -203,7 +204,7 @@ impl AgentEvent {
         Self::ToolCallEnd {
             id: id.into(),
             name: name.into(),
-            result: Err(error.into()),
+            result: ToolResult::error(error),
         }
     }
 

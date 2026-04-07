@@ -2,7 +2,9 @@
 //!
 //! All registered tools are always loaded into the LLM context.
 
-use aither_core::llm::tool::{Tool, ToolDefinition, ToolOutput, Tools as CoreTools};
+use aither_core::llm::tool::{
+    IntoToolResult, Tool, ToolDefinition, ToolResult, Tools as CoreTools,
+};
 #[cfg(feature = "mcp")]
 use aither_mcp::{McpConnection, McpToolService};
 
@@ -50,22 +52,21 @@ impl AgentTools {
         self.eager.register(tool);
     }
 
-    /// Registers a dynamic bash tool (type-erased).
+    /// Registers a dynamic terminal tool (type-erased).
     ///
-    /// This is used for child bash tools in subagents where the concrete type
+    /// This is used for child terminal tools in subagents where the concrete type
     /// is not known at compile time.
-    pub fn register_dyn_bash(&mut self, dyn_tool: aither_sandbox::DynBashTool) {
+    pub fn register_dyn_terminal(&mut self, dyn_tool: aither_sandbox::DynTerminalTool) {
         use futures_core::Future;
         use std::pin::Pin;
 
         let handler = dyn_tool.handler;
         self.eager
-            .register_dyn(dyn_tool.definition, move |args: &str| -> Pin<Box<dyn Future<Output = aither_core::Result<ToolOutput>> + Send>> {
+            .register_dyn(dyn_tool.definition, move |args: &str| -> Pin<Box<dyn Future<Output = aither_core::Result<ToolResult>> + Send>> {
                 let handler = handler.clone();
                 let args = args.to_string();
                 Box::pin(async move {
-                    let result = handler(&args).await;
-                    Ok(ToolOutput::text(result))
+                    handler(&args).await.into_tool_result()
                 })
             });
     }
@@ -101,7 +102,7 @@ impl AgentTools {
     /// # Errors
     ///
     /// Returns an error if the tool is not found or execution fails.
-    pub async fn call(&self, name: &str, args: &str) -> aither_core::Result<ToolOutput> {
+    pub async fn call(&self, name: &str, args: &str) -> aither_core::Result<ToolResult> {
         if self.eager.definitions().iter().any(|d| d.name() == name) {
             return self.eager.call(name, args).await;
         }
@@ -130,7 +131,7 @@ impl AgentTools {
                 return if result.is_error {
                     Err(anyhow::anyhow!("{output}"))
                 } else {
-                    Ok(ToolOutput::text(output))
+                    output.into_tool_result()
                 };
             }
         }
@@ -203,8 +204,10 @@ mod tests {
 
         type Arguments = DummyArgs;
 
-        async fn call(&self, _args: Self::Arguments) -> aither_core::Result<ToolOutput> {
-            Ok(ToolOutput::text("ok"))
+        type Res = ToolResult;
+
+        async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
+            Ok(ToolResult::text("ok"))
         }
     }
 

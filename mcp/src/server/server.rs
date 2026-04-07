@@ -224,13 +224,21 @@ impl<T: BidirectionalTransport> McpServer<T> {
 
         match self.tools.call(&params.name, &args_str).await {
             Ok(output) => {
-                let text = output.as_str().unwrap_or("").to_string();
+                let text = match output.render_for_model() {
+                    Ok(text) => text,
+                    Err(error) => {
+                        return JsonRpcResponse::error(
+                            req.id,
+                            JsonRpcError::internal_error(error.to_string()),
+                        );
+                    }
+                };
                 let result = CallToolResult {
                     content: vec![crate::protocol::Content::Text(TextContent {
                         text,
                         annotations: None,
                     })],
-                    is_error: false,
+                    is_error: output.is_error(),
                 };
                 JsonRpcResponse::success(req.id, result)
             }

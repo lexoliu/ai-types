@@ -1,8 +1,8 @@
-//! Native terminal control tools for background bash tasks.
+//! Native terminal control tools for background terminal tasks.
 
 use std::borrow::Cow;
 
-use aither_core::llm::{Tool, ToolOutput};
+use aither_core::llm::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -22,25 +22,26 @@ impl KillTerminalTool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct KillTerminalArgs {
-    /// Task identifier returned by bash when the task is backgrounded.
+    /// Task identifier returned by terminal when the task is backgrounded.
     pub task_id: String,
 }
 
 impl Tool for KillTerminalTool {
     fn name(&self) -> Cow<'static, str> {
-        "kill_terminal".into()
+        "terminal_kill".into()
     }
 
     type Arguments = KillTerminalArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
         let task_id = args.task_id.trim();
         if task_id.is_empty() {
             return Err(anyhow::anyhow!("task_id must not be empty"));
         }
 
         let killed = self.registry.kill_by_task_id(task_id).await;
-        ToolOutput::json(&serde_json::json!({
+        ToolResult::json(&serde_json::json!({
             "ok": killed,
             "task_id": task_id,
             "killed": killed,
@@ -67,7 +68,7 @@ impl InputTerminalTool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InputTerminalArgs {
-    /// Task identifier returned by bash when the task is backgrounded.
+    /// Task identifier returned by terminal when the task is backgrounded.
     pub task_id: String,
     /// Raw bytes encoded as UTF-8 text written to terminal stdin.
     pub input: String,
@@ -82,12 +83,13 @@ const fn default_append_newline() -> bool {
 
 impl Tool for InputTerminalTool {
     fn name(&self) -> Cow<'static, str> {
-        "input_terminal".into()
+        "terminal_input".into()
     }
 
     type Arguments = InputTerminalArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
         let task_id = args.task_id.trim();
         if task_id.is_empty() {
             return Err(anyhow::anyhow!("task_id must not be empty"));
@@ -99,11 +101,11 @@ impl Tool for InputTerminalTool {
         }
 
         self.registry
-            .input_terminal(task_id, bytes)
+            .terminal_input(task_id, bytes)
             .await
             .map_err(anyhow::Error::msg)?;
 
-        ToolOutput::json(&serde_json::json!({
+        ToolResult::json(&serde_json::json!({
             "ok": true,
             "task_id": task_id,
         }))
@@ -124,7 +126,7 @@ impl ReadTerminalDeltaTool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReadTerminalDeltaArgs {
-    /// Task identifier returned by bash when the task is backgrounded.
+    /// Task identifier returned by terminal when the task is backgrounded.
     pub task_id: String,
     /// Read only bytes after this cursor offset.
     #[serde(default)]
@@ -153,12 +155,13 @@ fn job_status_payload(status: &JobStatus) -> serde_json::Value {
 
 impl Tool for ReadTerminalDeltaTool {
     fn name(&self) -> Cow<'static, str> {
-        "read_terminal_delta".into()
+        "terminal_read".into()
     }
 
     type Arguments = ReadTerminalDeltaArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
         let task_id = args.task_id.trim();
         if task_id.is_empty() {
             return Err(anyhow::anyhow!("task_id must not be empty"));
@@ -169,11 +172,11 @@ impl Tool for ReadTerminalDeltaTool {
 
         let delta = self
             .registry
-            .read_terminal_delta(task_id, args.cursor, args.max_bytes)
+            .terminal_read(task_id, args.cursor, args.max_bytes)
             .await
             .map_err(anyhow::Error::msg)?;
 
-        ToolOutput::json(&serde_json::json!({
+        ToolResult::json(&serde_json::json!({
             "ok": true,
             "task_id": delta.task_id,
             "cursor": delta.cursor,

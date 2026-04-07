@@ -16,7 +16,7 @@ use crate::protocol::{
 /// Transport that spawns and communicates with a child process.
 ///
 /// This is typically used to connect to MCP servers that run as separate processes,
-/// such as npm packages or standalone binaries.
+/// such as JavaScript packages launched through Bun or standalone binaries.
 pub struct ChildProcessTransport {
     /// Child process handle.
     child: Child,

@@ -293,14 +293,11 @@ fn tool_impl(args: ToolArgs, input_fn: ItemFn) -> syn::Result<proc_macro2::Token
                 #tool_name.into()
             }
             type Arguments = #args_type;
+            type Res = ::aither::llm::ToolResult;
 
-            async fn call(&self, args: Self::Arguments) -> ::aither::Result<::aither::llm::ToolOutput> {
+            async fn call(&self, args: Self::Arguments) -> ::aither::Result<Self::Res> {
                 #extractor
-                let result: ::aither::Result<_> = #call_expr;
-                result.map(|value| {
-                    // Convert the result to a JSON ToolOutput
-                    ::aither::llm::ToolOutput::text(::aither::llm::tool::json(&value))
-                })
+                ::aither::llm::IntoToolResult::into_tool_result(#call_expr)
             }
         }
     };

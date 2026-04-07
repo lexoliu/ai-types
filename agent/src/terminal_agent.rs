@@ -1,8 +1,8 @@
-//! Bash-centric agent builder with stateless bash execution and native terminal controls.
+//! Terminal-first agent builder with stateless terminal execution and native terminal controls.
 //!
 //! This module provides a streamlined API for creating agents where:
-//! - **LLM perspective**: core execution happens via `bash`, with native terminal tools
-//! - **Developer perspective**: domain tools are registered as bash CLI commands
+//! - **LLM perspective**: core execution happens via `terminal`, with native terminal tools
+//! - **Developer perspective**: domain tools are registered as IPC-backed terminal commands
 //!
 //! # Architecture
 //!
@@ -10,7 +10,7 @@
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                         Agent                               │
 //! │  ┌─────────────────────────────────────────────────────┐   │
-//! │  │                    bash tool                         │   │
+//! │  │                  terminal command tool                  │   │
 //! │  │  ┌─────────────────────────────────────────────┐    │   │
 //! │  │  │              Sandbox (IPC)                   │    │   │
 //! │  │  │  websearch | webfetch | todo | task | ...   │    │   │
@@ -22,21 +22,25 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use aither_agent::bash_agent::BashAgentBuilder;
+//! use aither_agent::terminal_agent::TerminalAgentBuilder;
 //!
-//! let agent = BashAgentBuilder::new(llm, bash_tool)
-//!     .tool(WebSearchTool::default())  // Becomes `websearch` bash command
-//!     .tool(WebFetchTool::new())       // Becomes `webfetch` bash command
-//!     .tool(SubagentTool::new(llm))    // Becomes `subagent` bash command
+//! let agent = TerminalAgentBuilder::new(llm, terminal_tool)
+//!     .tool(WebSearchTool::default())  // Becomes `websearch` terminal command
+//!     .tool(WebFetchTool::new())       // Becomes `webfetch` terminal command
+//!     .tool(SubagentTool::new(llm))    // Becomes `subagent` terminal command
 //!     .build();
 //! ```
 
 use std::borrow::Cow;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use aither_core::LanguageModel;
 use aither_core::llm::Tool;
 use aither_core::llm::tool::ToolDefinition;
+#[cfg(feature = "mcp")]
+use aither_mcp::McpConnection;
 #[cfg(feature = "skills")]
 use aither_skills::SkillRegistry;
 use askama::Template;
@@ -49,12 +53,12 @@ use crate::hook::Hook;
 use crate::{Agent, AgentBuilder, config::AgentKind, context::serialize_xml};
 use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool, ReadTerminalDeltaTool};
 use aither_sandbox::{
-    BashTool, BashToolFactory, BashToolFactoryReceiver, ContainerShellRuntime, PermissionHandler,
-    ShellRuntimeAvailability, ShellSessionRegistry, SshServer, SshSessionAuthorizer,
-    ToolRegistryBuilder, Unconfigured, bash_tool_factory_channel,
+    CommandPayload, ContainerShellRuntime, PermissionHandler, ShellRuntimeAvailability,
+    ShellSessionRegistry, SshServer, SshSessionAuthorizer, TerminalTool, TerminalToolFactory,
+    TerminalToolFactoryReceiver, ToolRegistryBuilder, Unconfigured, terminal_tool_factory_channel,
 };
 
-/// System prompt template for bash-centric agents.
+/// System prompt template for terminal-first agents.
 #[derive(Template)]
 #[template(path = "system.txt", escape = "none")]
 struct SystemPrompt {
@@ -142,21 +146,21 @@ pub struct SubagentInfo {
     pub path: String,
 }
 
-/// Builder for creating bash-centric agents.
+/// Builder for creating terminal-first agents.
 ///
-/// All registered tools become IPC commands accessible via bash.
-/// The LLM only sees the `bash` tool.
-pub struct BashAgentBuilder<LLM, P, E, H = ()>
+/// All registered tools become IPC commands accessible via `terminal`.
+/// The LLM only sees the `terminal` tool.
+pub struct TerminalAgentBuilder<LLM, P, E, H = ()>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     inner: AgentBuilder<LLM, LLM, LLM, H>,
-    bash_tool: BashTool<P, E, Unconfigured>,
+    terminal_tool: TerminalTool<P, E, Unconfigured>,
     registry_builder: ToolRegistryBuilder,
-    bash_tool_factory: BashToolFactory,
-    bash_tool_factory_receiver: Option<BashToolFactoryReceiver>,
+    terminal_tool_factory: TerminalToolFactory,
+    terminal_tool_factory_receiver: Option<TerminalToolFactoryReceiver>,
     tool_descriptions: Vec<(String, String)>,
     skills: Vec<SkillInfo>,
     subagents: Vec<SubagentInfo>,
@@ -165,14 +169,14 @@ where
     skill_registry: Option<SkillRegistry>,
 }
 
-impl<LLM, P, E, H> std::fmt::Debug for BashAgentBuilder<LLM, P, E, H>
+impl<LLM, P, E, H> std::fmt::Debug for TerminalAgentBuilder<LLM, P, E, H>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BashAgentBuilder")
+        f.debug_struct("TerminalAgentBuilder")
             .field("tool_count", &self.tool_descriptions.len())
             .field("skill_count", &self.skills.len())
             .field("subagent_count", &self.subagents.len())
@@ -180,19 +184,20 @@ where
     }
 }
 
-impl<LLM, P, E> BashAgentBuilder<LLM, P, E, ()>
+impl<LLM, P, E> TerminalAgentBuilder<LLM, P, E, ()>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
-    /// Creates a new bash-centric agent builder.
+    /// Creates a new terminal-first agent builder.
     ///
-    /// Creates the agent with native tools (`kill_terminal`, `input_terminal`,
-    /// `read_terminal_delta`, `bash`) and IPC commands accessible through
-    /// bash (registered via `.tool()`).
-    pub fn new(llm: LLM, mut bash_tool: BashTool<P, E, Unconfigured>) -> Self {
-        let (bash_tool_factory, bash_tool_factory_receiver) = bash_tool_factory_channel();
+    /// Creates the agent with native tools (`terminal_kill`, `terminal_input`,
+    /// `terminal_read`, `terminal`) and IPC commands accessible through
+    /// `terminal` (registered via `.tool()`).
+    pub fn new(llm: LLM, mut terminal_tool: TerminalTool<P, E, Unconfigured>) -> Self {
+        let (terminal_tool_factory, terminal_tool_factory_receiver) =
+            terminal_tool_factory_channel();
         let registry_builder = ToolRegistryBuilder::new();
         let mut tool_descriptions = Vec::new();
 
@@ -202,11 +207,11 @@ where
             ssh: false,
         });
 
-        let job_registry = bash_tool.job_registry();
+        let job_registry = terminal_tool.job_registry();
         let kill_terminal_tool = KillTerminalTool::new(job_registry.clone());
         let input_terminal_tool = InputTerminalTool::new(job_registry.clone());
         let read_terminal_delta_tool = ReadTerminalDeltaTool::new(job_registry);
-        bash_tool = bash_tool.with_shell_sessions(shell_sessions.clone());
+        terminal_tool = terminal_tool.with_shell_sessions(shell_sessions.clone());
 
         let kill_def = ToolDefinition::new(&kill_terminal_tool);
         tool_descriptions.push((
@@ -231,10 +236,10 @@ where
 
         Self {
             inner,
-            bash_tool,
+            terminal_tool,
             registry_builder,
-            bash_tool_factory,
-            bash_tool_factory_receiver: Some(bash_tool_factory_receiver),
+            terminal_tool_factory,
+            terminal_tool_factory_receiver: Some(terminal_tool_factory_receiver),
             tool_descriptions,
             skills: Vec::new(),
             subagents: Vec::new(),
@@ -245,7 +250,7 @@ where
     }
 }
 
-impl<LLM, P, E, H> BashAgentBuilder<LLM, P, E, H>
+impl<LLM, P, E, H> TerminalAgentBuilder<LLM, P, E, H>
 where
     LLM: LanguageModel + Clone,
     P: PermissionHandler + 'static,
@@ -273,7 +278,7 @@ where
         kind: &str,
     ) -> Result<Self, crate::AgentError> {
         let abs_path = Self::resolve_absolute_dir(source_path, kind).await?;
-        self.bash_tool = self.bash_tool.with_readable_paths([abs_path]);
+        self.terminal_tool = self.terminal_tool.with_readable_paths([abs_path]);
         Ok(self)
     }
 
@@ -284,7 +289,7 @@ where
         link_name: &str,
     ) -> Result<Self, crate::AgentError> {
         let abs_path = Self::resolve_absolute_dir(source_path, kind).await?;
-        let symlink_path = self.bash_tool.working_dir().join(link_name);
+        let symlink_path = self.terminal_tool.working_dir().join(link_name);
 
         match fs::symlink_metadata(&symlink_path).await {
             Ok(metadata) => {
@@ -345,28 +350,28 @@ where
                 })?;
         }
 
-        self.bash_tool = self.bash_tool.with_readable_paths([abs_path]);
+        self.terminal_tool = self.terminal_tool.with_readable_paths([abs_path]);
         Ok(self)
     }
 
-    /// Sets runtime shell backend availability for `bash`.
+    /// Sets runtime shell backend availability for `terminal`.
     pub fn shell_runtime_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
         self.shell_sessions = self.shell_sessions.with_availability(availability.clone());
-        self.bash_tool = self
-            .bash_tool
+        self.terminal_tool = self
+            .terminal_tool
             .with_shell_sessions(self.shell_sessions.clone())
             .with_shell_runtime_availability(availability);
         self
     }
 
-    /// Sets preconfigured SSH targets that can be used by `bash` with ssh mode.
+    /// Sets preconfigured SSH targets that can be used by `terminal` with ssh mode.
     pub fn ssh_servers(mut self, servers: Vec<SshServer>) -> Self {
         self.shell_sessions = self
             .shell_sessions
             .with_ssh_servers(servers)
             .expect("invalid ssh server configuration");
-        self.bash_tool = self
-            .bash_tool
+        self.terminal_tool = self
+            .terminal_tool
             .with_shell_sessions(self.shell_sessions.clone());
         self
     }
@@ -374,8 +379,8 @@ where
     /// Sets the SSH session authorizer for interactive connect/install consent prompts.
     pub fn ssh_authorizer(mut self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
         self.shell_sessions = self.shell_sessions.with_ssh_authorizer(authorizer);
-        self.bash_tool = self
-            .bash_tool
+        self.terminal_tool = self
+            .terminal_tool
             .with_shell_sessions(self.shell_sessions.clone());
         self
     }
@@ -383,20 +388,20 @@ where
     /// Sets the container runtime for container-backed shell sessions.
     pub fn container_runtime(mut self, runtime: ContainerShellRuntime) -> Self {
         self.shell_sessions = self.shell_sessions.with_container_runtime(runtime.clone());
-        self.bash_tool = self.bash_tool.with_container_runtime(runtime);
+        self.terminal_tool = self.terminal_tool.with_container_runtime(runtime);
         self
     }
 
-    /// Registers a tool as an IPC command accessible via bash.
+    /// Registers a tool as an IPC command accessible via `terminal`.
     ///
-    /// The tool becomes a bash command with the same name.
+    /// The tool becomes a terminal command with the same name.
     /// For example, `WebSearchTool` becomes the `websearch` command.
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// builder.tool(WebSearchTool::default())
-    /// // LLM can now call: bash -c 'websearch "rust async"'
+    /// // LLM can now call: terminal({ script: "websearch \"rust async\"" })
     /// ```
     pub fn tool<T>(mut self, tool: T) -> Self
     where
@@ -410,6 +415,44 @@ where
         self.tool_descriptions
             .push((name, short_description(description)));
         self.registry_builder.configure_tool(tool);
+        self
+    }
+
+    /// Registers a schema-defined command on the terminal IPC bridge.
+    ///
+    /// This is the dynamic counterpart to [`Self::tool`]. The command wrapper
+    /// is still derived entirely from the tool definition schema, so `--help`,
+    /// positional arguments, and validation all stay automatic.
+    pub fn definition_handler<F>(mut self, definition: ToolDefinition, handler: F) -> Self
+    where
+        F: Fn(
+                serde_json::Value,
+            )
+                -> Pin<Box<dyn Future<Output = Result<Option<CommandPayload>, String>> + Send>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let name = definition.name().to_string();
+        let description = definition.description().to_string();
+        self.tool_descriptions
+            .push((name, short_description(description.as_str())));
+        self.registry_builder
+            .configure_definition_handler(definition, handler);
+        self
+    }
+
+    /// Registers all tools from one MCP connection as terminal commands.
+    #[cfg(feature = "mcp")]
+    pub fn mcp_connection(mut self, conn: McpConnection) -> Self {
+        let definitions = aither_mcp::register_terminal_commands(&mut self.registry_builder, conn);
+        self.tool_descriptions
+            .extend(definitions.into_iter().map(|definition| {
+                (
+                    definition.name().to_string(),
+                    short_description(definition.description()),
+                )
+            }));
         self
     }
 
@@ -488,16 +531,16 @@ where
         let host_profile = if availability.container {
             "container"
         } else if availability.local {
-            "leash"
+            "heel"
         } else if availability.ssh {
             "remote"
         } else {
-            panic!("bash agent requires at least one shell backend")
+            panic!("terminal agent requires at least one shell backend")
         };
         let runtime_kind = match host_profile {
             "container" => "linux_container",
             "remote" => "remote_ssh",
-            "leash" => "user_local_machine",
+            "heel" => "user_local_machine",
             _ => unreachable!("validated host profile"),
         };
         let shell_context = serialize_xml(
@@ -528,7 +571,7 @@ where
         let subagents = render_subagent_descriptions(&self.subagents);
 
         // Get directory paths
-        let sandbox_dir = self.bash_tool.working_dir().display().to_string();
+        let sandbox_dir = self.terminal_tool.working_dir().display().to_string();
         let user_cwd =
             std::env::current_dir().map_or_else(|_| ".".to_string(), |p| p.display().to_string());
 
@@ -561,13 +604,13 @@ where
     }
 
     /// Adds a hook to intercept agent operations.
-    pub fn hook<NH: Hook>(self, hook: NH) -> BashAgentBuilder<LLM, P, E, crate::HCons<NH, H>> {
-        BashAgentBuilder {
+    pub fn hook<NH: Hook>(self, hook: NH) -> TerminalAgentBuilder<LLM, P, E, crate::HCons<NH, H>> {
+        TerminalAgentBuilder {
             inner: self.inner.hook(hook),
-            bash_tool: self.bash_tool,
+            terminal_tool: self.terminal_tool,
             registry_builder: self.registry_builder,
-            bash_tool_factory: self.bash_tool_factory,
-            bash_tool_factory_receiver: self.bash_tool_factory_receiver,
+            terminal_tool_factory: self.terminal_tool_factory,
+            terminal_tool_factory_receiver: self.terminal_tool_factory_receiver,
             tool_descriptions: self.tool_descriptions,
             skills: self.skills,
             subagents: self.subagents,
@@ -737,10 +780,10 @@ where
         &self.tool_descriptions
     }
 
-    /// Returns a factory for spawning child bash tools (for subagents).
+    /// Returns a factory for spawning child terminal tools (for subagents).
     #[must_use]
-    pub fn bash_tool_factory(&self) -> BashToolFactory {
-        self.bash_tool_factory.clone()
+    pub fn terminal_tool_factory(&self) -> TerminalToolFactory {
+        self.terminal_tool_factory.clone()
     }
 
     /// Returns a mutable reference to the tool registry builder.
@@ -750,27 +793,29 @@ where
 
     /// Returns the sandbox working directory path.
     pub fn sandbox_dir(&self) -> Cow<'_, str> {
-        self.bash_tool.working_dir().to_string_lossy()
+        self.terminal_tool.working_dir().to_string_lossy()
     }
 
     /// Builds the agent.
     ///
-    /// The returned agent exposes `bash` plus native terminal control tools.
-    /// All registered IPC tools are accessible as bash commands.
+    /// The returned agent exposes `terminal` plus native terminal control tools.
+    /// All registered IPC tools are accessible as terminal commands.
     pub fn build(self) -> Agent<LLM, LLM, LLM, H> {
         // Build registry
-        let registry =
-            std::sync::Arc::new(self.registry_builder.build(self.bash_tool.outputs_dir()));
+        let registry = std::sync::Arc::new(
+            self.registry_builder
+                .build(self.terminal_tool.outputs_dir()),
+        );
 
-        // Configure bash tool
-        let bash_tool = self.bash_tool.with_registry(registry);
+        // Configure terminal tool
+        let terminal_tool = self.terminal_tool.with_registry(registry);
 
         // Start factory service for subagents if requested
-        if let Some(receiver) = self.bash_tool_factory_receiver {
-            bash_tool.start_factory_service(receiver);
+        if let Some(receiver) = self.terminal_tool_factory_receiver {
+            terminal_tool.start_factory_service(receiver);
         }
 
-        let inner = self.inner.bash(bash_tool);
+        let inner = self.inner.terminal(terminal_tool);
         #[cfg(feature = "skills")]
         let inner = if let Some(registry) = self.skill_registry {
             inner.skill_registry(Arc::new(registry))
@@ -855,10 +900,10 @@ fn describe_host_runtime_context(
         }
         "remote" => {
             output.push_str(
-                "Remote SSH runtime. Default mode runs on the configured SSH target with network enabled. Local CLI commands exposed through bash are unavailable unless a local backend also exists. ",
+                "Remote SSH runtime. Default mode runs on the configured SSH target with network enabled. Local CLI commands exposed through terminal are unavailable unless a local backend also exists. ",
             );
         }
-        "leash" => {
+        "heel" => {
             output.push_str(
                 "User machine runtime in sandbox. Default mode has network enabled. Use unsafe for host-level side effects. SSH available: ",
             );
@@ -969,7 +1014,7 @@ mod tests {
     use aither_core::LanguageModel;
     use aither_core::llm::{Event, LLMRequest, Tool, model::Profile as ModelProfile};
     use aither_sandbox::permission::NoopPermissionHandler;
-    use executor_core::DefaultExecutor;
+    use executor_core::tokio::TokioGlobal;
     use futures_core::Stream;
     use schemars::JsonSchema;
     use serde::Deserialize;
@@ -1015,12 +1060,10 @@ mod tests {
         }
 
         type Arguments = MockArgs;
+        type Res = aither_core::llm::ToolResult;
 
-        async fn call(
-            &self,
-            _args: Self::Arguments,
-        ) -> aither_core::Result<aither_core::llm::ToolOutput> {
-            Ok(aither_core::llm::ToolOutput::text("ok"))
+        async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
+            Ok(aither_core::llm::ToolResult::text("ok"))
         }
     }
 
@@ -1029,7 +1072,7 @@ mod tests {
     fn test_types_compile() {
         // This test just ensures the generic constraints are correct
         fn _assert_send_sync<T: Send + Sync>() {}
-        // BashAgentBuilder should be constructible with proper types
+        // TerminalAgentBuilder should be constructible with proper types
     }
 
     #[test]
@@ -1043,14 +1086,14 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_container_profile_excludes_leash_modes() {
+    fn test_system_prompt_container_profile_excludes_heel_modes() {
         let prompt = SystemPrompt {
             os: "macOS".to_string(),
             os_version: "15.0".to_string(),
             arch: "arm64",
             user_cwd: "/tmp/project".to_string(),
             sandbox_dir: "/tmp/sandbox".to_string(),
-            tools: "- bash: Execute shell commands".to_string(),
+            tools: "- terminal: Execute terminal commands".to_string(),
             host_profile: "container",
             host_runtime_context: "runtime=linux_container".to_string(),
             skills: String::new(),
@@ -1069,15 +1112,15 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_leash_profile_includes_shell_modes() {
+    fn test_system_prompt_heel_profile_includes_shell_modes() {
         let prompt = SystemPrompt {
             os: "macOS".to_string(),
             os_version: "15.0".to_string(),
             arch: "arm64",
             user_cwd: "/tmp/project".to_string(),
             sandbox_dir: "/tmp/sandbox".to_string(),
-            tools: "- bash: Execute shell commands".to_string(),
-            host_profile: "leash",
+            tools: "- terminal: Execute terminal commands".to_string(),
+            host_profile: "heel",
             host_runtime_context: "runtime=user_local_machine".to_string(),
             skills: String::new(),
             has_skills: false,
@@ -1086,47 +1129,46 @@ mod tests {
             is_macos: true,
         }
         .render()
-        .expect("failed to render leash prompt");
+        .expect("failed to render heel prompt");
 
         assert!(prompt.contains("<shell-modes>"));
         assert!(!prompt.contains("<shell-runtime>"));
         assert!(prompt.contains("<unsafe>"));
     }
 
-    #[test]
-    fn bash_agent_builder_keeps_ipc_tools_out_of_llm_tool_surface() {
-        futures_lite::future::block_on(async {
-            let dir = tempdir().expect("tempdir should exist");
-            let bash_tool =
-                aither_sandbox::BashTool::<NoopPermissionHandler, DefaultExecutor>::new_exact(
-                    dir.path(),
-                    NoopPermissionHandler,
-                    DefaultExecutor,
-                )
-                .await
-                .expect("bash tool should initialize");
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_agent_builder_keeps_ipc_tools_out_of_llm_tool_surface() {
+        let dir = tempdir().expect("tempdir should exist");
+        let terminal_tool =
+            aither_sandbox::TerminalTool::<NoopPermissionHandler, TokioGlobal>::new_exact(
+                dir.path(),
+                NoopPermissionHandler,
+                TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize");
 
-            let agent = BashAgentBuilder::new(MockLlm, bash_tool)
-                .tool(MockTool)
-                .with_default_prompt()
-                .build();
+        let agent = TerminalAgentBuilder::new(MockLlm, terminal_tool)
+            .tool(MockTool)
+            .with_default_prompt()
+            .build();
 
-            let tool_names = agent
-                .tools
-                .definitions()
-                .into_iter()
-                .map(|definition| definition.name().to_string())
-                .collect::<Vec<_>>();
+        let mut tool_names = agent
+            .tools
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name().to_string())
+            .collect::<Vec<_>>();
+        tool_names.sort();
 
-            assert_eq!(
-                tool_names,
-                vec![
-                    "kill_terminal".to_string(),
-                    "input_terminal".to_string(),
-                    "read_terminal_delta".to_string(),
-                    "bash".to_string(),
-                ]
-            );
-        });
+        assert_eq!(
+            tool_names,
+            vec![
+                "terminal".to_string(),
+                "terminal_input".to_string(),
+                "terminal_kill".to_string(),
+                "terminal_read".to_string(),
+            ]
+        );
     }
 }

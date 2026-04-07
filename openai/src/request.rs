@@ -162,7 +162,7 @@ impl ChatCompletionRequest {
             top_logprobs: params.top_logprobs,
             tools,
             tool_choice: tool_choice(params, has_tools),
-            parallel_tool_calls: if has_tools { Some(true) } else { None },
+            parallel_tool_calls: if has_tools { Some(false) } else { None },
             response_format: response_format(params),
             reasoning: reasoning(params),
             prompt_cache_key: params.prompt_cache_key.clone(),
@@ -594,6 +594,23 @@ impl ResponsesInputItem {
     }
 }
 
+fn require_non_empty_call_id<'a>(
+    call_id: Option<&'a str>,
+    message_kind: &str,
+) -> Result<&'a str, OpenAIError> {
+    let Some(call_id) = call_id else {
+        return Err(OpenAIError::Api(format!(
+            "{message_kind} is missing tool_call_id"
+        )));
+    };
+    if call_id.trim().is_empty() {
+        return Err(OpenAIError::Api(format!(
+            "{message_kind} has an empty tool_call_id"
+        )));
+    }
+    Ok(call_id)
+}
+
 #[derive(Debug, Serialize)]
 pub struct ResponsesRequest {
     model: String,
@@ -622,6 +639,8 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ResponsesToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<ResponseTextConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningPayload>,
@@ -642,6 +661,7 @@ impl ResponsesRequest {
         tool_choice: Option<ResponsesToolChoice>,
         stream: bool,
     ) -> Self {
+        let has_tools = tools.as_ref().is_some_and(|items| !items.is_empty());
         Self {
             model,
             input,
@@ -656,6 +676,7 @@ impl ResponsesRequest {
             top_logprobs: params.top_logprobs,
             tools,
             tool_choice,
+            parallel_tool_calls: if has_tools { Some(false) } else { None },
             text: responses_text(params),
             reasoning: reasoning(params),
             include: responses_include(params),
@@ -760,9 +781,11 @@ pub fn to_responses_input(messages: &[Message]) -> Result<Vec<ResponsesInputItem
                     }
                     // Add function call items
                     for tc in tool_calls {
+                        let call_id =
+                            require_non_empty_call_id(Some(tc.id.as_str()), "assistant tool call")?;
                         items.push(ResponsesInputItem::FunctionCall {
                             kind: "function_call",
-                            call_id: tc.id.clone(),
+                            call_id: call_id.to_string(),
                             name: tc.name.clone(),
                             arguments: tc.arguments.to_string(),
                         });
@@ -771,23 +794,40 @@ pub fn to_responses_input(messages: &[Message]) -> Result<Vec<ResponsesInputItem
             }
             Role::Tool => {
                 // Tool results must be sent as FunctionCallOutput
-                if let Some(call_id) = message.tool_call_id() {
-                    items.push(ResponsesInputItem::function_call_output(
-                        call_id,
-                        message.content().to_string(),
-                    ));
-                } else {
-                    // Fallback if no call_id (shouldn't happen)
-                    items.push(ResponsesInputItem::message(
-                        "user",
-                        ResponsesMessageContent::Text(flatten_content(message)),
-                    ));
-                }
+                let call_id = require_non_empty_call_id(message.tool_call_id(), "tool result")?;
+                items.push(ResponsesInputItem::function_call_output(
+                    call_id,
+                    message.content().to_string(),
+                ));
             }
         }
     }
 
+    validate_responses_input(&items)?;
     Ok(items)
+}
+
+fn validate_responses_input(items: &[ResponsesInputItem]) -> Result<(), OpenAIError> {
+    for (index, item) in items.iter().enumerate() {
+        match item {
+            ResponsesInputItem::FunctionCall { call_id, name, .. } => {
+                if call_id.trim().is_empty() {
+                    return Err(OpenAIError::Api(format!(
+                        "responses input[{index}] function_call '{name}' has an empty call_id"
+                    )));
+                }
+            }
+            ResponsesInputItem::FunctionCallOutput { call_id, .. } => {
+                if call_id.trim().is_empty() {
+                    return Err(OpenAIError::Api(format!(
+                        "responses input[{index}] function_call_output has an empty call_id"
+                    )));
+                }
+            }
+            ResponsesInputItem::Message { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn attachment_to_responses_part(url: &Url) -> Result<ResponsesInputContent, OpenAIError> {
@@ -889,6 +929,7 @@ fn prompt_cache_retention(params: &ParameterSnapshot) -> Option<&'static str> {
 mod tests {
     use super::*;
     use aither_core::llm::model::{OpenAIPromptCacheRetention, Parameters, ToolChoice};
+    use aither_core::llm::{Message, ToolCall};
 
     #[test]
     fn chat_json_object_when_structured_outputs_without_schema() {
@@ -933,6 +974,55 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_disables_parallel_tool_calls_when_tools_exist() {
+        let snapshot = ParameterSnapshot::from(&Parameters::default());
+        let req = ChatCompletionRequest::new(
+            "gpt-5".into(),
+            Vec::new(),
+            &snapshot,
+            Some(vec![ToolPayload {
+                r#type: "function",
+                function: ToolFunction {
+                    name: "lookup".to_string(),
+                    description: "lookup data".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                },
+            }]),
+            false,
+        );
+        let value = serde_json::to_value(&req).expect("serialize chat request");
+        assert_eq!(value["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn responses_request_disables_parallel_tool_calls_when_tools_exist() {
+        let snapshot = ParameterSnapshot::from(&Parameters::default());
+        let req = ResponsesRequest::new(
+            "gpt-5".into(),
+            vec![ResponsesInputItem::message(
+                "user",
+                ResponsesMessageContent::Text("hi".to_string()),
+            )],
+            &snapshot,
+            Some(vec![ResponsesTool::Function {
+                name: "lookup".to_string(),
+                description: "lookup data".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            }]),
+            responses_tool_choice(&snapshot, true),
+            false,
+        );
+        let value = serde_json::to_value(&req).expect("serialize responses request");
+        assert_eq!(value["parallel_tool_calls"], false);
+    }
+
+    #[test]
     fn responses_tool_choice_exact_serializes_function_choice() {
         let params = Parameters::default().tool_choice(ToolChoice::Exact("lookup".to_string()));
         let snapshot = ParameterSnapshot::from(&params);
@@ -974,5 +1064,40 @@ mod tests {
         let value = serde_json::to_value(&req).expect("serialize chat request");
         assert_eq!(value["prompt_cache_key"], "session:beta");
         assert_eq!(value["prompt_cache_retention"], "in-memory");
+    }
+
+    #[test]
+    fn responses_input_rejects_empty_assistant_tool_call_id() {
+        let messages = vec![Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCall::new("", "lookup", serde_json::json!({"id": 1}))],
+        )];
+        let error = to_responses_input(&messages).expect_err("empty tool call id must fail");
+        assert_eq!(
+            error.to_string(),
+            "assistant tool call has an empty tool_call_id"
+        );
+    }
+
+    #[test]
+    fn responses_input_rejects_empty_tool_result_call_id() {
+        let messages = vec![Message::tool("", "done")];
+        let error = to_responses_input(&messages).expect_err("empty tool result id must fail");
+        assert_eq!(error.to_string(), "tool result has an empty tool_call_id");
+    }
+
+    #[test]
+    fn responses_input_validation_rejects_empty_function_call_item() {
+        let error = validate_responses_input(&[ResponsesInputItem::FunctionCall {
+            kind: "function_call",
+            call_id: String::new(),
+            name: "lookup".to_string(),
+            arguments: "{}".to_string(),
+        }])
+        .expect_err("empty function call id must fail");
+        assert_eq!(
+            error.to_string(),
+            "responses input[0] function_call 'lookup' has an empty call_id"
+        );
     }
 }

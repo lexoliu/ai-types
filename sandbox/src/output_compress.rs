@@ -1,4 +1,4 @@
-//! Output compression pipeline for bash tool results.
+//! Output compression pipeline for terminal tool results.
 //!
 //! Applies semantics-preserving transformations to reduce output size:
 //! 1. JSON arrays/objects -> TSV with dot-notation flattened headers (if smaller)
@@ -195,7 +195,7 @@ struct FoldedCode {
 /// Mapping from magika `ContentType` label to tree-sitter language module.
 fn magika_label_to_ts_language(label: &str) -> Option<tree_sitter::Language> {
     match label {
-        "bash" | "shell" => Some(rs_tree_sitter_languages::bash::language()),
+        "terminal" | "shell" => Some(rs_tree_sitter_languages::bash::language()),
         "c" => Some(rs_tree_sitter_languages::c::language()),
         "cpp" => Some(rs_tree_sitter_languages::cpp::language()),
         "css" => Some(rs_tree_sitter_languages::css::language()),

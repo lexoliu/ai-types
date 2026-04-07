@@ -14,9 +14,9 @@ use std::sync::Arc;
 
 use aither_core::{
     LanguageModel,
-    llm::{Tool, ToolOutput},
+    llm::{Tool, ToolResult},
 };
-use aither_sandbox::BashToolFactory;
+use aither_sandbox::TerminalToolFactory;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -153,8 +153,8 @@ pub struct SubagentTool<LLM> {
     base_dir: Option<PathBuf>,
     /// Ordered mount map used to resolve virtual sandbox paths into host paths.
     mounts: Vec<SubagentFileMount>,
-    /// Factory for creating child bash tools for subagents.
-    bash_tool_factory: Option<BashToolFactory>,
+    /// Factory for creating child terminal tools for subagents.
+    terminal_tool_factory: Option<TerminalToolFactory>,
 }
 
 impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
@@ -175,7 +175,7 @@ impl<LLM: Clone> SubagentTool<LLM> {
             types: HashMap::new(),
             base_dir: None,
             mounts: Vec::new(),
-            bash_tool_factory: None,
+            terminal_tool_factory: None,
         }
     }
 
@@ -201,10 +201,10 @@ impl<LLM: Clone> SubagentTool<LLM> {
         self
     }
 
-    /// Sets the bash tool factory used for subagents.
+    /// Sets the terminal tool factory used for subagents.
     #[must_use]
-    pub fn with_bash_tool_factory(mut self, factory: BashToolFactory) -> Self {
-        self.bash_tool_factory = Some(factory);
+    pub fn with_terminal_tool_factory(mut self, factory: TerminalToolFactory) -> Self {
+        self.terminal_tool_factory = Some(factory);
         self
     }
 
@@ -407,6 +407,7 @@ impl<LLM: LanguageModel + Clone> SubagentTool<LLM> {
     pub fn with_definition(self, def: SubagentDefinition) -> Self {
         let subagent = SubagentType::new(def.description.clone(), move |llm| {
             crate::AgentBuilder::new(llm)
+                .agent_kind(crate::AgentKind::Chatbot)
                 .system_prompt(&def.system_prompt)
                 .max_iterations(def.max_iterations)
         });
@@ -434,8 +435,9 @@ where
     }
 
     type Arguments = SubagentArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
         // Determine if subagent is a file path or a registered type name
         // File paths contain '/' or end with '.md'
         let is_file_path = args.subagent.contains('/') || args.subagent.ends_with(".md");
@@ -456,6 +458,7 @@ where
                 })?;
 
             let builder = crate::AgentBuilder::new(self.llm.clone())
+                .agent_kind(crate::AgentKind::Chatbot)
                 .system_prompt(&def.system_prompt)
                 .max_iterations(def.max_iterations);
 
@@ -477,13 +480,13 @@ where
 
         tracing::info!(subagent = %subagent_id, "Starting subagent");
 
-        // Add child bash tool if factory is configured
-        let agent_builder = if let Some(factory) = &self.bash_tool_factory {
-            let dyn_bash = factory
+        // Add child terminal tool if factory is configured
+        let agent_builder = if let Some(factory) = &self.terminal_tool_factory {
+            let dyn_terminal = factory
                 .create()
                 .await
-                .map_err(|e| anyhow::anyhow!("failed to create subagent bash tool: {e}"))?;
-            agent_builder.dyn_bash(dyn_bash)
+                .map_err(|e| anyhow::anyhow!("failed to create subagent terminal tool: {e}"))?;
+            agent_builder.dyn_terminal(dyn_terminal)
         } else {
             agent_builder
         };
@@ -491,14 +494,29 @@ where
         let mut agent = agent_builder.build();
 
         // Run the subagent with the prompt
-        let result = agent
-            .query(&args.prompt)
-            .await
-            .map_err(|e| anyhow::anyhow!("Subagent '{subagent_id}' error: {e}"))?;
+        let result = match agent.query(&args.prompt).await {
+            Ok(result) => result,
+            Err(error) => {
+                let history = agent.history();
+                let recent = history
+                    .into_iter()
+                    .rev()
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>();
+                let recent_json = serde_json::to_string(&recent)
+                    .unwrap_or_else(|serialize_error| serialize_error.to_string());
+                return Err(anyhow::anyhow!(
+                    "Subagent '{subagent_id}' error: {error}\nRecent subagent history: {recent_json}"
+                ));
+            }
+        };
 
         tracing::info!(subagent = %subagent_id, "Subagent completed");
 
-        ToolOutput::json(&SubagentResult {
+        ToolResult::json(&SubagentResult {
             subagent: subagent_id,
             status: "completed",
             result,

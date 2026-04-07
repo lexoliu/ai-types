@@ -1,8 +1,8 @@
-//! Permission handling for bash execution modes.
+//! Permission handling for terminal execution modes.
 //!
-//! Different bash modes have different permission requirements:
-//! - `Sandboxed`: No approval needed (read-only, no network)
-//! - `Network`: First-use approval only
+//! Different terminal modes have different permission requirements:
+//! - `Sandboxed`: No approval needed
+//! - `Network`: No approval needed; outbound access is audited by higher layers
 //! - `Unsafe`: Per-script approval required
 
 use std::future::Future;
@@ -10,18 +10,16 @@ use std::future::Future;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Permission mode for bash execution.
+/// Permission mode for terminal execution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum BashMode {
-    /// Sandboxed execution with read-only filesystem and no network.
-    /// IPC commands (websearch, webfetch) still work.
-    /// No approval needed.
+pub enum TerminalMode {
+    /// Sandboxed execution without extra host privileges.
     #[default]
     Sandboxed,
 
-    /// Sandboxed execution with network access enabled.
-    /// Requires first-use approval.
+    /// Sandboxed execution with outbound network available.
+    /// Higher layers may audit the traffic, but this mode does not require approval.
     Network,
 
     /// Unsafe execution without sandbox.
@@ -29,11 +27,11 @@ pub enum BashMode {
     Unsafe,
 }
 
-impl BashMode {
+impl TerminalMode {
     /// Returns whether this mode requires user approval.
     #[must_use]
     pub const fn requires_approval(self) -> bool {
-        matches!(self, Self::Network | Self::Unsafe)
+        matches!(self, Self::Unsafe)
     }
 
     /// Returns whether approval is needed per-script (vs first-use only).
@@ -46,8 +44,8 @@ impl BashMode {
     #[must_use]
     pub const fn description(self) -> &'static str {
         match self {
-            Self::Sandboxed => "sandboxed (read-only, no network)",
-            Self::Network => "network-enabled sandbox",
+            Self::Sandboxed => "sandboxed",
+            Self::Network => "sandboxed with network access",
             Self::Unsafe => "unsafe (no sandbox, full access)",
         }
     }
@@ -55,7 +53,7 @@ impl BashMode {
 
 /// Trait for handling permission requests.
 ///
-/// Implementors decide whether to allow bash executions based on mode and script.
+/// Implementors decide whether to allow terminal executions based on mode and script.
 pub trait PermissionHandler: Send + Sync {
     /// Checks if the given mode and script are allowed.
     ///
@@ -64,7 +62,7 @@ pub trait PermissionHandler: Send + Sync {
     /// For `Unsafe` mode, this should prompt for each script.
     fn check(
         &self,
-        mode: BashMode,
+        mode: TerminalMode,
         script: &str,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send;
 
@@ -74,7 +72,7 @@ pub trait PermissionHandler: Send + Sync {
     /// events only when a permission request will actually block.
     fn will_wait_for_approval(
         &self,
-        mode: BashMode,
+        mode: TerminalMode,
         script: &str,
     ) -> impl Future<Output = bool> + Send {
         let _ = (mode, script);
@@ -115,17 +113,17 @@ pub enum PermissionError {
 pub struct DenyUnsafe;
 
 impl PermissionHandler for DenyUnsafe {
-    async fn check(&self, mode: BashMode, _script: &str) -> Result<bool, PermissionError> {
+    async fn check(&self, mode: TerminalMode, _script: &str) -> Result<bool, PermissionError> {
         match mode {
-            BashMode::Sandboxed => Ok(true),
-            BashMode::Network | BashMode::Unsafe => Err(PermissionError::Denied(format!(
-                "{} mode requires approval but no interactive handler is configured",
+            TerminalMode::Sandboxed | TerminalMode::Network => Ok(true),
+            TerminalMode::Unsafe => Err(PermissionError::Denied(format!(
+                "sandbox blocked {} execution; approval is required to escalate this command, but no interactive approval handler is configured",
                 mode.description()
             ))),
         }
     }
 
-    async fn will_wait_for_approval(&self, _mode: BashMode, _script: &str) -> bool {
+    async fn will_wait_for_approval(&self, _mode: TerminalMode, _script: &str) -> bool {
         false
     }
 }
@@ -135,11 +133,11 @@ impl PermissionHandler for DenyUnsafe {
 pub struct NoopPermissionHandler;
 
 impl PermissionHandler for NoopPermissionHandler {
-    async fn check(&self, _mode: BashMode, _script: &str) -> Result<bool, PermissionError> {
+    async fn check(&self, _mode: TerminalMode, _script: &str) -> Result<bool, PermissionError> {
         Ok(true)
     }
 
-    async fn will_wait_for_approval(&self, _mode: BashMode, _script: &str) -> bool {
+    async fn will_wait_for_approval(&self, _mode: TerminalMode, _script: &str) -> bool {
         false
     }
 
@@ -178,22 +176,10 @@ impl<Inner> StatefulPermissionHandler<Inner> {
 }
 
 impl<Inner: PermissionHandler> PermissionHandler for StatefulPermissionHandler<Inner> {
-    async fn check(&self, mode: BashMode, script: &str) -> Result<bool, PermissionError> {
+    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
         match mode {
-            BashMode::Sandboxed => Ok(true),
-            BashMode::Network => {
-                // Check if already approved
-                if self.is_network_approved() {
-                    return Ok(true);
-                }
-                // Ask inner handler
-                let approved = self.inner.check(mode, script).await?;
-                if approved {
-                    self.approve_network();
-                }
-                Ok(approved)
-            }
-            BashMode::Unsafe => {
+            TerminalMode::Sandboxed | TerminalMode::Network => Ok(true),
+            TerminalMode::Unsafe => {
                 // Always ask for unsafe
                 self.inner.check(mode, script).await
             }
@@ -204,13 +190,10 @@ impl<Inner: PermissionHandler> PermissionHandler for StatefulPermissionHandler<I
         self.inner.check_domain(domain, port).await
     }
 
-    async fn will_wait_for_approval(&self, mode: BashMode, script: &str) -> bool {
+    async fn will_wait_for_approval(&self, mode: TerminalMode, script: &str) -> bool {
         match mode {
-            BashMode::Sandboxed => false,
-            BashMode::Network => {
-                !self.is_network_approved() && self.inner.will_wait_for_approval(mode, script).await
-            }
-            BashMode::Unsafe => self.inner.will_wait_for_approval(mode, script).await,
+            TerminalMode::Sandboxed | TerminalMode::Network => false,
+            TerminalMode::Unsafe => self.inner.will_wait_for_approval(mode, script).await,
         }
     }
 }
@@ -224,22 +207,32 @@ mod tests {
         let handler = DenyUnsafe;
 
         // Sandboxed should be allowed
-        assert!(handler.check(BashMode::Sandboxed, "ls").await.unwrap());
+        assert!(handler.check(TerminalMode::Sandboxed, "ls").await.unwrap());
 
         // Network should be denied
-        assert!(handler.check(BashMode::Network, "curl").await.is_err());
+        assert!(handler.check(TerminalMode::Network, "curl").await.is_err());
 
         // Unsafe should be denied
-        assert!(handler.check(BashMode::Unsafe, "rm -rf /").await.is_err());
+        assert!(
+            handler
+                .check(TerminalMode::Unsafe, "rm -rf /")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn test_noop_permission_handler() {
         let handler = NoopPermissionHandler;
 
-        assert!(handler.check(BashMode::Sandboxed, "ls").await.unwrap());
-        assert!(handler.check(BashMode::Network, "curl").await.unwrap());
-        assert!(handler.check(BashMode::Unsafe, "rm -rf /").await.unwrap());
+        assert!(handler.check(TerminalMode::Sandboxed, "ls").await.unwrap());
+        assert!(handler.check(TerminalMode::Network, "curl").await.unwrap());
+        assert!(
+            handler
+                .check(TerminalMode::Unsafe, "rm -rf /")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -250,11 +243,11 @@ mod tests {
         assert!(!handler.is_network_approved());
 
         // First network check approves
-        assert!(handler.check(BashMode::Network, "curl").await.unwrap());
+        assert!(handler.check(TerminalMode::Network, "curl").await.unwrap());
         assert!(handler.is_network_approved());
 
         // Subsequent checks use cached approval
-        assert!(handler.check(BashMode::Network, "wget").await.unwrap());
+        assert!(handler.check(TerminalMode::Network, "wget").await.unwrap());
     }
 
     #[tokio::test]

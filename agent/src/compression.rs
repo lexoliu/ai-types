@@ -381,8 +381,8 @@ fn extract_commands(content: &str) -> Vec<String> {
 
         // Common command prefixes
         let cmd_prefixes = [
-            "cargo ", "npm ", "git ", "docker ", "make ", "rustc ", "python ", "node ", "go ",
-            "cd ", "ls ", "cat ", "mkdir ", "rm ", "mv ", "cp ",
+            "cargo ", "bun ", "bunx ", "npm ", "git ", "docker ", "make ", "rustc ", "python ",
+            "node ", "go ", "cd ", "ls ", "cat ", "mkdir ", "rm ", "mv ", "cp ",
         ];
         if cmd_prefixes.iter().any(|p| trimmed.starts_with(p)) {
             commands.push(trimmed.to_string());

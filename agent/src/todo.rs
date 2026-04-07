@@ -54,7 +54,7 @@ mod tests {
     }
 }
 
-use aither_core::llm::{Tool, ToolOutput};
+use aither_core::llm::{Tool, ToolResult};
 use arc_swap::ArcSwap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -219,8 +219,9 @@ impl Tool for TodoTool {
     }
 
     type Arguments = TodoWriteArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
         // Validate: at most one task should be in_progress
         let in_progress_count = arguments
             .todos
@@ -237,6 +238,6 @@ impl Tool for TodoTool {
         self.list.write(arguments.todos);
 
         // TodoWrite succeeds with no output - the UI shows the todo list separately
-        Ok(ToolOutput::Done)
+        Ok(ToolResult::Done)
     }
 }

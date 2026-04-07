@@ -89,14 +89,14 @@ Requires Rust 1.87+ (edition 2024).
 
 ## Tool development guide
 - You are not allowed to be special in architecture. You must implement `Tool` trait.
-- Your tool will be converted into bash-based automatically. You should never write workaround to expose CLI commands.
+- Your tool will be converted into IPC-backed terminal commands automatically. You should never write workaround to expose CLI commands.
 
-## Bash-based agent
-Our agent only have a single tool: `bash`. All capabilities are exposed via CLI commands,
+## Terminal-first agent
+Our agent only have a single tool: `terminal`. All capabilities are exposed via CLI commands,
 including web search, web fetch, task management, and LLM queries.
 
 Technically, these command is a wrapper script that calls `aither-ipc <command> "$@"`.
-Through from the agent's perspective, it is just calling a bash tool,
+From the agent's perspective, it is just calling the native `terminal` tool,
 you are stilled require to develop a tool using `Tool` trait. We convert these tools 
 to CLI commands under the hood.
 

@@ -1,20 +1,20 @@
 //! Debug hook for CLI agent testing.
 //!
-//! Provides logging and human-friendly bash output display.
+//! Provides logging and human-friendly terminal output display.
 
 use aither_agent::{
     Hook, PostToolAction, PreToolAction, StopContext, ToolResultContext, ToolUseContext,
 };
 
-/// A debug hook that logs tool calls with human-friendly bash output.
+/// A debug hook that logs tool calls with human-friendly terminal output.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DebugHook;
 
 impl Hook for DebugHook {
     async fn pre_tool_use(&self, ctx: &ToolUseContext<'_>) -> PreToolAction {
-        // Bash is the primary tool - show the command directly
-        if ctx.tool_name == "bash" {
-            if let Some((script, mode)) = parse_bash_args(ctx.arguments) {
+        // Terminal is the primary tool; show the command directly.
+        if ctx.tool_name == "terminal" {
+            if let Some((script, mode)) = parse_terminal_args(ctx.arguments) {
                 let mode_indicator = match mode.as_deref() {
                     Some("unsafe") => "\x1b[31m⚠\x1b[0m ",
                     Some("network") => "\x1b[33m⚡\x1b[0m ",
@@ -25,7 +25,7 @@ impl Hook for DebugHook {
                 println!("\x1b[32m{mode_indicator}$\x1b[0m {display_script}");
             }
         } else {
-            // Non-bash tools (shouldn't happen in bash-first architecture)
+            // Non-terminal tools (shouldn't happen in terminal-first architecture)
             println!(
                 "\x1b[36m[tool]\x1b[0m {} \x1b[90m(turn {})\x1b[0m",
                 ctx.tool_name, ctx.turn
@@ -39,7 +39,7 @@ impl Hook for DebugHook {
             }
         }
 
-        // Permission is handled by BashTool's InteractivePermissionHandler
+        // Permission is handled by TerminalTool's InteractivePermissionHandler
         // No need to check here - would cause duplicate prompts
         PreToolAction::Allow
     }
@@ -47,12 +47,12 @@ impl Hook for DebugHook {
     async fn post_tool_use(&self, ctx: &ToolResultContext<'_>) -> PostToolAction {
         let duration_ms = ctx.duration.as_millis();
 
-        if ctx.tool_name == "bash" {
+        if ctx.tool_name == "terminal" {
             match ctx.result {
                 Ok(result) => {
-                    // Parse bash result and show human-friendly output
-                    if let Some(output) = parse_bash_result(result) {
-                        print_bash_output(&output, duration_ms);
+                    // Parse terminal result and show human-friendly output
+                    if let Some(output) = parse_terminal_result(result) {
+                        print_terminal_output(&output, duration_ms);
                     } else {
                         // Fallback: show raw but truncated
                         println!("\x1b[90m({duration_ms}ms)\x1b[0m");
@@ -67,7 +67,7 @@ impl Hook for DebugHook {
                 }
             }
         } else {
-            // Non-bash tools
+            // Non-terminal tools
             match ctx.result {
                 Ok(result) => {
                     let truncated = truncate_output(result, 500);
@@ -107,8 +107,8 @@ impl Hook for DebugHook {
     }
 }
 
-/// Parsed bash arguments.
-fn parse_bash_args(arguments: &str) -> Option<(String, Option<String>)> {
+/// Parsed terminal arguments.
+fn parse_terminal_args(arguments: &str) -> Option<(String, Option<String>)> {
     let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
     let script = parsed.get("script")?.as_str()?.to_string();
     let mode = parsed
@@ -118,8 +118,8 @@ fn parse_bash_args(arguments: &str) -> Option<(String, Option<String>)> {
     Some((script, mode))
 }
 
-/// Parsed bash output.
-struct BashOutput {
+/// Parsed terminal output.
+struct TerminalOutput {
     stdout: Option<String>,
     stderr: Option<String>,
     exit_code: i32,
@@ -127,8 +127,8 @@ struct BashOutput {
     status: Option<String>,
 }
 
-/// Parse bash result JSON into human-readable format.
-fn parse_bash_result(result: &str) -> Option<BashOutput> {
+/// Parse terminal result JSON into human-readable format.
+fn parse_terminal_result(result: &str) -> Option<TerminalOutput> {
     let parsed: serde_json::Value = serde_json::from_str(result).ok()?;
 
     // Handle stdout - can be string or object with "text" field
@@ -162,7 +162,7 @@ fn parse_bash_result(result: &str) -> Option<BashOutput> {
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    Some(BashOutput {
+    Some(TerminalOutput {
         stdout,
         stderr,
         exit_code,
@@ -171,8 +171,8 @@ fn parse_bash_result(result: &str) -> Option<BashOutput> {
     })
 }
 
-/// Print bash output in human-friendly format.
-fn print_bash_output(output: &BashOutput, duration_ms: u128) {
+/// Print terminal output in human-friendly format.
+fn print_terminal_output(output: &TerminalOutput, duration_ms: u128) {
     // Background task
     if let Some(ref task_id) = output.task_id {
         if output.status.as_deref() == Some("running") {

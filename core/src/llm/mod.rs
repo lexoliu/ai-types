@@ -111,7 +111,7 @@ pub use researcher::{
 };
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
-pub use tool::{Tool, ToolOutput};
+pub use tool::{IntoToolResult, Tool, ToolResult};
 
 use crate::llm::{model::Profile, tool::json};
 
@@ -237,7 +237,7 @@ impl<'tools> LLMRequestWithTools<'tools> {
     ///
     /// # Errors
     /// Returns an error if tool is not found or the tool call fails.
-    pub async fn call_tool(&mut self, name: &str, args_json: &str) -> crate::Result<ToolOutput> {
+    pub async fn call_tool(&mut self, name: &str, args_json: &str) -> crate::Result<ToolResult> {
         self.tools.call(name, args_json).await
     }
 }
