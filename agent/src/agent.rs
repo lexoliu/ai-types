@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use aither_core::{
     LanguageModel,
-    llm::{Event, LLMRequest, Message, model::Profile as ModelProfile},
+    llm::{Event, LLMRequest, Message, ToolCall, model::Profile as ModelProfile},
 };
 #[cfg(feature = "skills")]
 use aither_skills::Skill;
@@ -40,11 +40,26 @@ use crate::{
 };
 
 use aither_sandbox::{
-    BackgroundTaskReceiver, BashArgs, BashExecutionMode, BashMode, CONTAINER_STDIN_BLOCKED_NOTICE,
-    JobRegistry, OutputStore, PermissionEvent, PermissionEventReceiver, PermissionEventStage,
+    BackgroundTaskReceiver, JobRegistry, OutputStore, PermissionEvent, PermissionEventReceiver,
+    PermissionEventStage, TERMINAL_STDIN_BLOCKED_NOTICE, TerminalArgs, TerminalExecutionMode,
+    TerminalMode,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+
+fn ensure_non_empty_tool_call_ids(
+    tool_calls: &[ToolCall],
+    response_text: &str,
+) -> Result<(), AgentError> {
+    if tool_calls.iter().all(|call| !call.id.trim().is_empty()) {
+        return Ok(());
+    }
+    let tool_calls_json = serde_json::to_string(tool_calls)
+        .unwrap_or_else(|error| format!("failed to serialize tool calls: {error}"));
+    Err(AgentError::Llm(format!(
+        "provider emitted tool call with empty id; response_text={response_text:?}; tool_calls={tool_calls_json}"
+    )))
+}
 
 /// Result of a compaction operation.
 #[derive(Debug, Clone)]
@@ -116,7 +131,7 @@ struct AllTasksCompleteReminderTemplate<'a> {
 }
 
 #[derive(serde::Serialize)]
-struct BackgroundBashResultXml {
+struct BackgroundTerminalResultXml {
     #[serde(rename = "@task_id")]
     task_id: String,
     script: String,
@@ -144,7 +159,7 @@ struct TerminalInputNeededEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PermissionEventKey {
-    mode: BashMode,
+    mode: TerminalMode,
     script: String,
 }
 
@@ -306,11 +321,11 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Output store for lazy URL allocation during compression.
     pub(crate) output_store: Option<Arc<OutputStore>>,
 
-    /// Receiver for completed background bash tasks.
+    /// Receiver for completed background terminal tasks.
     pub(crate) background_receiver: Option<BackgroundTaskReceiver>,
-    /// Receiver for permission wait/resume events emitted by bash.
+    /// Receiver for permission wait/resume events emitted by terminal execution.
     pub(crate) permission_receiver: Option<PermissionEventReceiver>,
-    /// Registry for running background bash tasks.
+    /// Registry for running background terminal tasks.
     pub(crate) job_registry: Option<JobRegistry>,
 
     /// Optional readable transcript for long-context recovery.
@@ -324,6 +339,12 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
 
     /// Start time of the most recent LLM request issued by this agent.
     pub(crate) last_request_started_at: Option<Instant>,
+
+    /// Transient per-turn system messages injected by the host application.
+    ///
+    /// These participate in prompt assembly for the current turn but are not
+    /// stored in the persistent context or checkpoints.
+    pub(crate) transient_system_messages: Vec<String>,
 
     /// Runtime skill registry for prompt-triggered activation.
     #[cfg(feature = "skills")]
@@ -373,6 +394,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             sandbox_dir: None,
             last_working_docs: None,
             last_request_started_at: None,
+            transient_system_messages: Vec::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
             #[cfg(feature = "skills")]
@@ -627,6 +649,7 @@ where
 
                 let response_text = text_chunks.join("");
                 all_text_chunks.extend(text_chunks);
+                ensure_non_empty_tool_call_ids(&tool_calls, &response_text)?;
 
                 // If no tool calls, we're done unless working-doc supervision requires continuation.
                 if tool_calls.is_empty() {
@@ -717,24 +740,27 @@ where
                                 });
                             }
                             PreToolAction::Deny(reason) => {
-                                (Err(anyhow::anyhow!(reason)), Duration::ZERO)
+                                (aither_core::llm::ToolResult::error(reason), Duration::ZERO)
                             }
                             PreToolAction::Allow => {
                                 let start = Instant::now();
-                                let result = tools.call(&call.name, &args_json).await;
-                                let result = result.map(|output| output.as_str().unwrap_or("").to_string());
+                                let result = match tools.call(&call.name, &args_json).await {
+                                    Ok(result) => result,
+                                    Err(error) => {
+                                        let error_text = error.to_string();
+                                        let mut message = String::from("Error: ");
+                                        message.push_str(error_text.as_str());
+                                        aither_core::llm::ToolResult::error(message)
+                                    }
+                                };
                                 (result, start.elapsed())
                             }
                         };
 
-                        let result_ref = result
-                            .as_ref()
-                            .map(std::string::String::as_str)
-                            .map_err(std::string::ToString::to_string);
                         let result_ctx = ToolResultContext {
                             tool_name: &call.name,
                             arguments: &args_json,
-                            result: result_ref.as_ref().map(|s| *s).map_err(std::string::String::as_str),
+                            result: &result,
                             duration,
                         };
 
@@ -745,20 +771,8 @@ where
                                     reason,
                                 });
                             }
-                            PostToolAction::Replace(replacement) => {
-                                if result.is_ok() {
-                                    Ok(replacement)
-                                } else {
-                                    Err(replacement)
-                                }
-                            }
-                            PostToolAction::Keep => result
-                                .map_err(|error| {
-                                    let error_text = error.to_string();
-                                    let mut text = String::from("Error: ");
-                                    text.push_str(error_text.as_str());
-                                    text
-                                }),
+                            PostToolAction::Replace(replacement) => replacement,
+                            PostToolAction::Keep => result,
                         };
 
                         Ok((call.id.clone(), call.name.clone(), tool_result))
@@ -766,7 +780,7 @@ where
                 });
 
                 enum ExecutionSignal {
-                    Tool(Result<(String, String, Result<String, String>), AgentError>),
+                    Tool(Result<(String, String, aither_core::llm::ToolResult), AgentError>),
                     Permission(PermissionEvent),
                 }
 
@@ -830,7 +844,7 @@ where
                 let mut has_tool_error = false;
                 for result in results {
                     let (call_id, call_name, tool_result) = result?;
-                    let is_bash_call = call_name == "bash";
+                    let is_terminal_call = call_name == "terminal";
 
                     if let Some(transcript) = &self.transcript {
                         transcript.write_tool_result(&call_name, &tool_result).await;
@@ -846,12 +860,9 @@ where
                         yield AgentEvent::run_resumed(reason, call_id.clone());
                     }
 
-                    let content = match &tool_result {
-                        Ok(content) => content,
-                        Err(error) => error,
-                    };
+                    let content = tool_result.render_for_model()?;
 
-                    if tool_result.is_err()
+                    if tool_result.is_error()
                         || content.contains("ssh_server_id is required")
                         || content.contains("unknown ssh_server_id")
                         || content.contains("not found")
@@ -859,11 +870,11 @@ where
                     {
                         has_tool_error = true;
                     }
-                    let processed_content = self.process_reload_marker(content);
+                    let processed_content = self.process_reload_marker(&content);
                     self.context.push(Message::tool(&call_id, processed_content));
-                    if is_bash_call
-                        && tool_result.is_ok()
-                        && let Some(started) = self.format_background_started_event(content)
+                    if is_terminal_call
+                        && !tool_result.is_error()
+                        && let Some(started) = self.format_background_started_event(&content)
                     {
                         self.context.push(Message::system(&started.reminder));
                         yield AgentEvent::background_task_started(
@@ -872,9 +883,9 @@ where
                             started.output_file,
                         );
                     }
-                    if is_bash_call
-                        && tool_result.is_ok()
-                        && let Some(waiting) = self.detect_terminal_input_needed(content)
+                    if is_terminal_call
+                        && !tool_result.is_error()
+                        && let Some(waiting) = self.detect_terminal_input_needed(&content)
                     {
                         yield AgentEvent::terminal_input_needed(waiting.task_id, waiting.notice);
                     }
@@ -883,7 +894,7 @@ where
                 // If there was a tool error, inject a reminder
                 if has_tool_error {
                     self.context.insert_reminder(&SystemReminder {
-                        content: "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain bash, kill_terminal, input_terminal, and read_terminal_delta.".to_string(),
+                        content: "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain terminal, terminal_kill, terminal_input, and terminal_read.".to_string(),
                     });
                 }
 
@@ -1051,6 +1062,20 @@ where
         self.context.push(message);
     }
 
+    /// Replaces transient per-turn system messages.
+    pub fn set_transient_system_messages(&mut self, messages: impl IntoIterator<Item = String>) {
+        self.transient_system_messages = messages
+            .into_iter()
+            .map(|message| message.trim().to_string())
+            .filter(|message| !message.is_empty())
+            .collect();
+    }
+
+    /// Clears transient per-turn system messages.
+    pub fn clear_transient_system_messages(&mut self) {
+        self.transient_system_messages.clear();
+    }
+
     /// Clears the conversation history.
     pub fn clear_history(&mut self) {
         self.context.clear_history();
@@ -1105,17 +1130,8 @@ where
             }
             None => "No additional focus hint was provided.".to_string(),
         };
-
-        let transcript_path = self
-            .transcript
-            .as_ref()
-            .map(|t| t.path().display().to_string())
-            .or_else(|| self.config.transcript_path.clone())
-            .unwrap_or_else(|| "transcript.md".to_string());
-
         let handoff_prompt = include_str!("prompts/compact_handoff.txt")
-            .replace("{focus_instruction}", &focus_instruction)
-            .replace("{transcript_path}", &transcript_path);
+            .replace("{focus_instruction}", &focus_instruction);
 
         let mut messages = self.context.conversation_messages();
         messages.push(Message::user(handoff_prompt));
@@ -1393,15 +1409,6 @@ where
         self.context
             .insert_system_named("permissions", include_str!("prompts/permissions.txt"));
 
-        if let Some(ref path) = self.config.transcript_path {
-            self.context.insert_system_named(
-                "transcript_memory",
-                format!(
-                    "Compressed memory may only keep a summary, but the full transcript remains available at {path}. If details are missing, recover them by searching/reading transcript content before making irreversible changes."
-                ),
-            );
-        }
-
         let tool_hints = self.format_tool_hints_block();
         if !tool_hints.is_empty() {
             self.context.insert_system_named("tool_hints", &tool_hints);
@@ -1437,7 +1444,7 @@ where
             if !running.is_empty() {
                 self.context.insert_reminder(&SystemReminder {
                     content: format!(
-                        "Running background terminals:\n{running}Use read_terminal_delta for incremental output, read redirected output files via bash (head/tail/grep/cat) when needed, input_terminal for stdin, and kill_terminal to stop tasks."
+                        "Running background terminals:\n{running}Use terminal_read for incremental output, read redirected output files via terminal commands like head/tail/grep/cat when needed, terminal_input for stdin, and terminal_kill to stop tasks."
                     ),
                 });
             }
@@ -1522,7 +1529,9 @@ where
     async fn assemble_context_window(&mut self) -> ContextWindowSnapshot {
         self.populate_dynamic_reminders().await;
 
-        let mut messages = self.context.build_messages();
+        let mut messages = self
+            .context
+            .build_messages_with_transient_system(&self.transient_system_messages);
         let mut metrics = self.estimate_context_window_metrics(&messages);
 
         if !metrics.has_handoff
@@ -1781,6 +1790,10 @@ where
             }
 
             let response_text = text_chunks.join("");
+            if let Err(error) = ensure_non_empty_tool_call_ids(&tool_calls, &response_text) {
+                events.push(Err(error));
+                return events;
+            }
 
             if tool_calls.is_empty() {
                 if !response_text.is_empty() {
@@ -1858,24 +1871,27 @@ where
                         let mut reason = String::from("skill activation blocked tool '");
                         reason.push_str(call.name.as_str());
                         reason.push('\'');
-                        return (call.id.clone(), call.name.clone(), Err(reason));
+                        return (
+                            call.id.clone(),
+                            call.name.clone(),
+                            aither_core::llm::ToolResult::error(reason),
+                        );
                     }
-                    let result = tools
-                        .call(&call.name, &args_json)
-                        .await
-                        .map(|output| output.as_str().unwrap_or("").to_string())
-                        .map_err(|error| {
+                    let result = match tools.call(&call.name, &args_json).await {
+                        Ok(result) => result,
+                        Err(error) => {
                             let error_text = error.to_string();
                             let mut text = String::from("Error: ");
                             text.push_str(error_text.as_str());
-                            text
-                        });
+                            aither_core::llm::ToolResult::error(text)
+                        }
+                    };
                     (call.id.clone(), call.name.clone(), result)
                 }
             });
 
             enum ExecutionSignal {
-                Tool((String, String, Result<String, String>)),
+                Tool((String, String, aither_core::llm::ToolResult)),
                 Permission(PermissionEvent),
             }
 
@@ -1936,22 +1952,25 @@ where
                 if let Some(reason) = pause_reason_for_tool(call_name.as_str()) {
                     events.push(Ok(AgentEvent::run_resumed(reason, call_id.clone())));
                 }
-                let is_bash_call = call_name == "bash";
+                let is_terminal_call = call_name == "terminal";
                 events.push(Ok(AgentEvent::ToolCallEnd {
                     id: call_id.clone(),
                     name: call_name,
                     result: tool_result.clone(),
                 }));
-                let content = match &tool_result {
+                let content = match tool_result.render_for_model() {
                     Ok(content) => content,
-                    Err(error) => error,
+                    Err(error) => {
+                        events.push(Err(error.into()));
+                        return events;
+                    }
                 };
-                let processed_content = self.process_reload_marker(content);
+                let processed_content = self.process_reload_marker(&content);
                 self.context
                     .push(Message::tool(&call_id, processed_content));
-                if is_bash_call
-                    && tool_result.is_ok()
-                    && let Some(started) = self.format_background_started_event(content)
+                if is_terminal_call
+                    && !tool_result.is_error()
+                    && let Some(started) = self.format_background_started_event(&content)
                 {
                     self.context.push(Message::system(&started.reminder));
                     events.push(Ok(AgentEvent::background_task_started(
@@ -1960,9 +1979,9 @@ where
                         started.output_file,
                     )));
                 }
-                if is_bash_call
-                    && tool_result.is_ok()
-                    && let Some(waiting) = self.detect_terminal_input_needed(content)
+                if is_terminal_call
+                    && !tool_result.is_error()
+                    && let Some(waiting) = self.detect_terminal_input_needed(&content)
                 {
                     events.push(Ok(AgentEvent::terminal_input_needed(
                         waiting.task_id,
@@ -2122,7 +2141,7 @@ where
         .ok()
     }
 
-    /// Formats a reminder and event payload when `bash` has been auto-promoted to background.
+    /// Formats a reminder and event payload when `terminal` has been auto-promoted to background.
     fn format_background_started_event(
         &self,
         tool_content: &str,
@@ -2170,7 +2189,7 @@ where
     }
 
     fn detect_terminal_input_needed(&self, tool_content: &str) -> Option<TerminalInputNeededEvent> {
-        let payload: aither_sandbox::BashResult = serde_json::from_str(tool_content).ok()?;
+        let payload: aither_sandbox::TerminalResult = serde_json::from_str(tool_content).ok()?;
         if payload.status.as_deref() != Some("running") {
             return None;
         }
@@ -2186,7 +2205,7 @@ where
             },
             aither_sandbox::OutputEntry::Empty => return None,
         };
-        if !notice.starts_with(CONTAINER_STDIN_BLOCKED_NOTICE) {
+        if !notice.starts_with(TERMINAL_STDIN_BLOCKED_NOTICE) {
             return None;
         }
         Some(TerminalInputNeededEvent {
@@ -2197,7 +2216,7 @@ where
 
     /// Formats a completed background task result as a system message.
     fn format_background_task_result(&self, task: &aither_sandbox::CompletedTask) -> String {
-        let mut xml = BackgroundBashResultXml {
+        let mut xml = BackgroundTerminalResultXml {
             task_id: task.task_id.clone(),
             script: truncate_script(&task.script, 100).to_string(),
             exit_code: None,
@@ -2225,7 +2244,7 @@ where
             }
         }
 
-        serialize_xml("background-bash-result", &xml)
+        serialize_xml("background-terminal-result", &xml)
     }
 
     /// Generates a reminder about the next task after a task was completed.
@@ -2273,14 +2292,14 @@ fn permission_event_key_for_call(
     tool_name: &str,
     arguments: &serde_json::Value,
 ) -> Option<PermissionEventKey> {
-    if tool_name != "bash" {
+    if tool_name != "terminal" {
         return None;
     }
-    let args: BashArgs = serde_json::from_value(arguments.clone()).ok()?;
+    let args: TerminalArgs = serde_json::from_value(arguments.clone()).ok()?;
     let mode = match args.mode {
-        BashExecutionMode::Sandboxed => return None,
-        BashExecutionMode::Unsafe => BashMode::Unsafe,
-        BashExecutionMode::Default | BashExecutionMode::Ssh => BashMode::Network,
+        TerminalExecutionMode::Sandboxed => return None,
+        TerminalExecutionMode::Unsafe => TerminalMode::Unsafe,
+        TerminalExecutionMode::Default | TerminalExecutionMode::Ssh => TerminalMode::Network,
     };
     Some(PermissionEventKey {
         mode,
@@ -2555,60 +2574,64 @@ mod tests {
     }
 
     #[test]
-    fn permission_event_key_parses_bash_modes() {
-        let default_args = serde_json::to_value(BashArgs {
+    fn permission_event_key_parses_terminal_modes() {
+        let default_args = serde_json::to_value(TerminalArgs {
             script: "ls".to_string(),
-            mode: BashExecutionMode::Default,
+            mode: TerminalExecutionMode::Default,
             ssh_server_id: None,
             expect: aither_sandbox::OutputFormat::Text,
+            resolution: aither_sandbox::MediaResolution::Auto,
             timeout: 30,
             max_lines: 200,
             raw: false,
         })
         .expect("default args should serialize");
-        let unsafe_args = serde_json::to_value(BashArgs {
+        let unsafe_args = serde_json::to_value(TerminalArgs {
             script: "rm -rf /tmp/demo".to_string(),
-            mode: BashExecutionMode::Unsafe,
+            mode: TerminalExecutionMode::Unsafe,
             ssh_server_id: None,
             expect: aither_sandbox::OutputFormat::Text,
+            resolution: aither_sandbox::MediaResolution::Auto,
             timeout: 30,
             max_lines: 200,
             raw: false,
         })
         .expect("unsafe args should serialize");
-        let sandboxed_args = serde_json::to_value(BashArgs {
+        let sandboxed_args = serde_json::to_value(TerminalArgs {
             script: "pwd".to_string(),
-            mode: BashExecutionMode::Sandboxed,
+            mode: TerminalExecutionMode::Sandboxed,
             ssh_server_id: None,
             expect: aither_sandbox::OutputFormat::Text,
+            resolution: aither_sandbox::MediaResolution::Auto,
             timeout: 30,
             max_lines: 200,
             raw: false,
         })
         .expect("sandboxed args should serialize");
 
-        let default_key = permission_event_key_for_call("bash", &default_args)
-            .expect("default bash mode should require permission routing");
-        let unsafe_key = permission_event_key_for_call("bash", &unsafe_args)
-            .expect("unsafe bash mode should require permission routing");
+        let default_key = permission_event_key_for_call("terminal", &default_args)
+            .expect("default terminal mode should require permission routing");
+        let unsafe_key = permission_event_key_for_call("terminal", &unsafe_args)
+            .expect("unsafe terminal mode should require permission routing");
 
-        assert_eq!(default_key.mode, BashMode::Network);
+        assert_eq!(default_key.mode, TerminalMode::Network);
         assert_eq!(default_key.script, "ls");
-        assert_eq!(unsafe_key.mode, BashMode::Unsafe);
+        assert_eq!(unsafe_key.mode, TerminalMode::Unsafe);
         assert_eq!(unsafe_key.script, "rm -rf /tmp/demo");
-        assert!(permission_event_key_for_call("bash", &sandboxed_args).is_none());
+        assert!(permission_event_key_for_call("terminal", &sandboxed_args).is_none());
     }
 
     #[test]
     fn permission_pause_tracker_routes_waiting_and_resolved_events() {
         let tool_calls = vec![aither_core::llm::ToolCall::new(
             "tool-1",
-            "bash",
-            serde_json::to_value(BashArgs {
+            "terminal",
+            serde_json::to_value(TerminalArgs {
                 script: "curl https://example.com".to_string(),
-                mode: BashExecutionMode::Default,
+                mode: TerminalExecutionMode::Default,
                 ssh_server_id: None,
                 expect: aither_sandbox::OutputFormat::Text,
+                resolution: aither_sandbox::MediaResolution::Auto,
                 timeout: 30,
                 max_lines: 200,
                 raw: false,
@@ -2619,14 +2642,14 @@ mod tests {
         let mut tracker = PermissionPauseTracker::from_tool_calls(&tool_calls);
         let waiting = tracker
             .event_for(PermissionEvent {
-                mode: BashMode::Network,
+                mode: TerminalMode::Network,
                 script: "curl https://example.com".to_string(),
                 stage: PermissionEventStage::Waiting,
             })
             .expect("waiting event should map to tool call");
         let resolved = tracker
             .event_for(PermissionEvent {
-                mode: BashMode::Network,
+                mode: TerminalMode::Network,
                 script: "curl https://example.com".to_string(),
                 stage: PermissionEventStage::Resolved,
             })

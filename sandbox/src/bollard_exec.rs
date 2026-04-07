@@ -1,22 +1,18 @@
 //! Container exec implementation backed by bollard.
 
-use std::future::Future;
-use std::process::{ExitStatus, Output};
-use std::sync::Arc;
-use std::time::Duration;
-
 use async_channel::{Receiver, Sender};
 use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::exec::CreateExecOptions;
 use futures_lite::StreamExt;
+use std::future::Future;
+use std::process::{ExitStatus, Output};
+use std::sync::Arc;
 
 use crate::shell_session::{ContainerExec, ContainerExecOutcome};
-
-/// Foreground tasks are promoted when the process blocks on stdin.
-pub const CONTAINER_STDIN_BLOCKED_NOTICE: &str = "Auto-promoted to background: container process appears blocked on stdin (detected via /proc/<pid>/syscall). Use input_terminal to continue.";
-
-const STDIN_WATCH_INTERVAL: Duration = Duration::from_millis(500);
+use crate::stdin_watch::{
+    STDIN_WATCH_INTERVAL, TERMINAL_STDIN_BLOCKED_NOTICE, is_waiting_on_stdin,
+};
 
 /// Executes commands in a running container via Docker exec.
 #[derive(Debug, Clone)]
@@ -32,34 +28,6 @@ impl BollardContainerExec {
     }
 }
 
-fn parse_kernel_u64(value: &str) -> Option<u64> {
-    let raw = value.trim();
-    if let Some(hex) = raw.strip_prefix("0x") {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    raw.parse::<u64>().ok()
-}
-
-/// Detect whether `/proc/<pid>/syscall` indicates `read(0, ...)`.
-#[must_use]
-pub fn is_waiting_on_stdin(syscall_dump: &str) -> bool {
-    let line = syscall_dump.trim();
-    if line.is_empty() || line.eq_ignore_ascii_case("running") {
-        return false;
-    }
-
-    let mut parts = line.split_whitespace();
-    let Some(syscall_no) = parts.next() else {
-        return false;
-    };
-    let Some(fd_raw) = parts.next() else {
-        return false;
-    };
-
-    parse_kernel_u64(syscall_no).is_some_and(|syscall| syscall == 0)
-        && parse_kernel_u64(fd_raw).is_some_and(|fd| fd == 0)
-}
-
 async fn detect_stdin_blocked_inside_container(
     client: &Docker,
     container_id: &str,
@@ -70,7 +38,7 @@ async fn detect_stdin_blocked_inside_container(
         .create_exec(
             container_id,
             CreateExecOptions {
-                cmd: Some(vec!["bash", "-lc", probe_script.as_str()]),
+                cmd: Some(vec!["sh", "-c", probe_script.as_str()]),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 ..Default::default()
@@ -129,7 +97,7 @@ async fn kill_exec_pid_inside_container(
         .create_exec(
             container_id,
             CreateExecOptions {
-                cmd: Some(vec!["bash", "-lc", kill_script.as_str()]),
+                cmd: Some(vec!["sh", "-c", kill_script.as_str()]),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 ..Default::default()
@@ -179,7 +147,7 @@ impl ContainerExec for BollardContainerExec {
 
         async move {
             let config = CreateExecOptions {
-                cmd: Some(vec!["bash", "-c", &script]),
+                cmd: Some(vec!["sh", "-c", &script]),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 working_dir: Some(working_dir.as_str()),
@@ -288,7 +256,7 @@ impl ContainerExec for BollardContainerExec {
                             Ok(true) => {
                                 if let Some(notice_tx) = stdin_blocked_notice.as_ref() {
                                     let _ = notice_tx
-                                        .try_send(CONTAINER_STDIN_BLOCKED_NOTICE.to_string());
+                                        .try_send(TERMINAL_STDIN_BLOCKED_NOTICE.to_string());
                                 }
                                 notice_sent = true;
                                 watchdog_active = false;
@@ -336,25 +304,5 @@ impl ExitStatusExt {
     fn from_raw(code: i32) -> ExitStatus {
         use std::os::windows::process::ExitStatusExt as _;
         ExitStatus::from_raw(code as u32)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_waiting_on_stdin;
-
-    #[test]
-    fn stdin_blocked_detection_handles_decimal_and_hex() {
-        assert!(is_waiting_on_stdin("0 0 0 0 0 0"));
-        assert!(is_waiting_on_stdin("0x0 0x0 0x0 0x0"));
-    }
-
-    #[test]
-    fn stdin_blocked_detection_ignores_non_blocking_syscalls() {
-        assert!(!is_waiting_on_stdin("running"));
-        assert!(!is_waiting_on_stdin(""));
-        assert!(!is_waiting_on_stdin("1 0 0 0"));
-        assert!(!is_waiting_on_stdin("0 1 0 0"));
-        assert!(!is_waiting_on_stdin("garbage"));
     }
 }

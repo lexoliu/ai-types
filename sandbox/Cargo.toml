@@ -6,16 +6,16 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Bash-based tool execution with leash sandboxing"
+description = "Terminal-first command execution with heel sandboxing"
 readme = "../README.md"
-keywords = ["sandbox", "agent", "tooling", "bash"]
+keywords = ["sandbox", "agent", "tooling", "terminal"]
 categories = ["api-bindings"]
 
 [dependencies]
 aither-core.workspace = true
 
 # Sandboxing
-leash = { path = "../../native-sandbox" }
+heel = { path = "../../native-sandbox" }
 
 # Executor for tokio integration
 executor-core = { version = "0.7", features = ["tokio"] }
@@ -47,6 +47,8 @@ strsim = "0.11.1"
 human-hash = "0.4"
 askama = "0.14"
 quick-xml = { version = "0.37", features = ["serialize"] }
+shell-words = "1.1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
 # Output compression: content detection + code folding
 magika = "1"
@@ -54,6 +56,7 @@ tree-sitter = "0.22"
 rs-tree-sitter-languages = "0.0.2"
 
 [dev-dependencies]
+magika = { version = "1", features = ["_test"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

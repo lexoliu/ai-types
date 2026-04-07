@@ -1,20 +1,20 @@
-//! Bash-based tool execution with leash sandboxing.
+//! Terminal-first command execution with heel sandboxing.
 //!
-//! This crate provides a bash-centric tool execution model where:
-//! - LLM has a single `bash` tool with different permission modes
+//! This crate provides a terminal-first execution model where:
+//! - LLM has a single `terminal` tool with different permission modes
 //! - All tools are exposed as CLI commands via IPC
 //! - Commands can be piped and composed freely
 //! - Outputs are stored with URLs for context management
 //!
-//! # Setting Up the Bash Tool
+//! # Setting Up the Terminal Tool
 //!
 //! ```rust,ignore
-//! use aither_sandbox::{BashTool, ToolRegistryBuilder, permission::NoopPermissionHandler};
+//! use aither_sandbox::{TerminalTool, ToolRegistryBuilder, permission::NoopPermissionHandler};
 //! use std::sync::Arc;
 //!
 //! // Creates a random four-word working directory (e.g., amber-forest-thunder-pearl/)
 //! // with outputs/ subdirectory and IPC command wrapper scripts
-//! let tool = BashTool::new_in(std::env::temp_dir(), NoopPermissionHandler, executor).await?;
+//! let tool = TerminalTool::new_in(std::env::temp_dir(), NoopPermissionHandler, executor).await?;
 //! let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
 //! let tool = tool.with_registry(registry);
 //!
@@ -24,7 +24,7 @@
 //!
 //! # Registering Tools as IPC Commands
 //!
-//! Tools can be made available to bash scripts running in the sandbox:
+//! Tools can be made available to terminal sessions running in the sandbox:
 //!
 //! ```rust,ignore
 //! use aither_sandbox::{ToolRegistryBuilder, register_tool_command};
@@ -52,7 +52,6 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-mod bash;
 mod bollard_exec;
 mod command;
 mod container;
@@ -60,6 +59,8 @@ mod naming;
 mod output;
 mod output_compress;
 mod shell_session;
+mod stdin_watch;
+mod terminal;
 
 /// Built-in IPC commands (ask, reload).
 pub mod builtin;
@@ -67,30 +68,34 @@ pub mod builtin;
 /// Background job registry for tracking tasks.
 pub mod job_registry;
 
-/// Permission handling for bash modes.
+/// Permission handling for terminal modes.
 pub mod permission;
 
-pub use bash::{
-    BackgroundTaskReceiver, BashArgs, BashError, BashExecutionMode, BashResult, BashTool,
-    BashToolFactory, BashToolFactoryError, BashToolFactoryReceiver, CompletedTask, Configured,
-    PermissionEvent, PermissionEventReceiver, PermissionEventStage, Unconfigured,
-    bash_tool_factory_channel,
-};
-pub use bollard_exec::{BollardContainerExec, CONTAINER_STDIN_BLOCKED_NOTICE, is_waiting_on_stdin};
+pub use bollard_exec::BollardContainerExec;
 pub use command::{
-    CommandEnvelope, CommandPayload, DynBashTool, DynToolHandler, IpcToolCommand, ToolCallCommand,
-    ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json, register_ipc_gateway_command,
-    register_tool_command, register_tool_direct, schema_to_help,
+    CommandEnvelope, CommandPayload, DynTerminalTool, DynToolHandler, IpcToolCommand,
+    ToolCallCommand, ToolCommand, ToolRegistry, ToolRegistryBuilder, cli_to_json,
+    register_ipc_gateway_command, register_tool_command, register_tool_direct, schema_to_help,
 };
 pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerRuntimeKind, MountAccess, MountRoot,
     MountRootError, MountSpec, RuntimePreference,
 };
 pub use job_registry::{JobInfo, JobRegistry, JobStatus, TerminalDelta};
-pub use output::{Content, OutputEntry, OutputFormat, OutputStore, PendingUrl};
-pub use permission::{BashMode, PermissionHandler};
+pub use output::{Content, MediaResolution, OutputEntry, OutputFormat, OutputStore, PendingUrl};
+pub use permission::{PermissionHandler, TerminalMode};
 pub use shell_session::{
     ContainerExec, ContainerExecHandle, ContainerExecOutcome, ContainerShellRuntime, ShellBackend,
     ShellRuntimeAvailability, ShellSessionRegistry, SshRuntimeProfile, SshServer,
     SshSessionAuthorizer, bootstrap_ssh_runtime,
+};
+pub use stdin_watch::{
+    STDIN_WATCH_INTERVAL, TERMINAL_STDIN_BLOCKED_NOTICE, detect_stdin_blocked_for_local_pid,
+    is_waiting_on_stdin,
+};
+pub use terminal::{
+    BackgroundTaskReceiver, CompletedTask, Configured, PermissionEvent, PermissionEventReceiver,
+    PermissionEventStage, TerminalArgs, TerminalError, TerminalExecutionMode, TerminalResult,
+    TerminalTool, TerminalToolFactory, TerminalToolFactoryError, TerminalToolFactoryReceiver,
+    Unconfigured, terminal_tool_factory_channel,
 };
