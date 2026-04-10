@@ -1217,11 +1217,6 @@ where
         self.context.conversation_messages()
     }
 
-    /// Serialize the full agent context for restart-safe persistence.
-    pub fn export_context_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(&self.context)
-    }
-
     fn tool_surface_hash(&self) -> String {
         let mut names = self
             .tools
@@ -1239,14 +1234,8 @@ where
     }
 
     /// Export a checkpoint bundle for restart-safe persistence.
-    pub async fn export_checkpoint(
-        &mut self,
-        history_anchor: Option<usize>,
-    ) -> Result<AgentCheckpoint, AgentError> {
+    pub async fn export_checkpoint(&mut self) -> Result<AgentCheckpoint, AgentError> {
         self.ensure_initialized().await;
-        let context_json = self
-            .export_context_json()
-            .map_err(|error| AgentError::Config(error.to_string()))?;
         let context_window = self.snapshot_context_window().await;
         let todo_items = self
             .todo_list
@@ -1254,15 +1243,13 @@ where
             .map(super::todo::TodoList::items)
             .unwrap_or_default();
         Ok(AgentCheckpoint {
-            context_json,
+            context: self.context.checkpoint(),
             todo_items,
-            #[cfg(feature = "skills")]
             active_skill_names: self
                 .active_skills
                 .iter()
                 .map(|skill| skill.name.clone())
                 .collect(),
-            history_anchor,
             tool_surface_hash: self.tool_surface_hash(),
             context_window,
             has_background_tasks: self
@@ -1272,26 +1259,9 @@ where
         })
     }
 
-    /// Export a checkpoint bundle encoded as JSON.
-    pub async fn export_checkpoint_json(
-        &mut self,
-        history_anchor: Option<usize>,
-    ) -> Result<String, AgentError> {
-        let checkpoint = self.export_checkpoint(history_anchor).await?;
-        serde_json::to_string(&checkpoint).map_err(|error| AgentError::Config(error.to_string()))
-    }
-
-    /// Restore the full agent context from a serialized snapshot.
-    pub fn restore_context_json(&mut self, context_json: &str) -> Result<(), serde_json::Error> {
-        let restored: Context = serde_json::from_str(context_json)?;
-        self.context.restore_runtime_state(restored);
-        Ok(())
-    }
-
     /// Restore a previously exported checkpoint bundle.
     pub fn restore_checkpoint(&mut self, checkpoint: AgentCheckpoint) -> Result<(), AgentError> {
-        self.restore_context_json(&checkpoint.context_json)
-            .map_err(|error| AgentError::Config(error.to_string()))?;
+        self.context.restore(checkpoint.context);
         if !checkpoint.todo_items.is_empty() {
             let list = self.todo_list.get_or_insert_with(TodoList::new);
             list.write(checkpoint.todo_items);
@@ -1335,13 +1305,6 @@ where
             }
         }
         Ok(())
-    }
-
-    /// Restore a previously exported checkpoint bundle from JSON.
-    pub fn restore_checkpoint_json(&mut self, checkpoint_json: &str) -> Result<(), AgentError> {
-        let checkpoint: AgentCheckpoint = serde_json::from_str(checkpoint_json)
-            .map_err(|error| AgentError::Config(error.to_string()))?;
-        self.restore_checkpoint(checkpoint)
     }
 
     /// Returns a structured snapshot of the currently assembled context window.
@@ -2078,9 +2041,17 @@ where
         assistant_text: &str,
         turn: usize,
     ) -> Result<EmittedCheckpoint, AgentError> {
-        let context_json = self
-            .export_context_json()
-            .map_err(|error| AgentError::Config(error.to_string()))?;
+        let context = self.context.checkpoint();
+        let todo_items = self
+            .todo_list
+            .as_ref()
+            .map(super::todo::TodoList::items)
+            .unwrap_or_default();
+        let active_skill_names = self
+            .active_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<Vec<_>>();
         let tool_surface_hash = self.tool_surface_hash();
         let window = self.assemble_context_window().await;
         let checkpoint_ctx = CheckpointContext {
@@ -2088,7 +2059,9 @@ where
             assistant_text,
             turn,
             message_count: self.context.len_recent(),
-            context_json: &context_json,
+            context: &context,
+            todo_items: &todo_items,
+            active_skill_names: &active_skill_names,
             tool_surface_hash: &tool_surface_hash,
             has_background_tasks: self
                 .background_receiver
@@ -2576,6 +2549,7 @@ mod tests {
     #[test]
     fn permission_event_key_parses_terminal_modes() {
         let default_args = serde_json::to_value(TerminalArgs {
+            description: "list the working directory".to_string(),
             script: "ls".to_string(),
             mode: TerminalExecutionMode::Default,
             ssh_server_id: None,
@@ -2587,6 +2561,7 @@ mod tests {
         })
         .expect("default args should serialize");
         let unsafe_args = serde_json::to_value(TerminalArgs {
+            description: "remove the demo directory".to_string(),
             script: "rm -rf /tmp/demo".to_string(),
             mode: TerminalExecutionMode::Unsafe,
             ssh_server_id: None,
@@ -2598,6 +2573,7 @@ mod tests {
         })
         .expect("unsafe args should serialize");
         let sandboxed_args = serde_json::to_value(TerminalArgs {
+            description: "print the current working directory".to_string(),
             script: "pwd".to_string(),
             mode: TerminalExecutionMode::Sandboxed,
             ssh_server_id: None,
@@ -2627,6 +2603,7 @@ mod tests {
             "tool-1",
             "terminal",
             serde_json::to_value(TerminalArgs {
+                description: "fetch the example homepage".to_string(),
                 script: "curl https://example.com".to_string(),
                 mode: TerminalExecutionMode::Default,
                 ssh_server_id: None,
@@ -2668,11 +2645,9 @@ mod tests {
     #[cfg(feature = "skills")]
     fn empty_checkpoint(active_skill_names: Vec<String>) -> AgentCheckpoint {
         AgentCheckpoint {
-            context_json: serde_json::to_string(&crate::Context::default())
-                .expect("empty context should serialize"),
+            context: crate::Context::default().checkpoint(),
             todo_items: Vec::new(),
             active_skill_names,
-            history_anchor: None,
             tool_surface_hash: "tool-surface".to_string(),
             context_window: ContextWindowSnapshot {
                 phase: ContextWindowPhase::Stable,

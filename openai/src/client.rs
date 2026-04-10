@@ -69,8 +69,12 @@ impl RetryConfig {
     }
 }
 
+fn is_retryable_json_error(error: &serde_json::Error) -> bool {
+    matches!(error.classify(), serde_json::error::Category::Eof)
+}
+
 /// Check if an error is retryable.
-const fn is_retryable_error(err: &OpenAIError) -> bool {
+fn is_retryable_error(err: &OpenAIError) -> bool {
     match err {
         // Network/transport errors are retryable
         OpenAIError::Http(_) => true,
@@ -85,8 +89,8 @@ const fn is_retryable_error(err: &OpenAIError) -> bool {
         OpenAIError::Timeout => true,
         // API errors are generally not retryable (bad request, auth, etc.)
         OpenAIError::Api(_) => false,
-        // Parse errors are not retryable
-        OpenAIError::Json(_) => false,
+        // EOF while parsing JSON is typically a truncated/empty upstream body.
+        OpenAIError::Json(error) => is_retryable_json_error(error),
         // Decode errors are not retryable
         OpenAIError::Decode(_) => false,
     }

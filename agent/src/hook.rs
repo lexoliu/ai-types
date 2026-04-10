@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use aither_core::llm::ToolResult;
 
-use crate::context_window::ContextWindowSnapshot;
+use crate::{ContextCheckpoint, TodoItem, context_window::ContextWindowSnapshot};
 
 /// Context provided to hooks before a tool is called.
 #[derive(Debug)]
@@ -100,8 +100,12 @@ pub struct CheckpointContext<'a> {
     pub turn: usize,
     /// Number of recent conversation messages currently in memory.
     pub message_count: usize,
-    /// Serialized runtime context after the latest turn mutations.
-    pub context_json: &'a str,
+    /// Structured runtime context after the latest turn mutations.
+    pub context: &'a ContextCheckpoint,
+    /// Current todo list state.
+    pub todo_items: &'a [TodoItem],
+    /// Skills activated for the current run.
+    pub active_skill_names: &'a [String],
     /// Hash of the currently exposed tool surface.
     pub tool_surface_hash: &'a str,
     /// Whether background work is still active.

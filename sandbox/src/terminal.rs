@@ -250,6 +250,10 @@ async fn ensure_mode_allowed<P: PermissionHandler>(
 /// `terminal` is stateless. Each call selects its own runtime mode.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TerminalArgs {
+    /// Short human-readable explanation of what this command is doing.
+    /// This is shown in the UI instead of echoing the shell source.
+    pub description: String,
+
     /// The terminal command payload to execute.
     pub script: String,
 
@@ -984,6 +988,9 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
     type Res = ToolResult;
 
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
+        if arguments.description.trim().is_empty() {
+            return Err(anyhow::anyhow!("terminal description must not be empty").into());
+        }
         let task_id = random_task_id();
         let script = arguments.script.clone();
         let execution_id = format!("exec-{task_id}");
@@ -2035,6 +2042,7 @@ fn wrap_script_with_session_runtime_env(working_dir: &std::path::Path, script: &
     let bun_cache = session_cache.join("bun");
     let session_config = working_dir.join(".config");
     let playwright_cache = session_cache.join("ms-playwright");
+    let python_path = working_dir.join("skills").join("python");
 
     SessionRuntimeWrapperTemplate {
         tmp_dir: shell_escape(&session_tmp.display().to_string()),
@@ -2042,6 +2050,7 @@ fn wrap_script_with_session_runtime_env(working_dir: &std::path::Path, script: &
         bun_cache_dir: shell_escape(&bun_cache.display().to_string()),
         config_dir: shell_escape(&session_config.display().to_string()),
         playwright_cache_dir: shell_escape(&playwright_cache.display().to_string()),
+        python_path: shell_escape(&python_path.display().to_string()),
         home_dir: shell_escape(&working_dir.display().to_string()),
         script,
     }
@@ -2057,6 +2066,7 @@ struct SessionRuntimeWrapperTemplate<'a> {
     bun_cache_dir: String,
     config_dir: String,
     playwright_cache_dir: String,
+    python_path: String,
     home_dir: String,
     script: &'a str,
 }
@@ -2617,8 +2627,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_args_defaults() {
-        let args: TerminalArgs =
-            serde_json::from_str(r#"{"script":"echo hello","timeout":1}"#).unwrap();
+        let args: TerminalArgs = serde_json::from_str(
+            r#"{"description":"print a greeting","script":"echo hello","timeout":1}"#,
+        )
+        .unwrap();
         assert_eq!(args.expect, OutputFormat::Text);
         assert_eq!(args.resolution, MediaResolution::Auto);
         assert_eq!(args.timeout, 1);
@@ -2681,13 +2693,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminal_args_timeout() {
-        let args: TerminalArgs =
-            serde_json::from_str(r#"{"script":"echo hello","timeout":0}"#).unwrap();
+        let args: TerminalArgs = serde_json::from_str(
+            r#"{"description":"print a greeting","script":"echo hello","timeout":0}"#,
+        )
+        .unwrap();
         assert_eq!(args.timeout, 0);
 
-        let args_default =
-            serde_json::from_str::<TerminalArgs>(r#"{"script":"echo hello"}"#).unwrap_err();
+        let args_default = serde_json::from_str::<TerminalArgs>(
+            r#"{"description":"print a greeting","script":"echo hello"}"#,
+        )
+        .unwrap_err();
         assert!(args_default.to_string().contains("timeout"));
+
+        let missing_description =
+            serde_json::from_str::<TerminalArgs>(r#"{"script":"echo hello","timeout":1}"#)
+                .unwrap_err();
+        assert!(missing_description.to_string().contains("description"));
     }
 
     #[test]
@@ -2897,6 +2918,7 @@ mod tests {
 
         let result = tool
             .call(TerminalArgs {
+                description: "wait for terminal input and echo it back".to_string(),
                 script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"".to_string(),
                 mode: TerminalExecutionMode::Sandboxed,
                 ssh_server_id: None,
@@ -2961,6 +2983,7 @@ mod tests {
 
         let result = tool
             .call(TerminalArgs {
+                description: "wait for terminal input and echo it back".to_string(),
                 script: "printf 'name? '; read name; printf 'hello %s\\n' \"$name\"".to_string(),
                 mode: TerminalExecutionMode::Sandboxed,
                 ssh_server_id: None,

@@ -211,28 +211,19 @@ impl ContainerExec for BollardContainerExec {
                     StreamEvent::Stdin(Ok(bytes)) => {
                         use tokio::io::AsyncWriteExt;
 
-                        input
-                            .write_all(&bytes)
-                            .await
-                            .map_err(|error| {
-                                format!("container exec stdin write failed: {error}")
-                            })?;
-                        input
-                            .flush()
-                            .await
-                            .map_err(|error| {
-                                format!("container exec stdin flush failed: {error}")
-                            })?;
+                        input.write_all(&bytes).await.map_err(|error| {
+                            format!("container exec stdin write failed: {error}")
+                        })?;
+                        input.flush().await.map_err(|error| {
+                            format!("container exec stdin flush failed: {error}")
+                        })?;
                     }
                     StreamEvent::Stdin(Err(_)) => {
                         use tokio::io::AsyncWriteExt;
 
-                        input
-                            .shutdown()
-                            .await
-                            .map_err(|error| {
-                                format!("container exec stdin shutdown failed: {error}")
-                            })?;
+                        input.shutdown().await.map_err(|error| {
+                            format!("container exec stdin shutdown failed: {error}")
+                        })?;
                         stdin_open = false;
                     }
                     StreamEvent::Cancel => {

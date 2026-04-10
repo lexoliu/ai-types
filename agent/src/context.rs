@@ -26,17 +26,22 @@ pub struct Context {
     /// prefix message.
     system_blocks: IndexMap<String, String>,
 
-    /// Ephemeral reminder blocks rendered as separate system messages after the
-    /// stable system prefix.
-    reminders: Vec<String>,
-
     /// Compaction handoff document from previous context compaction.
     ///
-    /// This is rendered after reminders and before recent conversation.
+    /// This is rendered immediately after the stable system prefix.
     handoff: Option<String>,
 
-    /// Recent conversation messages.
-    recent: Vec<Message>,
+    /// Ordered runtime items rendered after the optional handoff anchor.
+    runtime_items: Vec<ContextRuntimeItem>,
+}
+
+/// Ordered runtime items stored after the fixed handoff anchor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextRuntimeItem {
+    /// A reminder rendered as a system message.
+    Reminder(String),
+    /// A regular conversation message.
+    Message(Message),
 }
 
 impl Context {
@@ -106,18 +111,25 @@ impl Context {
     pub fn insert_reminder<T: Serialize>(&mut self, value: &T) {
         let tag = snake_case_type_name::<T>();
         let xml = serialize_xml(&tag, value);
-        self.reminders.push(xml);
+        self.runtime_items.push(ContextRuntimeItem::Reminder(xml));
     }
 
     /// Clears all ephemeral reminders.
     pub fn clear_reminders(&mut self) {
-        self.reminders.clear();
+        self.runtime_items
+            .retain(|item| !matches!(item, ContextRuntimeItem::Reminder(_)));
     }
 
     /// Returns current reminders.
     #[must_use]
-    pub fn reminders(&self) -> &[String] {
-        &self.reminders
+    pub fn reminders(&self) -> Vec<&str> {
+        self.runtime_items
+            .iter()
+            .filter_map(|item| match item {
+                ContextRuntimeItem::Reminder(content) => Some(content.as_str()),
+                ContextRuntimeItem::Message(_) => None,
+            })
+            .collect()
     }
 
     // ── Handoff ───────────────────────────────────────────────────────
@@ -148,65 +160,98 @@ impl Context {
 
     /// Appends a message to recent conversation.
     pub fn push(&mut self, message: Message) {
-        self.recent.push(message);
+        self.runtime_items
+            .push(ContextRuntimeItem::Message(message));
     }
 
     /// Extends recent conversation with multiple messages.
     pub fn extend(&mut self, messages: impl IntoIterator<Item = Message>) {
-        self.recent.extend(messages);
+        self.runtime_items
+            .extend(messages.into_iter().map(ContextRuntimeItem::Message));
     }
 
     /// Returns number of recent conversation messages.
     #[must_use]
     pub fn len_recent(&self) -> usize {
-        self.recent.len()
+        self.runtime_items
+            .iter()
+            .filter(|item| matches!(item, ContextRuntimeItem::Message(_)))
+            .count()
     }
 
     /// Returns the number of recent system messages.
     #[must_use]
     pub fn count_recent_system_messages(&self) -> usize {
-        self.recent
+        self.runtime_items
             .iter()
-            .filter(|message| message.role() == Role::System)
+            .filter(|item| {
+                matches!(
+                    item,
+                    ContextRuntimeItem::Message(message) if message.role() == Role::System
+                )
+            })
             .count()
     }
 
     /// Returns recent conversation messages.
     #[must_use]
-    pub fn recent(&self) -> &[Message] {
-        &self.recent
-    }
-
-    /// Returns mutable recent conversation messages.
-    #[must_use]
-    pub fn recent_mut(&mut self) -> &mut Vec<Message> {
-        &mut self.recent
+    pub fn recent(&self) -> Vec<&Message> {
+        self.runtime_items
+            .iter()
+            .filter_map(|item| match item {
+                ContextRuntimeItem::Reminder(_) => None,
+                ContextRuntimeItem::Message(message) => Some(message),
+            })
+            .collect()
     }
 
     /// Returns the latest recent message.
     #[must_use]
     pub fn last(&self) -> Option<&Message> {
-        self.recent.last()
+        self.runtime_items.iter().rev().find_map(|item| match item {
+            ContextRuntimeItem::Reminder(_) => None,
+            ContextRuntimeItem::Message(message) => Some(message),
+        })
     }
 
     /// Returns whether recent conversation is empty.
     #[must_use]
     pub fn is_conversation_empty(&self) -> bool {
-        self.recent.is_empty()
+        self.len_recent() == 0
     }
 
     /// Drains oldest recent messages while keeping the latest `keep` messages.
     pub fn drain_oldest(&mut self, keep: usize) -> Vec<Message> {
-        if keep >= self.recent.len() {
+        let remove_count = self.len_recent().saturating_sub(keep);
+        if remove_count == 0 {
             return Vec::new();
         }
-        self.recent.drain(..self.recent.len() - keep).collect()
+        let mut removed = Vec::with_capacity(remove_count);
+        let mut removed_messages = 0usize;
+        let mut retained = Vec::with_capacity(self.runtime_items.len());
+        for item in self.runtime_items.drain(..) {
+            match item {
+                ContextRuntimeItem::Message(message) if removed_messages < remove_count => {
+                    removed.push(message);
+                    removed_messages += 1;
+                }
+                other => retained.push(other),
+            }
+        }
+        self.runtime_items = retained;
+        removed
     }
 
     /// Returns recent conversation messages cloned.
     #[must_use]
     pub fn conversation_messages(&self) -> Vec<Message> {
-        self.recent.clone()
+        self.runtime_items
+            .iter()
+            .filter_map(|item| match item {
+                ContextRuntimeItem::Reminder(_) => None,
+                ContextRuntimeItem::Message(message) => Some(message.clone()),
+            })
+            .collect()
     }
 
     // ── Message assembly ───────────────────────────────────────────────
@@ -215,9 +260,9 @@ impl Context {
     ///
     /// Layout:
     /// 1. Persistent system blocks (single cacheable prefix)
-    /// 2. Ephemeral reminders (one system message each)
-    /// 3. Compaction handoff (optional system message)
-    /// 4. Recent conversation
+    /// 2. Compaction handoff (optional system message)
+    /// 3. Additional transient system messages for the current request
+    /// 4. Ordered runtime items (reminders and conversation messages)
     #[must_use]
     pub fn build_messages(&self) -> Vec<Message> {
         self.build_messages_with_transient_system(&[])
@@ -225,8 +270,8 @@ impl Context {
 
     /// Builds the full LLM message list with additional transient system messages.
     ///
-    /// Transient system messages are appended after persistent system blocks,
-    /// reminders, and handoff, but before recent conversation. They are not
+    /// Transient system messages are appended immediately after the fixed handoff
+    /// anchor and before ordered runtime items. They are not
     /// stored inside the context and therefore are not checkpointed.
     #[must_use]
     pub fn build_messages_with_transient_system(
@@ -245,10 +290,6 @@ impl Context {
             messages.push(Message::system(system_xml));
         }
 
-        for reminder in &self.reminders {
-            messages.push(Message::system(reminder));
-        }
-
         if let Some(handoff) = &self.handoff {
             messages.push(Message::system(handoff));
         }
@@ -257,7 +298,10 @@ impl Context {
             messages.push(Message::system(content.clone()));
         }
 
-        messages.extend(self.recent.iter().cloned());
+        messages.extend(self.runtime_items.iter().cloned().map(|item| match item {
+            ContextRuntimeItem::Reminder(content) => Message::system(content),
+            ContextRuntimeItem::Message(message) => message,
+        }));
         messages
     }
 
@@ -265,14 +309,14 @@ impl Context {
 
     /// Clears only recent conversation messages.
     pub fn clear_recent(&mut self) {
-        self.recent.clear();
+        self.runtime_items
+            .retain(|item| !matches!(item, ContextRuntimeItem::Message(_)));
     }
 
     /// Clears all non-persistent context: reminders, handoff, recent conversation.
     pub fn clear_history(&mut self) {
-        self.reminders.clear();
         self.handoff = None;
-        self.recent.clear();
+        self.runtime_items.clear();
     }
 
     /// Clears everything, including persistent system blocks.
@@ -291,54 +335,102 @@ impl Context {
     #[must_use]
     pub fn checkpoint(&self) -> ContextCheckpoint {
         ContextCheckpoint {
-            reminders: self.reminders.clone(),
             handoff: self.handoff.clone(),
-            recent: self.recent.clone(),
+            items: self
+                .runtime_items
+                .iter()
+                .cloned()
+                .map(|item| match item {
+                    ContextRuntimeItem::Reminder(content) => {
+                        ContextCheckpointItem::Reminder(content)
+                    }
+                    ContextRuntimeItem::Message(message) => ContextCheckpointItem::Message(message),
+                })
+                .collect(),
         }
     }
 
     /// Restores reminders, handoff, and recent conversation from checkpoint.
     pub fn restore(&mut self, checkpoint: ContextCheckpoint) {
-        self.reminders = checkpoint.reminders;
         self.handoff = checkpoint.handoff;
-        self.recent = checkpoint.recent;
+        self.runtime_items = checkpoint
+            .items
+            .into_iter()
+            .map(|item| match item {
+                ContextCheckpointItem::Reminder(content) => ContextRuntimeItem::Reminder(content),
+                ContextCheckpointItem::Message(message) => ContextRuntimeItem::Message(message),
+            })
+            .collect();
     }
 
     /// Removes recent system messages and returns how many were pruned.
     pub fn prune_recent_system_messages(&mut self) -> usize {
-        let before = self.recent.len();
-        self.recent.retain(|message| message.role() != Role::System);
-        before - self.recent.len()
+        let before = self.len_recent();
+        self.runtime_items.retain(|item| {
+            !matches!(
+                item,
+                ContextRuntimeItem::Message(message) if message.role() == Role::System
+            )
+        });
+        before - self.len_recent()
     }
 
     /// Restores runtime-managed state from another serialized context while
     /// preserving the current persistent system blocks.
     pub fn restore_runtime_state(&mut self, restored: Self) {
-        self.reminders = restored.reminders;
         self.handoff = restored.handoff;
-        self.recent = restored.recent;
+        self.runtime_items = restored.runtime_items;
     }
 }
 
 /// A snapshot of non-persistent context state that can be restored.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCheckpoint {
-    reminders: Vec<String>,
     handoff: Option<String>,
-    recent: Vec<Message>,
+    items: Vec<ContextCheckpointItem>,
+}
+
+/// Ordered runtime checkpoint items stored after the fixed handoff anchor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextCheckpointItem {
+    /// A reminder rendered as a system message.
+    Reminder(String),
+    /// A regular conversation message.
+    Message(Message),
 }
 
 impl ContextCheckpoint {
+    /// Creates a structured runtime checkpoint.
+    #[must_use]
+    pub const fn new(handoff: Option<String>, items: Vec<ContextCheckpointItem>) -> Self {
+        Self { handoff, items }
+    }
+
     /// Returns the number of recent messages in this checkpoint.
     #[must_use]
     pub fn len_recent(&self) -> usize {
-        self.recent.len()
+        self.items
+            .iter()
+            .filter(|item| matches!(item, ContextCheckpointItem::Message(_)))
+            .count()
     }
 
-    /// Returns whether this checkpoint has no reminders, no handoff, and no recent messages.
+    /// Returns the current handoff document, if present.
+    #[must_use]
+    pub fn handoff(&self) -> Option<&str> {
+        self.handoff.as_deref()
+    }
+
+    /// Returns ordered runtime checkpoint items.
+    #[must_use]
+    pub fn items(&self) -> &[ContextCheckpointItem] {
+        &self.items
+    }
+
+    /// Returns whether this checkpoint has no handoff and no runtime items.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.reminders.is_empty() && self.handoff.is_none() && self.recent.is_empty()
+        self.handoff.is_none() && self.items.is_empty()
     }
 }
 

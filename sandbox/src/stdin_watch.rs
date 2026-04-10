@@ -15,10 +15,7 @@ fn parse_kernel_u64(value: &str) -> Option<u64> {
 }
 
 fn is_linux_read_syscall(syscall_no: u64) -> bool {
-    matches!(
-        syscall_no,
-        0 | 3 | 63
-    )
+    matches!(syscall_no, 0 | 3 | 63)
 }
 
 /// Detect whether `/proc/<pid>/syscall` indicates `read(0, ...)`.
