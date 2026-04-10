@@ -1,0 +1,39 @@
+[package]
+name = "aither-search"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Search index/query tool for aither agents"
+readme = "../../README.md"
+keywords = ["ai", "agent", "tool", "search", "rag"]
+categories = ["api-bindings"]
+
+[dependencies]
+aither-core.workspace = true
+aither-rag.workspace = true
+arrow-array = "56.2"
+arrow-schema = "56.2"
+async-fs = "2.1"
+futures-lite = "2.6"
+ignore = "0.4"
+jiff = "0.2"
+lance-index = "1.0.1"
+lancedb = { version = "0.23.1", default-features = false }
+regex = "1.12"
+schemars = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+shell-words = "1.1"
+sqlparser = "0.58.0"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+
+[dev-dependencies]
+serde_json = "1.0"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

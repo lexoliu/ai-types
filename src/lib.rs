@@ -78,6 +78,9 @@ pub use aither_mem0 as mem0;
 #[cfg(feature = "websearch")]
 pub use aither_websearch as websearch;
 
+#[cfg(feature = "search")]
+pub use aither_search as search;
+
 #[cfg(feature = "fs")]
 pub use aither_fs as fs;
 
