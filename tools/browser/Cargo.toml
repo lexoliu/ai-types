@@ -1,0 +1,21 @@
+[package]
+name = "aither-browser"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Managed browser tool protocol and agent tool for aither"
+readme = "../../README.md"
+keywords = ["ai", "agent", "tool", "browser"]
+categories = ["api-bindings"]
+
+[dependencies]
+aither-agent = { path = "../../agent", default-features = false }
+aither-core.workspace = true
+schemars = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2"
+
+[lints]
+workspace = true

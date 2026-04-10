@@ -17,6 +17,7 @@ members = [
     "mem0",
     "skills",
     "models",
+    "tools/browser",
     "tools/websearch",
     "tools/webfetch",
     "tools/search",
@@ -57,6 +58,7 @@ aither-ort = { path = "./ort" }
 zenwave = { path = "../zenwave" }
 aither-skills = { path = "./skills" }
 aither-attachments = { path = "./attachments" }
+aither-browser = { path = "./tools/browser" }
 aither-websearch = { path = "./tools/websearch" }
 aither-webfetch = { path = "./tools/webfetch" }
 aither-search = { path = "./tools/search" }
@@ -103,6 +105,7 @@ aither-mem0 = { path = "./mem0", optional = true }
 aither-skills = { workspace = true, optional = true }
 
 # Tools
+aither-browser = { workspace = true, optional = true }
 aither-websearch = { workspace = true, optional = true }
 aither-webfetch = { workspace = true, optional = true }
 aither-search = { workspace = true, optional = true }
@@ -173,6 +176,7 @@ mem0 = ["aither-mem0"]
 skills = ["aither-skills"]
 
 # Tools
+browser = ["aither-browser"]
 websearch = ["aither-websearch"]
 webfetch = ["aither-webfetch"]
 search = ["aither-search"]
@@ -186,7 +190,7 @@ mcp = ["aither-mcp"]
 all-providers = ["openai", "claude", "gemini", "llama", "ort"]
 
 # Convenience feature to enable all tools
-all-tools = ["websearch", "webfetch", "search", "fs", "command"]
+all-tools = ["browser", "websearch", "webfetch", "search", "fs", "command"]
 
 # Convenience feature to enable everything
 full = ["all-providers", "all-tools", "agent", "rag", "mem0", "skills", "mcp"]

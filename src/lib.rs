@@ -75,6 +75,9 @@ pub use aither_rag as rag;
 pub use aither_mem0 as mem0;
 
 // Tools
+#[cfg(feature = "browser")]
+pub use aither_browser as browser;
+
 #[cfg(feature = "websearch")]
 pub use aither_websearch as websearch;
 
