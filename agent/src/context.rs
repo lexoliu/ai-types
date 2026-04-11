@@ -4,6 +4,8 @@
 //! system blocks (stable cacheable prefix), ephemeral reminders, compaction
 //! handoff, and recent conversation messages.
 
+use std::hash::{Hash, Hasher};
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +105,38 @@ impl Context {
     #[must_use]
     pub fn system_blocks_mut(&mut self) -> &mut IndexMap<String, String> {
         &mut self.system_blocks
+    }
+
+    /// Inserts or replaces a persistent system block with raw text.
+    ///
+    /// Unlike [`insert_system`](Self::insert_system) and
+    /// [`insert_system_named`](Self::insert_system_named), the `content` is
+    /// stored verbatim without any XML wrapping. This is the preferred entry
+    /// point for prose system blocks such as workspace descriptions, runtime
+    /// metadata, and environment hints, where XML structure adds tokens
+    /// without providing semantic value.
+    ///
+    /// Use [`insert_system`](Self::insert_system) only when the block is a
+    /// structured payload that genuinely needs XML delimiters to separate
+    /// context from instructions (for example, attached documents).
+    pub fn insert_system_text(&mut self, tag: impl Into<String>, content: impl Into<String>) {
+        self.system_blocks.insert(tag.into(), content.into());
+    }
+
+    /// Returns a stable fingerprint of the current system blocks in order.
+    ///
+    /// The fingerprint changes if and only if the ordered set of
+    /// `(tag, content)` pairs changes. Hosts can use this to detect
+    /// cache-invalidating modifications to the stable system prefix
+    /// (for example, to track KV-cache hit rate over time).
+    #[must_use]
+    pub fn stable_prefix_fingerprint(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (tag, content) in &self.system_blocks {
+            tag.hash(&mut hasher);
+            content.hash(&mut hasher);
+        }
+        hasher.finish()
     }
 
     // ── Reminders (ephemeral) ─────────────────────────────────────────
@@ -510,6 +544,69 @@ mod tests {
     }
 
     #[test]
+    fn insert_system_text_stores_raw_content() {
+        let mut context = Context::new();
+        context.insert_system_text("workspace", "Environment: local\nCWD: /tmp");
+
+        assert_eq!(context.system_block_count(), 1);
+        let messages = context.build_messages();
+        assert_eq!(messages.len(), 1);
+        let rendered = messages[0].content();
+        assert!(rendered.contains("Environment: local"));
+        assert!(rendered.contains("CWD: /tmp"));
+        assert!(
+            !rendered.contains("<workspace>"),
+            "insert_system_text must not add XML tags: {rendered}"
+        );
+    }
+
+    #[test]
+    fn insert_system_text_replaces_by_tag() {
+        let mut context = Context::new();
+        context.insert_system_text("workspace", "old");
+        context.insert_system_text("workspace", "new");
+
+        assert_eq!(context.system_block_count(), 1);
+        let messages = context.build_messages();
+        assert!(messages[0].content().contains("new"));
+        assert!(!messages[0].content().contains("old"));
+    }
+
+    #[test]
+    fn stable_prefix_fingerprint_reflects_block_changes() {
+        let mut context = Context::new();
+        let empty = context.stable_prefix_fingerprint();
+
+        context.insert_system_text("workspace", "a");
+        let after_insert = context.stable_prefix_fingerprint();
+        assert_ne!(empty, after_insert);
+
+        context.insert_system_text("workspace", "b");
+        let after_edit = context.stable_prefix_fingerprint();
+        assert_ne!(after_insert, after_edit);
+
+        context.remove_system_named("workspace");
+        assert_eq!(context.stable_prefix_fingerprint(), empty);
+    }
+
+    #[test]
+    fn stable_prefix_fingerprint_is_order_sensitive() {
+        let mut a = Context::new();
+        a.insert_system_text("one", "1");
+        a.insert_system_text("two", "2");
+
+        let mut b = Context::new();
+        b.insert_system_text("two", "2");
+        b.insert_system_text("one", "1");
+
+        assert_ne!(
+            a.stable_prefix_fingerprint(),
+            b.stable_prefix_fingerprint(),
+            "insertion order must be part of the fingerprint to reflect KV-cache prefix stability"
+        );
+    }
+
+    #[test]
     fn insert_system_replaces_existing_block() {
         let mut context = Context::new();
         context.insert_system(&Memory {
@@ -541,8 +638,8 @@ mod tests {
         let messages = context.build_messages();
         assert_eq!(messages.len(), 4);
         assert!(messages[0].content().contains("base"));
-        assert!(messages[1].content().contains("todo"));
-        assert!(messages[2].content().contains("handoff"));
+        assert!(messages[1].content().contains("handoff"));
+        assert!(messages[2].content().contains("todo"));
         assert!(messages[3].content().contains("hello"));
     }
 
@@ -561,9 +658,9 @@ mod tests {
         let messages = context.build_messages_with_transient_system(&["hidden".to_string()]);
         assert_eq!(messages.len(), 5);
         assert!(messages[0].content().contains("base"));
-        assert!(messages[1].content().contains("todo"));
-        assert!(messages[2].content().contains("handoff"));
-        assert_eq!(messages[3].content(), "hidden");
+        assert!(messages[1].content().contains("handoff"));
+        assert_eq!(messages[2].content(), "hidden");
+        assert!(messages[3].content().contains("todo"));
         assert!(messages[4].content().contains("hello"));
     }
 
