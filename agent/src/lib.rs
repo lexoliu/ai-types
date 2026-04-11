@@ -34,6 +34,7 @@ mod agent;
 pub mod ask_user;
 mod browser_backend;
 mod builder;
+mod cache_stats;
 mod checkpoint;
 mod compression;
 mod config;
@@ -78,6 +79,7 @@ pub use aither_sandbox as sandbox;
 pub use agent::{Agent, CompactResult};
 pub use browser_backend::{BrowserBackend, BrowserBackendError, StaticCdpBrowser};
 pub use builder::AgentBuilder;
+pub use cache_stats::CacheStats;
 pub use checkpoint::AgentCheckpoint;
 pub use compression::{
     CompressionLevel, ContextStrategy, PreserveConfig, PreservedContent, SmartCompressionConfig,

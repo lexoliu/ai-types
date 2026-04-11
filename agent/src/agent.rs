@@ -346,6 +346,12 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// stored in the persistent context or checkpoints.
     pub(crate) transient_system_messages: Vec<String>,
 
+    /// Rolling KV-cache statistics accumulated from emitted `Usage` events.
+    ///
+    /// Hosts can read [`Agent::cache_stats`] at any time to observe the
+    /// cumulative prompt-caching hit rate for this agent session.
+    pub(crate) cache_stats: crate::CacheStats,
+
     /// Runtime skill registry loaded by host integrations.
     /// Automatic prompt-triggered activation is intentionally disabled.
     #[cfg(feature = "skills")]
@@ -396,6 +402,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             last_working_docs: None,
             last_request_started_at: None,
             transient_system_messages: Vec::new(),
+            cache_stats: crate::CacheStats::new(),
             #[cfg(feature = "skills")]
             skill_registry: None,
             #[cfg(feature = "skills")]
@@ -550,6 +557,7 @@ where
                                     text_chunks.push(formatted);
                                 }
                                 Ok(Event::Usage(u)) => {
+                                    self.cache_stats.record(&u);
                                     yield AgentEvent::Usage(u);
                                 }
                                 Err(e) => {
@@ -586,6 +594,7 @@ where
                                     text_chunks.push(formatted);
                                 }
                                 Ok(Event::Usage(u)) => {
+                                    self.cache_stats.record(&u);
                                     yield AgentEvent::Usage(u);
                                 }
                                 Err(e) => {
@@ -622,6 +631,7 @@ where
                                     text_chunks.push(formatted);
                                 }
                                 Ok(Event::Usage(u)) => {
+                                    self.cache_stats.record(&u);
                                     yield AgentEvent::Usage(u);
                                 }
                                 Err(e) => {
@@ -1058,6 +1068,28 @@ where
     /// Clears transient per-turn system messages.
     pub fn clear_transient_system_messages(&mut self) {
         self.transient_system_messages.clear();
+    }
+
+    /// Returns the rolling KV-cache statistics for this agent session.
+    ///
+    /// The stats are updated every time the underlying provider emits a
+    /// `Usage` event (which, for providers like Claude with prompt
+    /// caching, includes `cache_read_tokens` and `cache_write_tokens`).
+    /// Hosts can read the hit rate, reset the accumulator, or snapshot
+    /// it for per-turn diffs.
+    #[must_use]
+    pub const fn cache_stats(&self) -> &crate::CacheStats {
+        &self.cache_stats
+    }
+
+    /// Returns a mutable reference to the KV-cache statistics accumulator.
+    ///
+    /// Hosts typically only use this to [`CacheStats::reset`] between
+    /// distinct sessions, since the agent itself records new observations.
+    ///
+    /// [`CacheStats::reset`]: crate::CacheStats::reset
+    pub const fn cache_stats_mut(&mut self) -> &mut crate::CacheStats {
+        &mut self.cache_stats
     }
 
     /// Clears the conversation history.
@@ -1603,7 +1635,10 @@ where
                                 events.push(Ok(AgentEvent::Text(formatted.clone())));
                                 text_chunks.push(formatted);
                             }
-                            Ok(Event::Usage(u)) => events.push(Ok(AgentEvent::Usage(u))),
+                            Ok(Event::Usage(u)) => {
+                                self.cache_stats.record(&u);
+                                events.push(Ok(AgentEvent::Usage(u)));
+                            }
                             Err(e) => {
                                 error = Some(e.to_string());
                                 break;
@@ -1628,7 +1663,10 @@ where
                                 events.push(Ok(AgentEvent::Text(formatted.clone())));
                                 text_chunks.push(formatted);
                             }
-                            Ok(Event::Usage(u)) => events.push(Ok(AgentEvent::Usage(u))),
+                            Ok(Event::Usage(u)) => {
+                                self.cache_stats.record(&u);
+                                events.push(Ok(AgentEvent::Usage(u)));
+                            }
                             Err(e) => {
                                 error = Some(e.to_string());
                                 break;
@@ -1653,7 +1691,10 @@ where
                                 events.push(Ok(AgentEvent::Text(formatted.clone())));
                                 text_chunks.push(formatted);
                             }
-                            Ok(Event::Usage(u)) => events.push(Ok(AgentEvent::Usage(u))),
+                            Ok(Event::Usage(u)) => {
+                                self.cache_stats.record(&u);
+                                events.push(Ok(AgentEvent::Usage(u)));
+                            }
                             Err(e) => {
                                 error = Some(e.to_string());
                                 break;
