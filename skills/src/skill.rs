@@ -12,8 +12,6 @@ pub struct Skill {
     pub name: String,
     /// Human-readable description.
     pub description: String,
-    /// Trigger phrases that activate this skill.
-    pub triggers: Vec<String>,
     /// The markdown instructions (everything after frontmatter).
     pub instructions: String,
     /// Optional list of allowed tools (None = all tools allowed).
@@ -24,14 +22,12 @@ pub struct Skill {
 
 /// YAML frontmatter parsed from SKILL.md files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillFrontmatter {
     /// Unique name of the skill.
     pub name: String,
     /// Human-readable description.
     pub description: String,
-    /// Trigger phrases that activate this skill.
-    #[serde(default)]
-    pub triggers: Vec<String>,
     /// Optional list of allowed tools.
     #[serde(default)]
     pub tools: Option<Vec<String>>,
@@ -45,8 +41,6 @@ impl Skill {
     /// ---
     /// name: skill-name
     /// description: What this skill does
-    /// triggers:
-    ///   - "trigger phrase"
     /// tools:
     ///   - Read
     ///   - Grep
@@ -84,7 +78,6 @@ impl Skill {
         Ok(Self {
             name: frontmatter.name,
             description: frontmatter.description,
-            triggers: frontmatter.triggers,
             instructions,
             allowed_tools: frontmatter.tools,
             resources: HashMap::new(),
@@ -101,9 +94,6 @@ mod tests {
         let content = r#"---
 name: code-review
 description: Reviews code for security and best practices
-triggers:
-  - "review"
-  - "security audit"
 tools:
   - Read
   - Grep
@@ -122,7 +112,6 @@ When reviewing code, follow these steps:
             skill.description,
             "Reviews code for security and best practices"
         );
-        assert_eq!(skill.triggers, vec!["review", "security audit"]);
         assert_eq!(
             skill.allowed_tools,
             Some(vec!["Read".to_string(), "Grep".to_string()])
@@ -143,7 +132,6 @@ Instructions here.
 
         let skill = Skill::parse(content).unwrap();
         assert_eq!(skill.name, "simple");
-        assert!(skill.triggers.is_empty());
         assert!(skill.allowed_tools.is_none());
     }
 

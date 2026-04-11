@@ -121,8 +121,6 @@ pub enum AgentEvent {
     SkillActivated {
         /// Skill name.
         name: String,
-        /// Trigger phrase that matched, when activation came from a trigger.
-        matched_trigger: Option<String>,
         /// Explicitly allowed tools declared by the skill.
         allowed_tools: Option<Vec<String>>,
         /// Resource files made available by the skill.
@@ -292,13 +290,11 @@ impl AgentEvent {
     #[must_use]
     pub fn skill_activated(
         name: impl Into<String>,
-        matched_trigger: Option<String>,
         allowed_tools: Option<Vec<String>>,
         resource_paths: Option<Vec<String>>,
     ) -> Self {
         Self::SkillActivated {
             name: name.into(),
-            matched_trigger,
             allowed_tools,
             resource_paths,
         }

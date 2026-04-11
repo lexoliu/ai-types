@@ -346,7 +346,8 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// stored in the persistent context or checkpoints.
     pub(crate) transient_system_messages: Vec<String>,
 
-    /// Runtime skill registry for prompt-triggered activation.
+    /// Runtime skill registry loaded by host integrations.
+    /// Automatic prompt-triggered activation is intentionally disabled.
     #[cfg(feature = "skills")]
     pub(crate) skill_registry: Option<Arc<aither_skills::SkillRegistry>>,
 
@@ -703,28 +704,11 @@ where
                 let hooks = &self.hooks;
                 let permission_receiver = self.permission_receiver.clone();
                 let mut permission_pause_tracker = PermissionPauseTracker::from_tool_calls(&tool_calls);
-                #[cfg(feature = "skills")]
-                let active_allowed_tools = self.active_allowed_tools.clone();
                 let tool_futures = tool_calls.iter().map(|call| {
                     let args_json = call.arguments.to_string();
                     let message_count = self.context.len_recent();
-                    #[cfg(feature = "skills")]
-                    let active_allowed_tools = active_allowed_tools.clone();
 
                     async move {
-                        #[cfg(feature = "skills")]
-                        if let Some(allowed_tools) = &active_allowed_tools
-                            && !allowed_tools.contains(&call.name.to_lowercase())
-                        {
-                            let mut reason = String::from("skill activation blocked tool '");
-                            reason.push_str(call.name.as_str());
-                            reason.push('\'');
-                            return Err(AgentError::HookRejected {
-                                hook: "skill_allowed_tools",
-                                reason,
-                            });
-                        }
-
                         let tool_ctx = ToolUseContext {
                             tool_name: &call.name,
                             arguments: &args_json,
@@ -1245,11 +1229,6 @@ where
         Ok(AgentCheckpoint {
             context: self.context.checkpoint(),
             todo_items,
-            active_skill_names: self
-                .active_skills
-                .iter()
-                .map(|skill| skill.name.clone())
-                .collect(),
             tool_surface_hash: self.tool_surface_hash(),
             context_window,
             has_background_tasks: self
@@ -1272,37 +1251,6 @@ where
         {
             self.active_skills.clear();
             self.active_allowed_tools = None;
-            if !checkpoint.active_skill_names.is_empty() {
-                let registry = self.skill_registry.as_ref().ok_or_else(|| {
-                    AgentError::Config(
-                        "checkpoint contains active skills but no skill registry is loaded"
-                            .to_string(),
-                    )
-                })?;
-                let mut allowed_tools = HashSet::new();
-                let mut saw_explicit_allowlist = false;
-                for name in checkpoint.active_skill_names {
-                    let skill = registry
-                        .get(&name)
-                        .ok_or_else(|| {
-                            let mut message = String::from("checkpoint references unknown skill '");
-                            message.push_str(name.as_str());
-                            message.push('\'');
-                            AgentError::Config(message)
-                        })?
-                        .clone();
-                    if let Some(tools) = &skill.allowed_tools {
-                        saw_explicit_allowlist = true;
-                        for tool in tools {
-                            allowed_tools.insert(tool.to_lowercase());
-                        }
-                    }
-                    self.active_skills.push(skill);
-                }
-                if saw_explicit_allowlist {
-                    self.active_allowed_tools = Some(allowed_tools);
-                }
-            }
         }
         Ok(())
     }
@@ -1431,42 +1379,10 @@ where
     }
 
     #[cfg(feature = "skills")]
-    pub(crate) fn activate_skills_for_prompt(&mut self, prompt: &str) -> Vec<AgentEvent> {
+    pub(crate) fn activate_skills_for_prompt(&mut self, _prompt: &str) -> Vec<AgentEvent> {
         self.active_skills.clear();
         self.active_allowed_tools = None;
-        let Some(registry) = self.skill_registry.as_ref() else {
-            return Vec::new();
-        };
-        let matches = registry.match_prompt(prompt);
-        if matches.is_empty() {
-            return Vec::new();
-        }
-
-        let mut allowed_tools = HashSet::new();
-        let mut saw_explicit_allowlist = false;
-        let mut events = Vec::with_capacity(matches.len());
-        for matched in matches {
-            let skill = matched.skill.clone();
-            let mut resource_paths = skill.resources.keys().cloned().collect::<Vec<_>>();
-            resource_paths.sort();
-            if let Some(tools) = &skill.allowed_tools {
-                saw_explicit_allowlist = true;
-                for tool in tools {
-                    allowed_tools.insert(tool.to_lowercase());
-                }
-            }
-            events.push(AgentEvent::skill_activated(
-                skill.name.clone(),
-                matched.matched_trigger.clone(),
-                skill.allowed_tools.clone(),
-                (!resource_paths.is_empty()).then_some(resource_paths),
-            ));
-            self.active_skills.push(skill);
-        }
-        if saw_explicit_allowlist {
-            self.active_allowed_tools = Some(allowed_tools);
-        }
-        events
+        Vec::new()
     }
 
     #[cfg(feature = "skills")]
@@ -1820,26 +1736,9 @@ where
             let tools = &self.tools;
             let permission_receiver = self.permission_receiver.clone();
             let mut permission_pause_tracker = PermissionPauseTracker::from_tool_calls(&tool_calls);
-            #[cfg(feature = "skills")]
-            let active_allowed_tools = self.active_allowed_tools.clone();
             let tool_futures = tool_calls.iter().map(|call| {
                 let args_json = call.arguments.to_string();
-                #[cfg(feature = "skills")]
-                let active_allowed_tools = active_allowed_tools.clone();
                 async move {
-                    #[cfg(feature = "skills")]
-                    if let Some(allowed_tools) = &active_allowed_tools
-                        && !allowed_tools.contains(&call.name.to_lowercase())
-                    {
-                        let mut reason = String::from("skill activation blocked tool '");
-                        reason.push_str(call.name.as_str());
-                        reason.push('\'');
-                        return (
-                            call.id.clone(),
-                            call.name.clone(),
-                            aither_core::llm::ToolResult::error(reason),
-                        );
-                    }
                     let result = match tools.call(&call.name, &args_json).await {
                         Ok(result) => result,
                         Err(error) => {
@@ -2047,11 +1946,6 @@ where
             .as_ref()
             .map(super::todo::TodoList::items)
             .unwrap_or_default();
-        let active_skill_names = self
-            .active_skills
-            .iter()
-            .map(|skill| skill.name.clone())
-            .collect::<Vec<_>>();
         let tool_surface_hash = self.tool_surface_hash();
         let window = self.assemble_context_window().await;
         let checkpoint_ctx = CheckpointContext {
@@ -2061,7 +1955,6 @@ where
             message_count: self.context.len_recent(),
             context: &context,
             todo_items: &todo_items,
-            active_skill_names: &active_skill_names,
             tool_surface_hash: &tool_surface_hash,
             has_background_tasks: self
                 .background_receiver
@@ -2643,11 +2536,10 @@ mod tests {
     }
 
     #[cfg(feature = "skills")]
-    fn empty_checkpoint(active_skill_names: Vec<String>) -> AgentCheckpoint {
+    fn empty_checkpoint() -> AgentCheckpoint {
         AgentCheckpoint {
             context: crate::Context::default().checkpoint(),
             todo_items: Vec::new(),
-            active_skill_names,
             tool_surface_hash: "tool-surface".to_string(),
             context_window: ContextWindowSnapshot {
                 phase: ContextWindowPhase::Stable,
@@ -2674,7 +2566,6 @@ mod tests {
         registry.register(Skill {
             name: "code-review".to_string(),
             description: "Review code carefully".to_string(),
-            triggers: vec!["review".to_string()],
             instructions: "Use a review checklist.".to_string(),
             allowed_tools: Some(vec!["mock_tool".to_string()]),
             resources: HashMap::new(),
@@ -2684,7 +2575,7 @@ mod tests {
 
     #[cfg(feature = "skills")]
     #[test]
-    fn restore_checkpoint_restores_active_skills_and_allowlist() {
+    fn restore_checkpoint_succeeds_without_legacy_skill_state() {
         let mut agent = Agent::with_config(
             MockLlm {
                 context_length: 1000,
@@ -2694,86 +2585,45 @@ mod tests {
         agent.skill_registry = Some(review_skill_registry());
 
         agent
-            .restore_checkpoint(empty_checkpoint(vec!["code-review".to_string()]))
-            .expect("skill checkpoint should restore");
-
-        assert_eq!(agent.active_skills.len(), 1);
-        assert_eq!(agent.active_skills[0].name, "code-review");
-        assert!(
-            agent
-                .active_allowed_tools
-                .as_ref()
-                .is_some_and(|allowed| allowed.contains("mock_tool"))
-        );
+            .restore_checkpoint(empty_checkpoint())
+            .expect("restore checkpoint must succeed");
     }
 
     #[cfg(feature = "skills")]
     #[test]
-    fn restore_checkpoint_rejects_unknown_skill_name() {
-        let mut agent = Agent::with_config(
-            MockLlm {
-                context_length: 1000,
-            },
-            AgentConfig::default(),
-        );
-        agent.skill_registry = Some(review_skill_registry());
-
-        let error = agent
-            .restore_checkpoint(empty_checkpoint(vec!["missing-skill".to_string()]))
-            .expect_err("unknown skill must fail");
-        assert!(
-            error.to_string().contains("unknown skill"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[cfg(feature = "skills")]
-    #[test]
-    fn query_rejects_tool_calls_outside_skill_allowlist() {
+    fn activate_skills_for_prompt_is_disabled() {
         futures_lite::future::block_on(async {
             let mut registry = SkillRegistry::new();
             registry.register(Skill {
                 name: "code-review".to_string(),
                 description: "Review code carefully".to_string(),
-                triggers: vec!["review".to_string()],
                 instructions: "Use a review checklist.".to_string(),
                 allowed_tools: Some(vec!["mock_tool".to_string()]),
                 resources: HashMap::new(),
             });
 
-            let llm = ScriptedLlm {
-                context_length: 1000,
-                events: vec![Event::tool_call(
-                    "call-1",
-                    "forbidden_tool",
-                    serde_json::json!({}),
-                )],
-            };
-            let mut agent = Agent::with_config(llm, AgentConfig::default());
-            agent.skill_registry = Some(Arc::new(registry));
-
-            let error = agent
-                .query("please review this patch")
-                .await
-                .expect_err("disallowed tool call must fail");
-            assert!(
-                error
-                    .to_string()
-                    .contains("skill activation blocked tool 'forbidden_tool'"),
-                "unexpected error: {error}"
+            let mut agent = Agent::with_config(
+                MockLlm {
+                    context_length: 1000,
+                },
+                AgentConfig::default(),
             );
+            agent.skill_registry = Some(Arc::new(registry));
+            let events = agent.activate_skills_for_prompt("please review this patch");
+            assert!(events.is_empty());
+            assert!(agent.active_skills.is_empty());
+            assert!(agent.active_allowed_tools.is_none());
         });
     }
 
     #[cfg(feature = "skills")]
     #[test]
-    fn build_live_request_messages_include_skill_resource_catalog() {
+    fn build_live_request_messages_omit_skill_resource_catalog() {
         futures_lite::future::block_on(async {
             let mut registry = SkillRegistry::new();
             registry.register(Skill {
                 name: "code-review".to_string(),
                 description: "Review code carefully".to_string(),
-                triggers: vec!["review".to_string()],
                 instructions: "Use a review checklist.".to_string(),
                 allowed_tools: Some(vec!["mock_tool".to_string()]),
                 resources: HashMap::from([(
@@ -2795,8 +2645,8 @@ mod tests {
             assert!(
                 messages
                     .iter()
-                    .any(|message| message.content().contains("templates/review.md")),
-                "skill resource catalog should be injected into request messages"
+                    .all(|message| !message.content().contains("templates/review.md")),
+                "skill resource catalog must not be injected automatically"
             );
         });
     }

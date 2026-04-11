@@ -21,9 +21,6 @@
 //! ---
 //! name: code-review
 //! description: Reviews code for security and best practices
-//! triggers:
-//!   - "review"
-//!   - "security audit"
 //! tools:
 //!   - Read
 //!   - Grep
@@ -47,9 +44,6 @@
 //!
 //! let registry = SkillRegistry::from_loader(&loader)?;
 //!
-//! // Find relevant skills
-//! let skills = registry.match_prompt("review this code for security issues");
-//!
 //! // Get skill by name
 //! if let Some(skill) = registry.get("code-review") {
 //!     println!("{}", skill.instructions);
@@ -58,12 +52,10 @@
 
 mod error;
 mod loader;
-mod matcher;
 mod registry;
 mod skill;
 
 pub use error::SkillError;
 pub use loader::SkillLoader;
-pub use matcher::{MatchResult, SkillMatcher};
 pub use registry::SkillRegistry;
 pub use skill::{Skill, SkillFrontmatter};

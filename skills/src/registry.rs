@@ -2,12 +2,11 @@
 
 use std::collections::HashMap;
 
-use crate::{MatchResult, Skill, SkillError, SkillLoader, SkillMatcher};
+use crate::{Skill, SkillError, SkillLoader};
 
 /// Registry of available skills.
 ///
-/// Stores skills by name and provides methods to find relevant skills
-/// based on user prompts.
+/// Stores skills by name for explicit lookup and loading.
 ///
 /// # Example
 ///
@@ -16,16 +15,11 @@ use crate::{MatchResult, Skill, SkillError, SkillLoader, SkillMatcher};
 /// let mut registry = SkillRegistry::new();
 /// registry.load_from(&loader).await?;
 ///
-/// // Find skills relevant to a prompt
-/// let matches = registry.match_prompt("review this code");
-/// for m in matches {
-///     println!("Skill: {} (confidence: {:.2})", m.skill.name, m.confidence);
-/// }
+/// assert!(registry.get("code-review").is_none());
 /// ```
 #[derive(Debug, Default)]
 pub struct SkillRegistry {
     skills: HashMap<String, Skill>,
-    matcher: SkillMatcher,
 }
 
 impl SkillRegistry {
@@ -33,15 +27,6 @@ impl SkillRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Create a registry with a custom matcher.
-    #[must_use]
-    pub fn with_matcher(matcher: SkillMatcher) -> Self {
-        Self {
-            skills: HashMap::new(),
-            matcher,
-        }
     }
 
     /// Load skills from a loader.
@@ -104,28 +89,6 @@ impl SkillRegistry {
         self.skills.is_empty()
     }
 
-    /// Find skills that match a user prompt.
-    ///
-    /// Returns matches sorted by confidence (highest first).
-    #[must_use]
-    pub fn match_prompt(&self, prompt: &str) -> Vec<MatchResult<'_>> {
-        // Clone skills for matching (matcher takes owned slice)
-        let skills_owned: Vec<Skill> = self.skills.values().cloned().collect();
-        let matches = self.matcher.match_prompt(prompt, &skills_owned);
-
-        // Re-map to registry references for stable lifetimes
-        matches
-            .into_iter()
-            .filter_map(|m| {
-                self.skills.get(&m.skill.name).map(|skill| MatchResult {
-                    skill,
-                    confidence: m.confidence,
-                    matched_trigger: m.matched_trigger,
-                })
-            })
-            .collect()
-    }
-
     /// Remove a skill from the registry.
     pub fn remove(&mut self, name: &str) -> Option<Skill> {
         self.skills.remove(name)
@@ -141,14 +104,10 @@ impl SkillRegistry {
 mod tests {
     use super::*;
 
-    fn make_skill(name: &str, triggers: &[&str]) -> Skill {
+    fn make_skill(name: &str) -> Skill {
         Skill {
             name: name.to_string(),
             description: format!("{name} description"),
-            triggers: triggers
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect(),
             instructions: format!("Instructions for {name}"),
             allowed_tools: None,
             resources: HashMap::new(),
@@ -158,7 +117,7 @@ mod tests {
     #[test]
     fn test_register_and_get() {
         let mut registry = SkillRegistry::new();
-        registry.register(make_skill("test", &[]));
+        registry.register(make_skill("test"));
 
         assert!(registry.contains("test"));
         assert_eq!(
@@ -171,8 +130,8 @@ mod tests {
     #[test]
     fn test_names_and_all() {
         let mut registry = SkillRegistry::new();
-        registry.register(make_skill("alpha", &[]));
-        registry.register(make_skill("beta", &[]));
+        registry.register(make_skill("alpha"));
+        registry.register(make_skill("beta"));
 
         let names = registry.names();
         assert_eq!(names.len(), 2);
@@ -183,21 +142,10 @@ mod tests {
     }
 
     #[test]
-    fn test_match_prompt() {
-        let mut registry = SkillRegistry::new();
-        registry.register(make_skill("code-review", &["review", "audit"]));
-        registry.register(make_skill("refactor", &["refactor"]));
-
-        let matches = registry.match_prompt("please review this code");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].skill.name, "code-review");
-    }
-
-    #[test]
     fn test_remove_and_clear() {
         let mut registry = SkillRegistry::new();
-        registry.register(make_skill("a", &[]));
-        registry.register(make_skill("b", &[]));
+        registry.register(make_skill("a"));
+        registry.register(make_skill("b"));
 
         assert_eq!(registry.len(), 2);
 

@@ -104,8 +104,6 @@ pub struct CheckpointContext<'a> {
     pub context: &'a ContextCheckpoint,
     /// Current todo list state.
     pub todo_items: &'a [TodoItem],
-    /// Skills activated for the current run.
-    pub active_skill_names: &'a [String],
     /// Hash of the currently exposed tool surface.
     pub tool_surface_hash: &'a str,
     /// Whether background work is still active.
