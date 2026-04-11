@@ -523,6 +523,18 @@ where
         self
     }
 
+    /// Inserts or replaces a persistent system block with raw text.
+    ///
+    /// Unlike [`system`](Self::system) and [`system_named`](Self::system_named),
+    /// the `content` is stored verbatim without any XML wrapping. This is the
+    /// preferred entry point for prose system blocks (workspace descriptions,
+    /// runtime metadata, environment hints) where XML structure adds tokens
+    /// without providing semantic value.
+    pub fn system_text(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
+        self.inner = self.inner.system_text(tag, content);
+        self
+    }
+
     /// Generates and sets the default system prompt using the built-in template.
     ///
     /// This should be called after all tools are registered.
