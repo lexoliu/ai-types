@@ -166,6 +166,25 @@ pub enum Event {
     /// This is for observability only - it's not part of the conversation.
     Reasoning(String),
 
+    /// Incremental tool call assembly progress.
+    ///
+    /// Emitted as the model streams a tool call's name and arguments.
+    /// Consumers can use this to show early UI feedback (e.g., tool name
+    /// and partial description) before the full arguments are available.
+    ///
+    /// A final [`Event::ToolCall`] is always emitted once the tool call
+    /// is fully assembled; consumers that don't need incremental progress
+    /// can ignore `ToolCallDelta` entirely.
+    ToolCallDelta {
+        /// Tool call identifier (available from the first delta).
+        id: String,
+        /// Tool name (available from the first delta for Claude;
+        /// may arrive incrementally for OpenAI).
+        name: String,
+        /// Partial JSON arguments accumulated so far.
+        arguments_fragment: String,
+    },
+
     /// Request to execute a tool.
     ///
     /// **Important**: The core crate does NOT execute tool calls.
@@ -209,6 +228,20 @@ impl Event {
     #[must_use]
     pub fn reasoning(thought: impl Into<String>) -> Self {
         Self::Reasoning(thought.into())
+    }
+
+    /// Creates a tool call delta event for incremental streaming.
+    #[must_use]
+    pub fn tool_call_delta(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments_fragment: impl Into<String>,
+    ) -> Self {
+        Self::ToolCallDelta {
+            id: id.into(),
+            name: name.into(),
+            arguments_fragment: arguments_fragment.into(),
+        }
     }
 
     /// Creates a tool call event.

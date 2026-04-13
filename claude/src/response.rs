@@ -347,6 +347,12 @@ pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<Vec<LLMEven
                     }
                 }
                 ContentBlockType::ToolUse { id, name, .. } => {
+                    // Emit initial delta so UI can show the tool name immediately
+                    events.push(LLMEvent::ToolCallDelta {
+                        id: id.clone(),
+                        name: name.clone(),
+                        arguments_fragment: String::new(),
+                    });
                     state.blocks[ev.index] = BlockState::ToolUse {
                         id,
                         name,
@@ -372,10 +378,19 @@ pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<Vec<LLMEven
                         events.push(LLMEvent::Reasoning(delta));
                     }
                     (
-                        BlockState::ToolUse { input_json, .. },
+                        BlockState::ToolUse {
+                            id,
+                            name,
+                            input_json,
+                        },
                         DeltaType::InputJsonDelta { partial_json },
                     ) => {
                         input_json.push_str(&partial_json);
+                        events.push(LLMEvent::ToolCallDelta {
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments_fragment: input_json.clone(),
+                        });
                     }
                     _ => {
                         // Mismatched delta type - ignore

@@ -671,7 +671,7 @@ fn chat_completions_stream_inner(
                                         }
                                     }
                                 }
-                                // Accumulate tool calls
+                                // Accumulate tool calls and emit deltas
                                 if let Some(calls) = &choice.delta.tool_calls {
                                     for call in calls {
                                         let index = call.index.unwrap_or(0);
@@ -686,6 +686,14 @@ fn chat_completions_stream_inner(
                                             if let Some(args) = &function.arguments {
                                                 acc.arguments.push_str(args);
                                             }
+                                        }
+                                        // Emit delta for UI progress
+                                        if let (Some(id), Some(name)) = (&acc.id, &acc.name) {
+                                            yield Ok(Event::ToolCallDelta {
+                                                id: id.clone(),
+                                                name: name.clone(),
+                                                arguments_fragment: acc.arguments.clone(),
+                                            });
                                         }
                                     }
                                 }
@@ -1072,12 +1080,28 @@ fn responses_stream_inner(
                                         acc.item_id = non_empty_response_id(item_id)
                                             .or_else(|| non_empty_response_id(Some(id)));
                                         acc.call_id = Some(normalize_response_call_id(call_id, &fallback_id));
-                                        acc.name = Some(name);
+                                        acc.name = Some(name.clone());
+                                        // Emit initial delta with tool name
+                                        if let Some(ref call_id) = acc.call_id {
+                                            yield Ok(Event::ToolCallDelta {
+                                                id: call_id.clone(),
+                                                name,
+                                                arguments_fragment: String::new(),
+                                            });
+                                        }
                                     }
                                 }
                                 ResponsesStreamEvent::FunctionCallArgumentsDelta { delta, output_index, .. } => {
                                     let acc = function_calls.entry(output_index).or_default();
                                     acc.arguments.push_str(&delta);
+                                    // Emit delta for UI progress
+                                    if let (Some(call_id), Some(name)) = (&acc.call_id, &acc.name) {
+                                        yield Ok(Event::ToolCallDelta {
+                                            id: call_id.clone(),
+                                            name: name.clone(),
+                                            arguments_fragment: acc.arguments.clone(),
+                                        });
+                                    }
                                 }
                                 ResponsesStreamEvent::FunctionCallArgumentsDone { arguments, output_index, .. } => {
                                     let acc = function_calls.entry(output_index).or_default();

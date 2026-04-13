@@ -33,6 +33,19 @@ pub enum AgentEvent {
     /// Reasoning step (for models with extended thinking).
     Reasoning(String),
 
+    /// Incremental tool call assembly progress from the model stream.
+    ///
+    /// Emitted as the model streams tool call name and arguments, before the
+    /// full call is assembled. UI layers can use this to show early feedback.
+    ToolCallDelta {
+        /// Tool call identifier.
+        id: String,
+        /// Tool name (may be empty in very early deltas for some providers).
+        name: String,
+        /// Partial JSON arguments accumulated so far.
+        arguments_fragment: String,
+    },
+
     /// Tool is about to be called.
     ToolCallStart {
         /// Unique identifier for this tool call.
@@ -162,6 +175,20 @@ impl AgentEvent {
     #[must_use]
     pub fn reasoning(content: impl Into<String>) -> Self {
         Self::Reasoning(content.into())
+    }
+
+    /// Creates a new tool call delta event.
+    #[must_use]
+    pub fn tool_delta(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments_fragment: impl Into<String>,
+    ) -> Self {
+        Self::ToolCallDelta {
+            id: id.into(),
+            name: name.into(),
+            arguments_fragment: arguments_fragment.into(),
+        }
     }
 
     /// Creates a new tool call start event.

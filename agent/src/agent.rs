@@ -550,6 +550,9 @@ where
                                 Ok(Event::Reasoning(r)) => {
                                     yield AgentEvent::Reasoning(r);
                                 }
+                                Ok(Event::ToolCallDelta { id, name, arguments_fragment }) => {
+                                    yield AgentEvent::ToolCallDelta { id, name, arguments_fragment };
+                                }
                                 Ok(Event::ToolCall(call)) => tool_calls.push(call),
                                 Ok(Event::BuiltInToolResult { tool, result }) => {
                                     let formatted = format_builtin_tool_result(&tool, &result);
@@ -587,6 +590,9 @@ where
                                 Ok(Event::Reasoning(r)) => {
                                     yield AgentEvent::Reasoning(r);
                                 }
+                                Ok(Event::ToolCallDelta { id, name, arguments_fragment }) => {
+                                    yield AgentEvent::ToolCallDelta { id, name, arguments_fragment };
+                                }
                                 Ok(Event::ToolCall(call)) => tool_calls.push(call),
                                 Ok(Event::BuiltInToolResult { tool, result }) => {
                                     let formatted = format_builtin_tool_result(&tool, &result);
@@ -623,6 +629,9 @@ where
                                 }
                                 Ok(Event::Reasoning(r)) => {
                                     yield AgentEvent::Reasoning(r);
+                                }
+                                Ok(Event::ToolCallDelta { id, name, arguments_fragment }) => {
+                                    yield AgentEvent::ToolCallDelta { id, name, arguments_fragment };
                                 }
                                 Ok(Event::ToolCall(call)) => tool_calls.push(call),
                                 Ok(Event::BuiltInToolResult { tool, result }) => {
@@ -1629,6 +1638,9 @@ where
                                 text_chunks.push(text);
                             }
                             Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
+                            Ok(Event::ToolCallDelta { id, name, arguments_fragment }) => {
+                                events.push(Ok(AgentEvent::ToolCallDelta { id, name, arguments_fragment }));
+                            }
                             Ok(Event::ToolCall(call)) => tool_calls.push(call),
                             Ok(Event::BuiltInToolResult { tool, result }) => {
                                 let formatted = format_builtin_tool_result(&tool, &result);
@@ -1657,6 +1669,9 @@ where
                                 text_chunks.push(text);
                             }
                             Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
+                            Ok(Event::ToolCallDelta { id, name, arguments_fragment }) => {
+                                events.push(Ok(AgentEvent::ToolCallDelta { id, name, arguments_fragment }));
+                            }
                             Ok(Event::ToolCall(call)) => tool_calls.push(call),
                             Ok(Event::BuiltInToolResult { tool, result }) => {
                                 let formatted = format_builtin_tool_result(&tool, &result);
@@ -1685,6 +1700,9 @@ where
                                 text_chunks.push(text);
                             }
                             Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
+                            Ok(Event::ToolCallDelta { id, name, arguments_fragment }) => {
+                                events.push(Ok(AgentEvent::ToolCallDelta { id, name, arguments_fragment }));
+                            }
                             Ok(Event::ToolCall(call)) => tool_calls.push(call),
                             Ok(Event::BuiltInToolResult { tool, result }) => {
                                 let formatted = format_builtin_tool_result(&tool, &result);
