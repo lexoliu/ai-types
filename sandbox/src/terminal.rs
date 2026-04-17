@@ -326,6 +326,28 @@ const fn default_max_lines() -> u32 {
 
 const MAX_LINES_CEILING: u32 = 800;
 
+/// Why a foreground terminal command was promoted to the background.
+///
+/// Propagated to the UI so the background shelf can render a meaningful
+/// caption ("Promoted after 2s timeout" vs "Waiting for input" vs explicit).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BackgroundReason {
+    /// Exceeded the per-call foreground timeout budget.
+    Timeout {
+        /// Timeout in seconds as configured by the caller.
+        configured_seconds: u64,
+    },
+    /// stdin-blocked detector fired — process is waiting for input that
+    /// will not arrive via the foreground path.
+    StdinBlocked {
+        /// Human-readable notice from the detector, suitable for display.
+        notice: String,
+    },
+    /// Caller explicitly asked to run in the background (`timeout == 0`).
+    Explicit,
+}
+
 /// Result of a terminal execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalResult {
@@ -347,11 +369,16 @@ pub struct TerminalResult {
     /// Status for background tasks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+
+    /// Why the command was moved to the background (only populated when
+    /// `status == "running"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_reason: Option<BackgroundReason>,
 }
 
 enum ForegroundDecision {
     Completed(Result<TerminalResult, String>),
-    PromoteToBackground(Option<String>),
+    PromoteToBackground(BackgroundReason),
 }
 
 #[derive(Clone)]
@@ -1228,12 +1255,13 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                     ));
                 }
             }
+            let reason = BackgroundReason::Explicit;
             let stdout = start_background_output_redirect(
                 &self.job_registry,
                 &store_dir,
                 &task_id,
                 max_lines,
-                None,
+                Some(&reason),
             )
             .await?;
             let running = TerminalResult {
@@ -1242,10 +1270,12 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                 exit_code: 0,
                 task_id: Some(task_id),
                 status: Some("running".to_string()),
+                background_reason: Some(reason),
             };
             return ToolResult::json(&running);
         }
 
+        let configured_timeout_seconds = timeout;
         let timeout = std::time::Duration::from_secs(timeout);
         let immediate = futures_lite::future::or(
             async {
@@ -1258,15 +1288,27 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
             async {
                 futures_lite::future::or(
                     async {
-                        stdin_blocked_rx
-                            .recv()
-                            .await
-                            .ok()
-                            .map(|reason| ForegroundDecision::PromoteToBackground(Some(reason)))
+                        stdin_blocked_rx.recv().await.ok().map(|notice| {
+                            ForegroundDecision::PromoteToBackground(
+                                BackgroundReason::StdinBlocked { notice },
+                            )
+                        })
                     },
                     async {
                         async_io::Timer::after(timeout).await;
-                        Some(ForegroundDecision::PromoteToBackground(None))
+                        // Grace window: the completion channel and timer can
+                        // both become ready in the same tick. If completion
+                        // arrived first we must not promote — one non-blocking
+                        // poll here preserves "command finished in time" even
+                        // when executor polling order races.
+                        if let Ok(result) = result_rx.try_recv() {
+                            return Some(ForegroundDecision::Completed(result));
+                        }
+                        Some(ForegroundDecision::PromoteToBackground(
+                            BackgroundReason::Timeout {
+                                configured_seconds: configured_timeout_seconds,
+                            },
+                        ))
                     },
                 )
                 .await
@@ -1274,78 +1316,56 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         )
         .await;
 
-        match immediate {
+        let (reason, pre_registered) = match immediate {
             Some(ForegroundDecision::Completed(Ok(mut result))) => {
                 result.task_id = None;
                 result.status = None;
-
-                let failed = result.exit_code != 0;
-                let json = serde_json::to_string(&result).map_err(|e| anyhow::anyhow!(e))?;
-
-                if failed {
-                    return Err(anyhow::anyhow!(format!("terminal command failed: {json}")));
-                }
-
-                ToolResult::json(&result)
+                result.background_reason = None;
+                return ToolResult::json(&result);
             }
-            Some(ForegroundDecision::Completed(Err(err))) => Err(anyhow::anyhow!(err)),
-            Some(ForegroundDecision::PromoteToBackground(reason)) => {
-                background_mode.store(true, Ordering::Release);
-                match startup_rx.recv().await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => return Err(anyhow::anyhow!(err)),
-                    Err(_) => {
-                        return Err(anyhow::anyhow!(
-                            "background startup channel dropped before registration"
-                        ));
-                    }
-                }
-                let stdout = start_background_output_redirect(
-                    &self.job_registry,
-                    &store_dir,
-                    &task_id,
-                    max_lines,
-                    reason.as_deref(),
-                )
-                .await?;
-                let running = TerminalResult {
-                    stdout,
-                    stderr: None,
-                    exit_code: 0,
-                    task_id: Some(task_id),
-                    status: Some("running".to_string()),
-                };
-                ToolResult::json(&running)
+            Some(ForegroundDecision::Completed(Err(err))) => {
+                return Err(anyhow::anyhow!(err));
             }
-            None => {
-                background_mode.store(true, Ordering::Release);
-                match startup_rx.recv().await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => return Err(anyhow::anyhow!(err)),
-                    Err(_) => {
-                        return Err(anyhow::anyhow!(
-                            "background startup channel dropped before registration"
-                        ));
-                    }
+            Some(ForegroundDecision::PromoteToBackground(reason)) => (reason, false),
+            None => (BackgroundReason::Explicit, false),
+        };
+
+        tracing::info!(
+            target: "may::background_promotion",
+            reason = ?reason,
+            configured_timeout_seconds,
+            "promoting terminal command to background"
+        );
+
+        background_mode.store(true, Ordering::Release);
+        if !pre_registered {
+            match startup_rx.recv().await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(anyhow::anyhow!(err)),
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "background startup channel dropped before registration"
+                    ));
                 }
-                let stdout = start_background_output_redirect(
-                    &self.job_registry,
-                    &store_dir,
-                    &task_id,
-                    max_lines,
-                    None,
-                )
-                .await?;
-                let running = TerminalResult {
-                    stdout,
-                    stderr: None,
-                    exit_code: 0,
-                    task_id: Some(task_id),
-                    status: Some("running".to_string()),
-                };
-                ToolResult::json(&running)
             }
         }
+        let stdout = start_background_output_redirect(
+            &self.job_registry,
+            &store_dir,
+            &task_id,
+            max_lines,
+            Some(&reason),
+        )
+        .await?;
+        let running = TerminalResult {
+            stdout,
+            stderr: None,
+            exit_code: 0,
+            task_id: Some(task_id),
+            status: Some("running".to_string()),
+            background_reason: Some(reason),
+        };
+        ToolResult::json(&running)
     }
 }
 
@@ -1354,7 +1374,7 @@ async fn start_background_output_redirect(
     store_dir: &PathBuf,
     task_id: &str,
     max_lines: usize,
-    promotion_reason: Option<&str>,
+    promotion_reason: Option<&BackgroundReason>,
 ) -> Result<OutputEntry, anyhow::Error> {
     let url = save_raw_to_file(store_dir, &[]).await?;
     let output_path = store_dir.join(url.strip_prefix("outputs/").unwrap_or(&url));
@@ -1364,8 +1384,11 @@ async fn start_background_output_redirect(
         .await
         .map_err(anyhow::Error::msg)?;
     let (preview, truncated) = preview_first_lines(&snapshot, max_lines);
-    let text = match (promotion_reason, preview.is_empty()) {
-        (Some(reason), true) => reason.to_string(),
+    let text = match (
+        promotion_reason.map(background_reason_preview),
+        preview.is_empty(),
+    ) {
+        (Some(reason), true) => reason,
         (Some(reason), false) => format!("{reason}\n{preview}"),
         (None, true) => "(no output yet)".to_string(),
         (None, false) => preview,
@@ -1375,6 +1398,16 @@ async fn start_background_output_redirect(
         url,
         content: Some(Content::Text { text, truncated }),
     })
+}
+
+fn background_reason_preview(reason: &BackgroundReason) -> String {
+    match reason {
+        BackgroundReason::Timeout { configured_seconds } => {
+            format!("Foreground timeout of {configured_seconds}s elapsed — promoted to background.")
+        }
+        BackgroundReason::StdinBlocked { notice } => notice.clone(),
+        BackgroundReason::Explicit => "Started in background (timeout=0 requested).".to_string(),
+    }
 }
 
 /// Standalone script execution that can be spawned in a background task.
@@ -1621,6 +1654,7 @@ where
         exit_code,
         task_id: None,
         status: None,
+        background_reason: None,
     })
 }
 
@@ -2654,6 +2688,7 @@ mod tests {
             exit_code: 0,
             task_id: None,
             status: None,
+            background_reason: None,
         };
 
         let json = serde_json::to_string(&result).unwrap();
@@ -2673,6 +2708,7 @@ mod tests {
             exit_code: 0,
             task_id: None,
             status: None,
+            background_reason: None,
         };
         let json_inline = serde_json::to_string(&result_inline).unwrap();
         assert!(!json_inline.contains("\"url\""));
@@ -2685,6 +2721,9 @@ mod tests {
             exit_code: 0,
             task_id: Some("amber-forest-thunder-pearl".to_string()),
             status: Some("running".to_string()),
+            background_reason: Some(BackgroundReason::Timeout {
+                configured_seconds: 30,
+            }),
         };
         let json_bg = serde_json::to_string(&result_background).unwrap();
         assert!(json_bg.contains("\"task_id\":\"amber-forest-thunder-pearl\""));
@@ -2893,6 +2932,56 @@ mod tests {
             }
             Err(error) => panic!("sandboxed pwd should succeed, got error: {error}"),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_command_returns_json_with_nonzero_exit_code() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let tool: TerminalTool<TestPermissionHandler, executor_core::tokio::TokioGlobal> =
+            TerminalTool::new_exact(
+                dir.path(),
+                TestPermissionHandler::default(),
+                executor_core::tokio::TokioGlobal,
+            )
+            .await
+            .expect("terminal tool should initialize")
+            .with_shell_runtime_availability(crate::ShellRuntimeAvailability {
+                local: true,
+                container: false,
+                ssh: false,
+            });
+        let registry = Arc::new(ToolRegistryBuilder::new().build(tool.outputs_dir()));
+        let tool = tool.with_registry(registry);
+
+        let result = tool
+            .call(TerminalArgs {
+                description: "exit with non-zero status".to_string(),
+                script: "exit 42".to_string(),
+                mode: TerminalExecutionMode::Sandboxed,
+                ssh_server_id: None,
+                expect: OutputFormat::Text,
+                resolution: MediaResolution::Auto,
+                timeout: 30,
+                max_lines: 50,
+                raw: false,
+            })
+            .await
+            .expect("terminal call should not be promoted to transport error on non-zero exit");
+
+        assert!(
+            !result.is_error(),
+            "non-zero exit must not produce ToolResult::Error, got: {result:?}"
+        );
+        let payload = parse_terminal_tool_result(&result);
+        assert_eq!(payload.exit_code, 42, "exit code should round-trip");
+        assert!(
+            payload.task_id.is_none(),
+            "foreground completion must not carry a task id"
+        );
+        assert!(
+            payload.status.is_none(),
+            "foreground completion must not carry a running status"
+        );
     }
 
     #[tokio::test]

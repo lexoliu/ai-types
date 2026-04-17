@@ -40,9 +40,9 @@ use crate::{
 };
 
 use aither_sandbox::{
-    BackgroundTaskReceiver, JobRegistry, OutputStore, PermissionEvent, PermissionEventReceiver,
-    PermissionEventStage, TERMINAL_STDIN_BLOCKED_NOTICE, TerminalArgs, TerminalExecutionMode,
-    TerminalMode,
+    BackgroundReason, BackgroundTaskReceiver, JobRegistry, OutputStore, PermissionEvent,
+    PermissionEventReceiver, PermissionEventStage, TERMINAL_STDIN_BLOCKED_NOTICE, TerminalArgs,
+    TerminalExecutionMode, TerminalMode,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -150,6 +150,7 @@ struct BackgroundTaskStartedEvent {
     output_preview: String,
     output_file: String,
     reminder: String,
+    reason: BackgroundReason,
 }
 
 struct TerminalInputNeededEvent {
@@ -884,6 +885,7 @@ where
                             started.task_id,
                             started.output_preview,
                             started.output_file,
+                            started.reason,
                         );
                     }
                     if is_terminal_call
@@ -1638,8 +1640,16 @@ where
                                 text_chunks.push(text);
                             }
                             Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
-                            Ok(Event::ToolCallDelta { id, name, arguments_fragment }) => {
-                                events.push(Ok(AgentEvent::ToolCallDelta { id, name, arguments_fragment }));
+                            Ok(Event::ToolCallDelta {
+                                id,
+                                name,
+                                arguments_fragment,
+                            }) => {
+                                events.push(Ok(AgentEvent::ToolCallDelta {
+                                    id,
+                                    name,
+                                    arguments_fragment,
+                                }));
                             }
                             Ok(Event::ToolCall(call)) => tool_calls.push(call),
                             Ok(Event::BuiltInToolResult { tool, result }) => {
@@ -1669,8 +1679,16 @@ where
                                 text_chunks.push(text);
                             }
                             Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
-                            Ok(Event::ToolCallDelta { id, name, arguments_fragment }) => {
-                                events.push(Ok(AgentEvent::ToolCallDelta { id, name, arguments_fragment }));
+                            Ok(Event::ToolCallDelta {
+                                id,
+                                name,
+                                arguments_fragment,
+                            }) => {
+                                events.push(Ok(AgentEvent::ToolCallDelta {
+                                    id,
+                                    name,
+                                    arguments_fragment,
+                                }));
                             }
                             Ok(Event::ToolCall(call)) => tool_calls.push(call),
                             Ok(Event::BuiltInToolResult { tool, result }) => {
@@ -1700,8 +1718,16 @@ where
                                 text_chunks.push(text);
                             }
                             Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
-                            Ok(Event::ToolCallDelta { id, name, arguments_fragment }) => {
-                                events.push(Ok(AgentEvent::ToolCallDelta { id, name, arguments_fragment }));
+                            Ok(Event::ToolCallDelta {
+                                id,
+                                name,
+                                arguments_fragment,
+                            }) => {
+                                events.push(Ok(AgentEvent::ToolCallDelta {
+                                    id,
+                                    name,
+                                    arguments_fragment,
+                                }));
                             }
                             Ok(Event::ToolCall(call)) => tool_calls.push(call),
                             Ok(Event::BuiltInToolResult { tool, result }) => {
@@ -1898,6 +1924,7 @@ where
                         started.task_id,
                         started.output_preview,
                         started.output_file,
+                        started.reason,
                     )));
                 }
                 if is_terminal_call
@@ -2097,6 +2124,12 @@ where
             .and_then(serde_json::Value::as_str)
             .unwrap_or("(missing output file)");
 
+        let reason = payload
+            .get("background_reason")
+            .cloned()
+            .and_then(|raw| serde_json::from_value::<BackgroundReason>(raw).ok())
+            .unwrap_or(BackgroundReason::Explicit);
+
         let reminder = BackgroundStartedReminderTemplate {
             task_id,
             output_preview,
@@ -2110,6 +2143,7 @@ where
             output_preview: output_preview.to_string(),
             output_file: output_file.to_string(),
             reminder,
+            reason,
         })
     }
 

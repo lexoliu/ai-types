@@ -94,8 +94,9 @@ pub use stdin_watch::{
     is_waiting_on_stdin,
 };
 pub use terminal::{
-    BackgroundTaskReceiver, CompletedTask, Configured, PermissionEvent, PermissionEventReceiver,
-    PermissionEventStage, TerminalArgs, TerminalError, TerminalExecutionMode, TerminalResult,
-    TerminalTool, TerminalToolFactory, TerminalToolFactoryError, TerminalToolFactoryReceiver,
-    Unconfigured, terminal_tool_factory_channel,
+    BackgroundReason, BackgroundTaskReceiver, CompletedTask, Configured, PermissionEvent,
+    PermissionEventReceiver, PermissionEventStage, TerminalArgs, TerminalError,
+    TerminalExecutionMode, TerminalResult, TerminalTool, TerminalToolFactory,
+    TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured,
+    terminal_tool_factory_channel,
 };

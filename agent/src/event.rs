@@ -5,6 +5,8 @@ use crate::error::AgentError;
 use crate::hook::CheckpointReason;
 use aither_core::llm::ToolResult;
 
+pub use aither_sandbox::BackgroundReason;
+
 /// Reason why an agent run is paused or resumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunPauseReason {
@@ -96,6 +98,8 @@ pub enum AgentEvent {
         output_preview: String,
         /// File path or URL where full output can be recovered.
         output_file: String,
+        /// Why the command was moved to the background.
+        reason: BackgroundReason,
     },
 
     /// A background task completed and its result was reinjected into context.
@@ -266,11 +270,13 @@ impl AgentEvent {
         task_id: impl Into<String>,
         output_preview: impl Into<String>,
         output_file: impl Into<String>,
+        reason: BackgroundReason,
     ) -> Self {
         Self::BackgroundTaskStarted {
             task_id: task_id.into(),
             output_preview: output_preview.into(),
             output_file: output_file.into(),
+            reason,
         }
     }
 

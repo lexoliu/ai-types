@@ -44,9 +44,7 @@ impl Default for BrowserScreenshotMode {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq,
-)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum BrowserReadFormat {
     #[default]
