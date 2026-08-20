@@ -524,6 +524,36 @@ impl<T: Tool + 'static> ToolImpl for RegisteredTool<T> {
     }
 }
 
+/// A tool definition carried something that is not a JSON schema.
+///
+/// JSON Schema allows an object or a bare boolean; anything else — a string, an
+/// array, a number — describes nothing a model could fill in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidSchema {
+    /// The tool whose schema was rejected.
+    name: Cow<'static, str>,
+}
+
+impl InvalidSchema {
+    /// The name of the tool whose schema was rejected.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Display for InvalidSchema {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "tool '{}' has an argument schema that is neither an object nor a boolean",
+            self.name
+        )
+    }
+}
+
+impl core::error::Error for InvalidSchema {}
+
 /// Why a tool could not be added to a [`Tools`] registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterError {
@@ -613,24 +643,26 @@ impl ToolDefinition {
     ///
     /// This is useful for creating definitions from external sources like MCP servers.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the schema value is not a valid JSON schema (must be object or bool).
-    #[must_use]
+    /// Returns [`InvalidSchema`] if the value is not a JSON schema — that is,
+    /// anything other than an object or a boolean. The schema often comes from
+    /// a remote server, so this is a rejection to report, not a bug to panic
+    /// on.
     pub fn from_parts(
         name: Cow<'static, str>,
         description: Cow<'static, str>,
         schema: Value,
-    ) -> Self {
+    ) -> core::result::Result<Self, InvalidSchema> {
         let arguments: Schema = schema
             .try_into()
-            .expect("Schema must be a JSON object or boolean");
+            .map_err(|_| InvalidSchema { name: name.clone() })?;
 
-        Self {
+        Ok(Self {
             name,
             description,
             arguments,
-        }
+        })
     }
 
     /// Returns the tool's name.
@@ -1076,6 +1108,39 @@ mod tests {
 
         async fn call(&self, args: Self::Arguments) -> Result<ToolOutput> {
             Ok(ToolOutput::text(format!("Hello, {}!", args.name)))
+        }
+    }
+
+    #[test]
+    fn from_parts_accepts_object_and_boolean_schemas() {
+        // JSON Schema allows a bare boolean as well as an object.
+        for schema in [
+            serde_json::json!({"type": "object"}),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                ToolDefinition::from_parts("t".into(), "does a thing".into(), schema.clone())
+                    .is_ok(),
+                "{schema} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn from_parts_rejects_non_schema_values() {
+        // A server that sends any of these describes nothing a model could
+        // fill in. Rejecting must not panic: the value came off the wire.
+        for schema in [
+            serde_json::json!("a string"),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!(7),
+            serde_json::json!(null),
+        ] {
+            let result = ToolDefinition::from_parts("weird".into(), "d".into(), schema.clone());
+            let Err(err) = result else {
+                panic!("{schema} should be rejected");
+            };
+            assert_eq!(err.name(), "weird");
         }
     }
 

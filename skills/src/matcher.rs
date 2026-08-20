@@ -7,8 +7,14 @@ use crate::Skill;
 
 /// Matches user prompts against skill triggers.
 ///
-/// Uses simple substring matching for now. Can be extended
-/// to support more sophisticated matching (embeddings, fuzzy, etc.)
+/// Matching is lexical and runs in three passes, most specific first: a
+/// declared trigger phrase, then the skill's name, then keywords shared with
+/// its description. Confidence reflects how much of the prompt the match
+/// covers, so a long trigger scores above an incidental word.
+///
+/// Lexical rather than semantic on purpose: matching runs on every prompt,
+/// before any model call, and must stay cheap and predictable. A skill that
+/// needs semantic recall should declare more trigger phrases.
 #[derive(Debug, Default)]
 pub struct SkillMatcher {
     /// Minimum confidence threshold (0.0 - 1.0).

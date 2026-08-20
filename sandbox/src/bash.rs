@@ -937,6 +937,11 @@ where
     ///
     /// This is useful for creating child bash tools for subagents where
     /// the concrete type cannot be known at compile time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `BashArgs` stops deriving a JSON-object schema, which would
+    /// mean the tool could no longer describe its own arguments to a model.
     pub fn to_dyn(self) -> crate::command::DynBashTool {
         use crate::command::{DynBashTool, DynToolHandler};
         use aither_core::llm::tool::ToolDefinition;
@@ -951,8 +956,11 @@ where
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // `schema_for!` always produces an object, so this cannot fail; it is
+        // spelled out rather than swallowed so a future schema change is loud.
         let definition =
-            ToolDefinition::from_parts("bash".into(), description.into(), schema_value);
+            ToolDefinition::from_parts("bash".into(), description.into(), schema_value)
+                .expect("schema_for! always produces a JSON object");
 
         // Create the handler
         let tool = Arc::new(self);

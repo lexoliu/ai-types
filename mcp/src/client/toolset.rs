@@ -311,17 +311,13 @@ impl McpConnection {
     }
 
     /// Returns aither-compatible tool definitions.
+    ///
+    /// A tool whose schema the server sent in a form JSON Schema does not allow
+    /// is dropped with a warning: it is unusable, and one bad entry should not
+    /// cost the caller every other tool on the server.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.mcp_definitions()
-            .iter()
-            .map(|def| {
-                let name: Cow<'static, str> = Cow::Owned(def.name.clone());
-                let description: Cow<'static, str> =
-                    Cow::Owned(def.description.clone().unwrap_or_default());
-                ToolDefinition::from_parts(name, description, def.input_schema.clone())
-            })
-            .collect()
+        convert_definitions(self.mcp_definitions())
     }
 
     /// Check if this connection has a tool with the given name.
@@ -378,17 +374,11 @@ impl McpToolService {
     }
 
     /// Returns aither-compatible tool definitions.
+    ///
+    /// See [`McpConnection::definitions`] for how an unusable schema is handled.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools
-            .iter()
-            .map(|def| {
-                let name: Cow<'static, str> = Cow::Owned(def.name.clone());
-                let description: Cow<'static, str> =
-                    Cow::Owned(def.description.clone().unwrap_or_default());
-                ToolDefinition::from_parts(name, description, def.input_schema.clone())
-            })
-            .collect()
+        convert_definitions(&self.tools)
     }
 
     /// Check if this service has a tool with the given name.
@@ -421,6 +411,28 @@ impl McpToolService {
             .await
             .map_err(|_| McpError::ConnectionClosed)?
     }
+}
+
+/// Converts the server's tool list into aither definitions.
+///
+/// The schemas come off the wire from a third-party server, so one that is not
+/// a JSON schema at all is a rejection to log, not a reason to fail: that tool
+/// is skipped and the rest are returned.
+fn convert_definitions(defs: &[McpToolDefinition]) -> Vec<ToolDefinition> {
+    defs.iter()
+        .filter_map(|def| {
+            let name: Cow<'static, str> = Cow::Owned(def.name.clone());
+            let description: Cow<'static, str> =
+                Cow::Owned(def.description.clone().unwrap_or_default());
+            match ToolDefinition::from_parts(name, description, def.input_schema.clone()) {
+                Ok(definition) => Some(definition),
+                Err(err) => {
+                    tracing::warn!(error = %err, "skipping MCP tool with an unusable schema");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 /// Drives one MCP connection until every command sender has gone away.

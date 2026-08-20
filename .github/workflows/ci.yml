@@ -103,7 +103,12 @@ jobs:
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-hack
       - run: cargo hack check --each-feature --no-dev-deps
-      - run: cargo hack check --feature-powerset --no-dev-deps
+      # The full powerset of this crate's 20 features is 89,766 `cargo check`
+      # runs, which no CI job can finish. Depth 2 covers every pair of features
+      # — where feature-interaction bugs actually live — in 152 runs. The three
+      # aggregate aliases are unions of features already covered individually
+      # and pairwise, and are what makes the full powerset explode.
+      - run: cargo hack check --feature-powerset --depth 2 --exclude-features all-providers,all-tools,full --no-dev-deps
 
   test:
     name: Test
