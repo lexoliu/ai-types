@@ -1,6 +1,6 @@
 [package]
 name = "aither-models"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.87"
 description = "Model registry with capabilities, context windows, and metadata for popular LLMs"
@@ -24,3 +24,6 @@ ureq = "3"
 [features]
 default = []
 remote = ["zenwave"]
+
+[lints]
+workspace = true

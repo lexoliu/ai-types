@@ -149,7 +149,7 @@ impl SshServer {
 
 #[derive(Debug, Clone)]
 pub enum SshRuntimeProfile {
-    Leash { binary: String },
+    Heel { binary: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -175,7 +175,7 @@ pub trait SshSessionAuthorizer: Send + Sync {
         target: &str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
 
-    fn authorize_leash_install(
+    fn authorize_heel_install(
         &self,
         target: &str,
         details: &str,
@@ -397,7 +397,7 @@ impl Tool for OpenSshTool {
             "ssh_server_id": server.id(),
             "target": server.target,
             "runtime": match runtime {
-                SshRuntimeProfile::Leash { .. } => "leash",
+                SshRuntimeProfile::Heel { .. } => "heel",
             }
         });
         Ok(ToolOutput::text(payload.to_string()))
@@ -419,45 +419,45 @@ pub async fn bootstrap_ssh_runtime(
     }
 
     let remote = detect_remote(target).await?;
-    if remote.leash_found {
-        return Ok(SshRuntimeProfile::Leash {
-            binary: remote.leash_path,
+    if remote.heel_found {
+        return Ok(SshRuntimeProfile::Heel {
+            binary: remote.heel_path,
         });
     }
 
     if let Some(auth) = authorizer {
         let details = format!(
-            "Remote {} ({}) does not have leash installed.",
+            "Remote {} ({}) does not have heel installed.",
             remote.os, remote.arch
         );
         let approve_install = auth
-            .authorize_leash_install(target, &details)
+            .authorize_heel_install(target, &details)
             .await
             .map_err(anyhow::Error::msg)?;
-        if approve_install && install_leash(target, &remote).await? {
+        if approve_install && install_heel(target, &remote).await? {
             let verified = detect_remote(target).await?;
-            if verified.leash_found {
-                return Ok(SshRuntimeProfile::Leash {
-                    binary: verified.leash_path,
+            if verified.heel_found {
+                return Ok(SshRuntimeProfile::Heel {
+                    binary: verified.heel_path,
                 });
             }
         }
     }
 
     Err(anyhow::anyhow!(
-        "remote leash runtime unavailable; ssh mode requires leash on the remote host"
+        "remote heel runtime unavailable; ssh mode requires heel on the remote host"
     ))
 }
 
 struct RemoteInfo {
     os: String,
     arch: String,
-    leash_found: bool,
-    leash_path: String,
+    heel_found: bool,
+    heel_path: String,
 }
 
 async fn detect_remote(target: &str) -> Result<RemoteInfo, anyhow::Error> {
-    let probe = "uname -s; uname -m; if command -v leash >/dev/null 2>&1; then command -v leash; elif [ -x \"$HOME/.local/bin/leash\" ]; then printf '%s\\n' \"$HOME/.local/bin/leash\"; else echo __NO_LEASH__; fi";
+    let probe = "uname -s; uname -m; if command -v heel >/dev/null 2>&1; then command -v heel; elif [ -x \"$HOME/.local/bin/heel\" ]; then printf '%s\\n' \"$HOME/.local/bin/heel\"; else echo __NO_HEEL__; fi";
     let output = async_process::Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
@@ -489,26 +489,26 @@ fn parse_remote_probe_output(stdout: &[u8]) -> Result<RemoteInfo, anyhow::Error>
         return Err(anyhow::anyhow!("ssh probe returned unexpected output"));
     }
 
-    let leash_line = lines[2].clone();
-    let leash_found = leash_line != "__NO_LEASH__";
-    if !leash_found {
+    let heel_line = lines[2].clone();
+    let heel_found = heel_line != "__NO_HEEL__";
+    if !heel_found {
         return Ok(RemoteInfo {
             os: lines[0].clone(),
             arch: lines[1].clone(),
-            leash_found,
-            leash_path: String::new(),
+            heel_found,
+            heel_path: String::new(),
         });
     }
 
     Ok(RemoteInfo {
         os: lines[0].clone(),
         arch: lines[1].clone(),
-        leash_found,
-        leash_path: leash_line,
+        heel_found,
+        heel_path: heel_line,
     })
 }
 
-async fn install_leash(target: &str, remote: &RemoteInfo) -> Result<bool, anyhow::Error> {
+async fn install_heel(target: &str, remote: &RemoteInfo) -> Result<bool, anyhow::Error> {
     let local_os = std::env::consts::OS;
     let remote_os = remote.os.to_lowercase();
     let os_match = (local_os == "macos" && remote_os.contains("darwin"))
@@ -522,8 +522,8 @@ async fn install_leash(target: &str, remote: &RemoteInfo) -> Result<bool, anyhow
         return Ok(false);
     }
 
-    let local_leash = find_local_leash().await?;
-    if local_leash.is_empty() {
+    let local_heel = find_local_heel().await?;
+    if local_heel.is_empty() {
         return Ok(false);
     }
 
@@ -542,18 +542,18 @@ async fn install_leash(target: &str, remote: &RemoteInfo) -> Result<bool, anyhow
         return Ok(false);
     }
 
-    let dest = format!("{target}:~/.local/bin/leash");
+    let dest = format!("{target}:~/.local/bin/heel");
     let scp_status = async_process::Command::new("scp")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
-        .arg(&local_leash)
+        .arg(&local_heel)
         .arg(&dest)
         .stdin(async_process::Stdio::null())
         .status()
         .await
-        .map_err(|e| anyhow::anyhow!("scp leash failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("scp heel failed: {e}"))?;
     if !scp_status.success() {
         return Ok(false);
     }
@@ -564,23 +564,23 @@ async fn install_leash(target: &str, remote: &RemoteInfo) -> Result<bool, anyhow
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg(target)
-        .arg("chmod +x ~/.local/bin/leash && ~/.local/bin/leash --version")
+        .arg("chmod +x ~/.local/bin/heel && ~/.local/bin/heel --version")
         .stdin(async_process::Stdio::null())
         .status()
         .await
-        .map_err(|e| anyhow::anyhow!("verify leash failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("verify heel failed: {e}"))?;
 
     Ok(verify_status.success())
 }
 
-async fn find_local_leash() -> Result<String, anyhow::Error> {
+async fn find_local_heel() -> Result<String, anyhow::Error> {
     let out = async_process::Command::new("sh")
         .arg("-c")
-        .arg("command -v leash || true")
+        .arg("command -v heel || true")
         .stdin(async_process::Stdio::null())
         .output()
         .await
-        .map_err(|e| anyhow::anyhow!("failed to locate local leash: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to locate local heel: {e}"))?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -597,20 +597,20 @@ mod tests {
     use super::parse_remote_probe_output;
 
     #[test]
-    fn parse_remote_probe_detects_local_bin_leash_path() {
-        let stdout = b"Linux\nx86_64\n/home/test/.local/bin/leash\n";
+    fn parse_remote_probe_detects_local_bin_heel_path() {
+        let stdout = b"Linux\nx86_64\n/home/test/.local/bin/heel\n";
         let remote = parse_remote_probe_output(stdout).expect("probe output should parse");
         assert_eq!(remote.os, "Linux");
         assert_eq!(remote.arch, "x86_64");
-        assert!(remote.leash_found);
-        assert_eq!(remote.leash_path, "/home/test/.local/bin/leash");
+        assert!(remote.heel_found);
+        assert_eq!(remote.heel_path, "/home/test/.local/bin/heel");
     }
 
     #[test]
-    fn parse_remote_probe_handles_missing_leash() {
-        let stdout = b"Linux\naarch64\n__NO_LEASH__\n";
+    fn parse_remote_probe_handles_missing_heel() {
+        let stdout = b"Linux\naarch64\n__NO_HEEL__\n";
         let remote = parse_remote_probe_output(stdout).expect("probe output should parse");
-        assert!(!remote.leash_found);
-        assert!(remote.leash_path.is_empty());
+        assert!(!remote.heel_found);
+        assert!(remote.heel_path.is_empty());
     }
 }

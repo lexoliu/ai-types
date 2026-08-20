@@ -1,6 +1,6 @@
 [package]
 name = "aither-ort"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -13,19 +13,24 @@ categories = ["api-bindings"]
 
 [dependencies]
 aither-core.workspace = true
-ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "ndarray"] }
-tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
-ndarray = "0.16"
+# Held at rc.12 to match `magika`, which pins `ort` exactly.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "ndarray"] }
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+ndarray = "0.17"
 thiserror = "2.0"
 
 [dev-dependencies]
-tokio = { version = "1.0", features = ["macros", "rt"] }
+tokio = { version = "1.53", features = ["macros", "rt"] }
 
 [features]
-default = ["cuda", "coreml", "download-binaries"]
+# No execution providers or binary downloads by default: those are deployment
+# decisions for the binary at the top of the dependency tree, not for a library.
+default = []
 cuda = ["ort/cuda"]
 coreml = ["ort/coreml"]
-download-binaries = ["ort/download-binaries"]
+# `ort`'s downloader needs a TLS backend selected, otherwise its build script
+# fails outright. Pull one in so this feature is self-consistent when enabled.
+download-binaries = ["ort/download-binaries", "ort/tls-rustls"]
 
 [lints]
 workspace = true

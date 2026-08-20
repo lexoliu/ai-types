@@ -1,4 +1,4 @@
-//! Bash-based tool execution with leash sandboxing.
+//! Bash-based tool execution with heel sandboxing.
 //!
 //! This crate provides a bash-centric tool execution model where:
 //! - LLM has a single `bash` tool with different permission modes

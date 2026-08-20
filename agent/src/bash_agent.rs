@@ -429,7 +429,7 @@ where
         let host_profile = if availability.container {
             "container"
         } else {
-            "leash"
+            "heel"
         };
         let runtime_kind = if host_profile == "container" {
             "linux_container"
@@ -811,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_container_profile_excludes_leash_modes() {
+    fn test_system_prompt_container_profile_excludes_heel_modes() {
         let prompt = SystemPrompt {
             os: "macOS".to_string(),
             os_version: "15.0".to_string(),
@@ -837,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_leash_profile_includes_shell_modes() {
+    fn test_system_prompt_heel_profile_includes_shell_modes() {
         let prompt = SystemPrompt {
             os: "macOS".to_string(),
             os_version: "15.0".to_string(),
@@ -845,7 +845,7 @@ mod tests {
             user_cwd: "/tmp/project".to_string(),
             sandbox_dir: "/tmp/sandbox".to_string(),
             tools: "- bash: Execute shell commands".to_string(),
-            host_profile: "leash",
+            host_profile: "heel",
             host_runtime_context: "runtime=user_local_machine".to_string(),
             skills: String::new(),
             has_skills: false,
@@ -854,7 +854,7 @@ mod tests {
             is_macos: true,
         }
         .render()
-        .expect("failed to render leash prompt");
+        .expect("failed to render heel prompt");
 
         assert!(prompt.contains("<shell-modes>"));
         assert!(!prompt.contains("<shell-runtime>"));

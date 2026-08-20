@@ -1,6 +1,6 @@
 [package]
 name = "aither-skills"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -13,13 +13,13 @@ categories = ["api-bindings"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"
+serde_norway = "0.9"
 thiserror = "2.0"
 async-fs = "2"
 futures-lite = "2"
 
 [dev-dependencies]
-tempfile = "3.17"
+tempfile = "3.27"
 
 [lints]
 workspace = true

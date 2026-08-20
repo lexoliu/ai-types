@@ -35,7 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aither_core::llm::Tool;
-use leash::IpcCommand;
+use heel::IpcCommand;
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -360,7 +360,7 @@ impl ToolRegistry {
 /// IPC command for invoking tools from the sandbox.
 ///
 /// The `tool_name` comes from the IPC method name, and args are flattened
-/// from the key-value pairs sent by leash-ipc.
+/// from the key-value pairs sent by heel-ipc.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolCallCommand {
     /// Shared tool registry.
@@ -462,10 +462,10 @@ impl IpcCommand for ToolCallCommand {
         self.tool_name = name.to_string();
     }
 
-    fn apply_args(&mut self, params: &[u8]) -> Result<(), leash::rmp_serde::decode::Error> {
+    fn apply_args(&mut self, params: &[u8]) -> Result<(), heel::rmp_serde::decode::Error> {
         // Params are a flattened HashMap that maps directly to args.
         // tool_name is set via set_method_name and preserved here.
-        self.args = leash::rmp_serde::from_slice(params)?;
+        self.args = heel::rmp_serde::from_slice(params)?;
         Ok(())
     }
 
@@ -504,7 +504,7 @@ impl IpcCommand for ToolCallCommand {
 ///
 /// ```rust,ignore
 /// use aither_sandbox::command::register_tool_command;
-/// use leash::IpcRouter;
+/// use heel::IpcRouter;
 ///
 /// let router = IpcRouter::new();
 /// let registry = std::sync::Arc::new(ToolRegistryBuilder::new().build("./outputs"));
@@ -512,10 +512,10 @@ impl IpcCommand for ToolCallCommand {
 /// ```
 #[must_use]
 pub fn register_tool_command(
-    router: leash::IpcRouter,
+    router: heel::IpcRouter,
     registry: Arc<ToolRegistry>,
     tool_name: &str,
-) -> leash::IpcRouter {
+) -> heel::IpcRouter {
     router.register(ToolCallCommand::new(tool_name, registry))
 }
 
@@ -546,8 +546,8 @@ impl IpcCommand for IpcGatewayCommand {
 
     fn set_method_name(&mut self, _name: &str) {}
 
-    fn apply_args(&mut self, params: &[u8]) -> Result<(), leash::rmp_serde::decode::Error> {
-        self.args = leash::rmp_serde::from_slice(params)?;
+    fn apply_args(&mut self, params: &[u8]) -> Result<(), heel::rmp_serde::decode::Error> {
+        self.args = heel::rmp_serde::from_slice(params)?;
         Ok(())
     }
 
@@ -580,9 +580,9 @@ impl IpcCommand for IpcGatewayCommand {
 /// Registers the generic `ipc` gateway command that dispatches to any tool by name.
 #[must_use]
 pub fn register_ipc_gateway_command(
-    router: leash::IpcRouter,
+    router: heel::IpcRouter,
     registry: Arc<ToolRegistry>,
-) -> leash::IpcRouter {
+) -> heel::IpcRouter {
     router.register(IpcGatewayCommand::new(registry))
 }
 
@@ -782,9 +782,9 @@ where
         self.name = name.to_string();
     }
 
-    fn apply_args(&mut self, params: &[u8]) -> Result<(), leash::rmp_serde::decode::Error> {
+    fn apply_args(&mut self, params: &[u8]) -> Result<(), heel::rmp_serde::decode::Error> {
         // Only update args, preserve the tool instance with its state
-        self.args = leash::rmp_serde::from_slice(params)?;
+        self.args = heel::rmp_serde::from_slice(params)?;
         Ok(())
     }
 
@@ -849,12 +849,12 @@ where
 ///
 /// ```rust,ignore
 /// use aither_sandbox::command::register_tool_direct;
-/// use leash::IpcRouter;
+/// use heel::IpcRouter;
 ///
 /// let router = IpcRouter::new();
 /// let router = register_tool_direct(router, my_tool);
 /// ```
-pub fn register_tool_direct<T>(router: leash::IpcRouter, tool: T) -> leash::IpcRouter
+pub fn register_tool_direct<T>(router: heel::IpcRouter, tool: T) -> heel::IpcRouter
 where
     T: Tool + Send + Sync + Clone + Default + 'static,
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
@@ -1069,7 +1069,7 @@ fn find_similar_option<'a>(input: &str, options: impl Iterator<Item = &'a str>) 
 
 /// Parses an object schema from CLI arguments.
 fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
-    // Strip leading "--" separator (from leash-ipc wrapper) without disabling flag parsing.
+    // Strip leading "--" separator (from heel-ipc wrapper) without disabling flag parsing.
     // A standalone "--" later in the args still acts as end-of-options.
     let args = if args.first().map(std::string::String::as_str) == Some("--") {
         &args[1..]
@@ -1600,7 +1600,7 @@ mod tests {
         let schema = schemars::schema_for!(SimpleArgs);
         let schema = serde_json::to_value(schema).unwrap();
 
-        // Leading "--" from leash-ipc is stripped; flags still work after it
+        // Leading "--" from heel-ipc is stripped; flags still work after it
         let result = cli_to_json(
             &schema,
             &[
@@ -1618,7 +1618,7 @@ mod tests {
         let schema = schemars::schema_for!(SimpleArgs);
         let schema = serde_json::to_value(schema).unwrap();
 
-        // Double "--": first is leash-ipc separator, second is end-of-options
+        // Double "--": first is heel-ipc separator, second is end-of-options
         let result = cli_to_json(
             &schema,
             &["--".to_string(), "--".to_string(), "-dash.txt".to_string()],
@@ -1725,7 +1725,7 @@ mod tests {
 
     #[test]
     fn test_tool_call_command_serialization() {
-        // Simulate IPC params (key-value pairs from leash-ipc)
+        // Simulate IPC params (key-value pairs from heel-ipc)
         let json = r#"{"query": "rust async", "max": 5}"#;
         let tmp = tempfile::tempdir().unwrap();
         let registry = ToolRegistryBuilder::new().build(tmp.path());
@@ -1983,7 +1983,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let registry = ToolRegistryBuilder::new().build(tmp.path());
         let mut cmd = ToolCallCommand::new("ask_user", Arc::new(registry));
-        // Simulates what leash-ipc sends
+        // Simulates what heel-ipc sends
         cmd.args = serde_json::from_value(serde_json::json!({
             "args": ["--question", "Pick one", "--options", "A", "--options", "B"]
         }))
@@ -2058,7 +2058,7 @@ mod tests {
         builder.configure_tool(FakeAskUser);
         let registry = std::sync::Arc::new(builder.build(tmp.path()));
 
-        // Simulate what leash-ipc sends: all args in an "args" array
+        // Simulate what heel-ipc sends: all args in an "args" array
         let mut cmd = ToolCallCommand::new("ask_user", registry);
         cmd.args = serde_json::from_value(serde_json::json!({
             "args": [

@@ -1,4 +1,4 @@
-//! Bash tool implementation with leash sandboxing.
+//! Bash tool implementation with heel sandboxing.
 //!
 //! Provides the main `bash` tool that LLMs use to execute scripts.
 //! Scripts run in a sandbox with configurable permission modes.
@@ -28,7 +28,7 @@ use async_io::Async;
 use executor_core::{Executor, Task};
 #[cfg(unix)]
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
-use leash::{
+use heel::{
     AllowAll, DomainRequest, IpcRouter, NetworkPolicy, Sandbox, SandboxConfig, SecurityConfig,
     StdioConfig, WorkingDir,
 };
@@ -129,7 +129,7 @@ pub struct BashArgs {
 
     /// Runtime execution mode.
     /// - "default": local runtime execution with network enabled
-    /// - "unsafe": direct host execution (leash profile only)
+    /// - "unsafe": direct host execution (heel profile only)
     /// - "ssh": execute on a preconfigured SSH server (requires `ssh_server_id`)
     #[serde(default)]
     pub mode: BashExecutionMode,
@@ -754,7 +754,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
                     .map_err(anyhow::Error::msg)?;
                 if !matches!(backend, ShellBackend::Local) {
                     return Err(anyhow::anyhow!(
-                        "unsafe mode is only available in leash local runtime"
+                        "unsafe mode is only available in heel local runtime"
                     ));
                 }
                 (backend, BashMode::Unsafe, None, None, None)
@@ -1465,17 +1465,17 @@ async fn execute_ssh_background(
         .ok_or_else(|| BashError::Execution("missing ssh runtime profile".to_string()))?;
 
     let remote_cmd = match (runtime, mode) {
-        (SshRuntimeProfile::Leash { binary }, BashMode::Network) => format!(
+        (SshRuntimeProfile::Heel { binary }, BashMode::Network) => format!(
             "{} run --network allow -- /bin/bash -lc {}",
             shell_escape(&binary),
             shell_escape(script)
         ),
-        (SshRuntimeProfile::Leash { .. }, BashMode::Unsafe) => {
+        (SshRuntimeProfile::Heel { .. }, BashMode::Unsafe) => {
             return Err(BashError::Execution(
                 "unsafe mode is not supported for ssh backend".to_string(),
             ));
         }
-        (SshRuntimeProfile::Leash { .. }, BashMode::Sandboxed) => {
+        (SshRuntimeProfile::Heel { .. }, BashMode::Sandboxed) => {
             return Err(BashError::Execution(
                 "sandboxed mode is not supported for ssh backend".to_string(),
             ));
@@ -1558,8 +1558,8 @@ fn wrap_container_script(
         .join(" ");
 
     let mut wrapped = String::with_capacity(script.len() + 1024);
-    wrapped.push_str("MAY_IPC_BIN=\"$(command -v leash-ipc || true)\"; ");
-    wrapped.push_str("if [ -z \"$MAY_IPC_BIN\" ]; then echo \"leash-ipc command not found in container\" >&2; exit 127; fi; ");
+    wrapped.push_str("MAY_IPC_BIN=\"$(command -v heel-ipc || true)\"; ");
+    wrapped.push_str("if [ -z \"$MAY_IPC_BIN\" ]; then echo \"heel-ipc command not found in container\" >&2; exit 127; fi; ");
     wrapped.push_str("MAY_IPC_DIR=\"$(mktemp -d)\"; ");
     wrapped.push_str("cleanup(){ local __may_ipc_status=$?; wait >/dev/null 2>&1 || true; rm -rf \"$MAY_IPC_DIR\"; return $__may_ipc_status; }; trap cleanup EXIT; ");
     wrapped.push_str("for cmd in ");
@@ -1570,7 +1570,7 @@ fn wrap_container_script(
     wrapped.push_str("done; ");
     wrapped.push_str("export PATH=\"$MAY_IPC_DIR:$PATH\"; ");
     wrapped.push_str("hash -r; ");
-    wrapped.push_str("export LEASH_IPC_SOCKET=\"tcp://${MAY_HOST_GATEWAY:-host.docker.internal}:");
+    wrapped.push_str("export HEEL_IPC_SOCKET=\"tcp://${MAY_HOST_GATEWAY:-host.docker.internal}:");
     wrapped.push_str(&port.to_string());
     wrapped.push_str("\"; ");
     wrapped.push_str(script);
@@ -1753,7 +1753,7 @@ async fn handle_container_ipc_connection(
 #[cfg(unix)]
 fn decode_container_ipc_args(params: &[u8]) -> Result<Vec<String>, String> {
     let parsed: serde_json::Value =
-        leash::rmp_serde::from_slice(params).map_err(|e| format!("invalid IPC params: {e}"))?;
+        heel::rmp_serde::from_slice(params).map_err(|e| format!("invalid IPC params: {e}"))?;
     let args = parsed
         .as_object()
         .and_then(|map| map.get("args"))
@@ -1778,7 +1778,7 @@ async fn write_container_ipc_success(
     stream: &mut Async<StdTcpStream>,
     response: &serde_json::Value,
 ) -> Result<(), String> {
-    let payload = leash::rmp_serde::to_vec(response)
+    let payload = heel::rmp_serde::to_vec(response)
         .map_err(|e| format!("failed to encode IPC success payload: {e}"))?;
     write_container_ipc_response(stream, true, &payload).await
 }
@@ -1788,7 +1788,7 @@ async fn write_container_ipc_error(
     stream: &mut Async<StdTcpStream>,
     message: &str,
 ) -> Result<(), String> {
-    let payload = leash::rmp_serde::to_vec(&message.to_string())
+    let payload = heel::rmp_serde::to_vec(&message.to_string())
         .map_err(|e| format!("failed to encode IPC error payload: {e}"))?;
     write_container_ipc_response(stream, false, &payload).await
 }
@@ -2005,7 +2005,7 @@ impl<P, E, State> std::fmt::Debug for BashTool<P, E, State> {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-    use leash::ConnectionDirection;
+    use heel::ConnectionDirection;
 
     use super::*;
 
@@ -2116,7 +2116,7 @@ mod tests {
         .expect("wrap script");
         assert!(wrapped.contains("hash -r;"));
         assert!(wrapped.contains("MAY_IPC_DIR"));
-        assert!(wrapped.contains("LEASH_IPC_SOCKET"));
+        assert!(wrapped.contains("HEEL_IPC_SOCKET"));
     }
 
     #[test]

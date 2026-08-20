@@ -13,8 +13,7 @@ use llama_cpp_2::{
     context::params::{LlamaContextParams, LlamaPoolingType},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{AddBos, LlamaChatTemplate, LlamaModel, params::LlamaModelParams},
-    openai::OpenAIChatTemplateParams,
+    model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
 };
 use serde::Serialize;
@@ -305,17 +304,11 @@ fn run_response_generation(
 
     let tool_defs = filter_tool_definitions(tool_defs, &parameters.tool_choice);
     let template = resolve_chat_template(model.as_ref(), cfg.as_ref())?;
-    let prompt = build_prompt(
-        model.as_ref(),
-        &template,
-        &messages,
-        &parameters,
-        &tool_defs,
-    )?;
+    let prompt = build_prompt(model.as_ref(), &template, &messages, &tool_defs)?;
 
     let mut context = create_context(model.as_ref(), backend.as_ref(), cfg.as_ref(), false)?;
     let prompt_tokens = model
-        .str_to_token(&prompt.template_result.prompt, AddBos::Never)
+        .str_to_token(&prompt.text, AddBos::Never)
         .map_err(|err| LlamaError::Token(err.to_string()))?;
 
     if prompt_tokens.is_empty() {
@@ -368,11 +361,14 @@ fn run_response_generation(
         pos += 1;
     }
 
-    if let Ok(parsed) = prompt
-        .template_result
-        .parse_response_oaicompat(&generated, false)
+    // Templates have no tool channel, so the call payload arrives inline in the
+    // generated text. Only look for it when tools were actually offered, and
+    // treat a non-match as "the model chose to answer in prose".
+    if prompt.expects_tool_calls
+        && let Some(payload) = extract_tool_call_payload(&generated)
+        && let Ok(calls) = parse_openai_message(payload)
     {
-        for call in parse_openai_message(&parsed)? {
+        for call in calls {
             if sender.send_blocking(Ok(Event::ToolCall(call))).is_err() {
                 return Ok(());
             }
@@ -421,42 +417,66 @@ fn resolve_chat_template(
 }
 
 struct Prompt {
-    template_result: llama_cpp_2::model::ChatTemplateResult,
+    text: String,
+    /// Whether tools were advertised, and so whether the generated text should
+    /// be inspected for a tool-call payload.
+    expects_tool_calls: bool,
+}
+
+/// Instructions prepended as a system message when tools are available.
+///
+/// `llama.cpp`'s chat templates take plain role/content pairs and have no tool
+/// channel of their own, so the schemas and the expected reply shape have to be
+/// described in-band.
+fn tool_system_prompt(tools_json: &str) -> String {
+    format!(
+        "You have access to the following tools, described as JSON schemas:\n\
+         {tools_json}\n\n\
+         To call one or more tools, reply with nothing but a JSON object of the form:\n\
+         {{\"tool_calls\":[{{\"id\":\"<unique id>\",\"function\":{{\"name\":\"<tool name>\",\
+         \"arguments\":\"<arguments as a JSON string>\"}}}}]}}\n\
+         If no tool is needed, answer normally and do not emit that object."
+    )
 }
 
 fn build_prompt(
     model: &LlamaModel,
     template: &LlamaChatTemplate,
     messages: &[Message],
-    parameters: &Parameters,
     tool_defs: &[ToolDefinition],
 ) -> Result<Prompt, LlamaError> {
-    let messages_json = serde_json::to_string(&messages_to_openai(messages))?;
     let tools_json = tools_to_openai_json(tool_defs);
+    let mut chat = Vec::with_capacity(messages.len() + usize::from(tools_json.is_some()));
 
-    let template_result = model
-        .apply_chat_template_oaicompat(
-            template,
-            &OpenAIChatTemplateParams {
-                messages_json: &messages_json,
-                tools_json: tools_json.as_deref(),
-                tool_choice: None,
-                json_schema: None,
-                grammar: None,
-                reasoning_format: None,
-                chat_template_kwargs: None,
-                add_generation_prompt: true,
-                use_jinja: true,
-                parallel_tool_calls: true,
-                enable_thinking: parameters.include_reasoning,
-                add_bos: false,
-                add_eos: false,
-                parse_tool_calls: !tool_defs.is_empty(),
-            },
-        )
+    if let Some(tools_json) = &tools_json {
+        chat.push(
+            LlamaChatMessage::new("system".to_string(), tool_system_prompt(tools_json))
+                .map_err(|err| LlamaError::Model(err.to_string()))?,
+        );
+    }
+
+    for msg in messages_to_openai(messages) {
+        // A tool result carries no role of its own in a plain template; fold it
+        // into the user turn so the model still sees the output it asked for.
+        let (role, content) = if msg.role == "tool" {
+            ("user".to_string(), format!("Tool result: {}", msg.content))
+        } else {
+            (msg.role, msg.content)
+        };
+        chat.push(
+            LlamaChatMessage::new(role, content)
+                .map_err(|err| LlamaError::Model(err.to_string()))?,
+        );
+    }
+
+    let text = model
+        .apply_chat_template(template, &chat, true)
         .map_err(|err| LlamaError::Model(err.to_string()))?;
 
-    Ok(Prompt { template_result })
+    Ok(Prompt {
+        text,
+        expects_tool_calls: tools_json.is_some(),
+    })
 }
 
 fn filter_tool_definitions(
@@ -608,6 +628,45 @@ fn sampling_seed(seed: Option<u32>) -> u32 {
     ((now ^ (now >> 32)) & 0xFFFF_FFFF) as u32
 }
 
+/// Extracts the JSON object carrying `tool_calls` from generated text.
+///
+/// Models routinely wrap the object in prose or a fenced code block, so scan for
+/// the outermost balanced braces containing a `"tool_calls"` key rather than
+/// requiring the whole response to be JSON.
+fn extract_tool_call_payload(generated: &str) -> Option<&str> {
+    let start = generated.find('{')?;
+    let bytes = generated.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, &byte) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let candidate = &generated[start..=idx];
+                    return candidate.contains("\"tool_calls\"").then_some(candidate);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
 fn parse_openai_message(json_text: &str) -> Result<Vec<ToolCall>, LlamaError> {
     let value: Value = serde_json::from_str(json_text)?;
 
@@ -653,4 +712,45 @@ fn parse_openai_message(json_text: &str) -> Result<Vec<ToolCall>, LlamaError> {
     }
 
     Ok(calls)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_tool_call_payload, parse_openai_message};
+
+    #[test]
+    fn extracts_bare_tool_call_object() {
+        let raw = r#"{"tool_calls":[{"id":"a","function":{"name":"f","arguments":"{}"}}]}"#;
+        assert_eq!(extract_tool_call_payload(raw), Some(raw));
+    }
+
+    #[test]
+    fn extracts_tool_call_wrapped_in_prose_and_fences() {
+        let raw = "Sure, calling it now:\n```json\n{\"tool_calls\":[{\"id\":\"a\",\
+                   \"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}\n```\nDone.";
+        let payload = extract_tool_call_payload(raw).expect("payload should be found");
+        assert!(payload.starts_with('{') && payload.ends_with('}'));
+        assert!(payload.contains("\"tool_calls\""));
+    }
+
+    #[test]
+    fn ignores_prose_without_tool_calls() {
+        assert_eq!(extract_tool_call_payload("The answer is 4."), None);
+        assert_eq!(extract_tool_call_payload(r#"{"content":"hi"}"#), None);
+    }
+
+    #[test]
+    fn brace_inside_string_does_not_end_the_object() {
+        let raw = r#"{"tool_calls":[{"id":"a","function":{"name":"f","arguments":"{\"q\":\"}\"}"}}]}"#;
+        assert_eq!(extract_tool_call_payload(raw), Some(raw));
+    }
+
+    #[test]
+    fn parses_arguments_into_tool_calls() {
+        let raw = r#"{"tool_calls":[{"id":"call_1","function":{"name":"search","arguments":"{\"q\":\"rust\"}"}}]}"#;
+        let calls = parse_openai_message(raw).expect("should parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].arguments["q"], "rust");
+    }
 }

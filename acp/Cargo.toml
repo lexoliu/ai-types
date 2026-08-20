@@ -1,6 +1,6 @@
 [package]
 name = "aither-acp"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -12,9 +12,9 @@ keywords = ["ai", "agent", "acp", "editor-integration"]
 categories = ["api-bindings"]
 
 [dependencies]
-aither-core = { path = "../core" }
-aither-agent = { path = "../agent" }
-aither-mcp = { path = "../mcp" }
+aither-core.workspace = true
+aither-agent.workspace = true
+aither-mcp.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 futures-lite = "2"
