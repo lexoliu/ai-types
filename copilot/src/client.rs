@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -612,6 +613,198 @@ fn chat_completions_stream(
     ))
 }
 
+/// Assembles the streaming chat-completion request.
+fn build_chat_request(
+    cfg: &Config,
+    messages: Vec<ChatMessagePayload>,
+    params: &Parameters,
+    tools: Option<Vec<ToolPayload>>,
+) -> ChatCompletionRequest {
+    let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
+    ChatCompletionRequest {
+        model: cfg.model.clone(),
+        messages,
+        stream: true,
+        stream_options: Some(StreamOptions {
+            include_usage: true,
+        }),
+        temperature: params.temperature,
+        top_p: params.top_p,
+        max_tokens: params.max_tokens,
+        tools,
+        tool_choice: tool_choice(params, has_tools),
+        prompt_cache_key: params
+            .cache
+            .openai
+            .as_ref()
+            .and_then(|cache| cache.key.clone()),
+        prompt_cache_retention: prompt_cache_retention(params),
+    }
+}
+
+/// Opens the SSE stream, minting a fresh session token if the current one has
+/// expired.
+///
+/// Copilot session tokens are short-lived, so a 401 on an otherwise valid
+/// request is routine rather than a real authorization failure; `cfg` is
+/// updated in place so the caller keeps the refreshed token.
+///
+/// # Errors
+///
+/// Returns the original error if the token cannot be refreshed, and the retry's
+/// error if the refreshed token is also rejected.
+async fn open_sse_stream_refreshing(
+    cfg: &mut Config,
+    request: &ChatCompletionRequest,
+) -> Result<zenwave::sse::SseStream, CopilotError> {
+    let err = match open_sse_stream(cfg, request).await {
+        Ok(stream) => return Ok(stream),
+        Err(err) if is_unauthorized(&err) => err,
+        Err(err) => return Err(err),
+    };
+
+    match refresh_session_config(cfg).await? {
+        Some(refreshed) => {
+            *cfg = refreshed;
+            open_sse_stream(cfg, request).await
+        }
+        None => Err(err),
+    }
+}
+
+/// Reads an `{"error": ...}` body that arrived in place of a stream chunk.
+fn sse_payload_error(data: &str) -> Option<CopilotError> {
+    let value = serde_json::from_str::<Value>(data).ok()?;
+    let error = value.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Unknown API error");
+    Some(CopilotError::Api(message.to_string()))
+}
+
+/// What one chat-completion chunk contributed to the stream.
+struct ChunkOutcome {
+    /// Events to hand to the caller, in wire order.
+    events: Vec<Event>,
+    /// Whether the chunk carried content, tool-call deltas, or usage. These are
+    /// the signals that the connection is alive, so they reset the idle timer.
+    made_progress: bool,
+    /// Whether every choice in the chunk reported a finish reason.
+    finished: bool,
+}
+
+/// Folds one chunk into the accumulated tool calls and usage.
+fn apply_chunk(
+    chunk: &ChatCompletionChunk,
+    tool_calls: &mut HashMap<usize, ToolCallAccumulator>,
+    usage: &mut Option<Usage>,
+) -> ChunkOutcome {
+    let mut outcome = ChunkOutcome {
+        events: Vec::new(),
+        made_progress: false,
+        finished: false,
+    };
+
+    if let Some(chunk_usage) = &chunk.usage {
+        *usage = Some(usage_from_chat_completion(chunk_usage));
+        outcome.made_progress = true;
+    }
+
+    outcome.finished = !chunk.choices.is_empty()
+        && chunk
+            .choices
+            .iter()
+            .all(|choice| choice.finish_reason.is_some());
+
+    for choice in &chunk.choices {
+        if let Some(content) = &choice.delta.content
+            && !content.is_empty()
+        {
+            outcome.made_progress = true;
+            outcome.events.push(Event::Text(content.clone()));
+        }
+
+        if let Some(calls) = &choice.delta.tool_calls
+            && !calls.is_empty()
+        {
+            outcome.made_progress = true;
+            accumulate_tool_call_deltas(tool_calls, calls);
+        }
+    }
+
+    outcome
+}
+
+/// Folds one chunk's tool-call deltas into the per-index accumulators.
+///
+/// The id and name arrive in the first delta for an index and the arguments in
+/// pieces after it, so every field is optional on every delta.
+fn accumulate_tool_call_deltas(
+    tool_calls: &mut HashMap<usize, ToolCallAccumulator>,
+    calls: &[ChunkToolCall],
+) {
+    for call in calls {
+        let acc = tool_calls.entry(call.index.unwrap_or(0)).or_default();
+        if let Some(id) = &call.id {
+            acc.id = Some(id.clone());
+        }
+        let Some(function) = &call.function else {
+            continue;
+        };
+        if let Some(name) = &function.name {
+            acc.name = Some(name.clone());
+        }
+        if let Some(args) = &function.arguments {
+            acc.arguments.push_str(args);
+        }
+    }
+}
+
+/// Turns the accumulators into tool calls, in the index order the API used.
+///
+/// An accumulator that never received both an id and a name is incomplete and
+/// is dropped rather than emitted as a call the caller cannot answer.
+fn drain_chat_tool_calls(tool_calls: HashMap<usize, ToolCallAccumulator>) -> Vec<ToolCall> {
+    let mut sorted: Vec<_> = tool_calls.into_iter().collect();
+    sorted.sort_by_key(|(index, _)| *index);
+    sorted
+        .into_iter()
+        .filter_map(|(_, acc)| {
+            let (Some(id), Some(name)) = (acc.id, acc.name) else {
+                return None;
+            };
+            let arguments = serde_json::from_str(&acc.arguments)
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::default()));
+            Some(ToolCall {
+                id,
+                name,
+                arguments,
+            })
+        })
+        .collect()
+}
+
+/// The next thing to happen on an SSE stream that is also being timed.
+enum NextEvent {
+    /// An event arrived, or the stream ended (`None`).
+    Event(Option<Result<zenwave::sse::Event, zenwave::sse::ParseError>>),
+    /// The idle deadline passed first.
+    Timeout,
+}
+
+/// Waits for the next SSE event, giving up after `timeout`.
+async fn next_event_or_timeout(
+    sse_stream: &mut Pin<&mut zenwave::sse::SseStream>,
+    timeout: Duration,
+) -> NextEvent {
+    futures_lite::future::race(async { NextEvent::Event(sse_stream.next().await) }, async {
+        Timer::after(timeout).await;
+        NextEvent::Timeout
+    })
+    .await
+}
+
 fn chat_completions_stream_inner(
     cfg: Arc<Config>,
     payload_messages: Vec<ChatMessagePayload>,
@@ -619,202 +812,57 @@ fn chat_completions_stream_inner(
     tools: Option<Vec<ToolPayload>>,
 ) -> impl Stream<Item = Result<Event, CopilotError>> + Send {
     async_stream::stream! {
-        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
         let mut cfg = cfg.as_ref().clone();
-        let request = ChatCompletionRequest {
-            model: cfg.model.clone(),
-            messages: payload_messages,
-            stream: true,
-            stream_options: Some(StreamOptions {
-                include_usage: true,
-            }),
-            temperature: params.temperature,
-            top_p: params.top_p,
-            max_tokens: params.max_tokens,
-            tools,
-            tool_choice: tool_choice(&params, has_tools),
-            prompt_cache_key: params
-                .cache
-                .openai
-                .as_ref()
-                .and_then(|cache| cache.key.clone()),
-            prompt_cache_retention: prompt_cache_retention(&params),
-        };
+        let request = build_chat_request(&cfg, payload_messages, &params, tools);
 
         tracing::debug!(
             request = %serde_json::to_string_pretty(&request).unwrap_or_default(),
             "Sending Copilot chat completion request"
         );
 
-        let sse_stream = match open_sse_stream(&cfg, &request).await {
+        let sse_stream = match open_sse_stream_refreshing(&mut cfg, &request).await {
             Ok(stream) => stream,
-            Err(err) if is_unauthorized(&err) => {
-                match refresh_session_config(&cfg).await {
-                    Ok(Some(refreshed)) => {
-                        cfg = refreshed;
-                        match open_sse_stream(&cfg, &request).await {
-                            Ok(stream) => stream,
-                            Err(e) => {
-                                yield Err(e);
-                                return;
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        yield Err(err);
-                        return;
-                    }
-                    Err(e) => {
-                        yield Err(e);
-                        return;
-                    }
-                }
-            }
             Err(e) => {
                 yield Err(e);
                 return;
             }
         };
+        futures_lite::pin!(sse_stream);
 
         // Stream SSE events, stopping on [DONE], a finish_reason, or an idle timeout.
         let mut event_count = 0usize;
-        let mut saw_finish = false;
         let mut saw_payload = false;
         let mut last_progress = Instant::now();
-
-        // Accumulate tool calls by index
         let mut tool_calls: HashMap<usize, ToolCallAccumulator> = HashMap::new();
         let mut usage: Option<Usage> = None;
 
-        let sse_stream = sse_stream;
-        futures_lite::pin!(sse_stream);
-
         loop {
-            enum NextEvent {
-                Event(Option<Result<zenwave::sse::Event, zenwave::sse::ParseError>>),
-                Timeout,
-            }
-
+            // Before the first payload the model may still be thinking, so it
+            // gets a longer grace period than a stream that has gone quiet.
             let timeout = if saw_payload {
                 SSE_IDLE_TIMEOUT
             } else {
                 SSE_FIRST_EVENT_TIMEOUT
             };
+            let remaining =
+                timeout.saturating_sub(Instant::now().saturating_duration_since(last_progress));
 
-            let elapsed = Instant::now().saturating_duration_since(last_progress);
-            if elapsed >= timeout {
-                if saw_payload {
-                    tracing::warn!("Copilot SSE idle timeout; ending stream");
-                    break;
+            let next = if remaining.is_zero() {
+                NextEvent::Timeout
+            } else {
+                next_event_or_timeout(&mut sse_stream, remaining).await
+            };
+
+            let event = match next {
+                NextEvent::Event(Some(Ok(event))) => event,
+                NextEvent::Event(Some(Err(e))) => {
+                    yield Err(CopilotError::Stream(e));
+                    return;
                 }
-                yield Err(CopilotError::Timeout);
-                return;
-            }
-            let remaining = timeout.saturating_sub(elapsed);
-
-            let next = futures_lite::future::race(
-                async {
-                    NextEvent::Event(sse_stream.next().await)
-                },
-                async {
-                    Timer::after(remaining).await;
-                    NextEvent::Timeout
-                },
-            )
-            .await;
-
-            match next {
-                NextEvent::Event(Some(event)) => {
-                    match event {
-                        Ok(e) => {
-                            let data = e.text_data();
-                            let data = data.trim();
-                            if data.is_empty() {
-                                continue;
-                            }
-                            if data == "[DONE]" {
-                                break;
-                            }
-                            tracing::trace!(sse_event = %data, "Received Copilot SSE event");
-                            event_count += 1;
-
-                            // Check for API error response
-                            if let Ok(error_obj) = serde_json::from_str::<Value>(data) {
-                                if let Some(error) = error_obj.get("error") {
-                                    let msg = error
-                                        .get("message")
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("Unknown API error");
-                                    yield Err(CopilotError::Api(msg.to_string()));
-                                    return;
-                                }
-                            }
-
-                            match serde_json::from_str::<ChatCompletionChunk>(data) {
-                                Ok(chunk) => {
-                                    if let Some(chunk_usage) = &chunk.usage {
-                                        usage = Some(usage_from_chat_completion(chunk_usage));
-                                        saw_payload = true;
-                                        last_progress = Instant::now();
-                                    }
-                                    if !chunk.choices.is_empty()
-                                        && chunk
-                                            .choices
-                                            .iter()
-                                            .all(|choice| choice.finish_reason.is_some())
-                                    {
-                                        saw_finish = true;
-                                    }
-                                    for choice in &chunk.choices {
-                                        // Emit text events
-                                        if let Some(content) = &choice.delta.content {
-                                            if !content.is_empty() {
-                                                saw_payload = true;
-                                                last_progress = Instant::now();
-                                                yield Ok(Event::Text(content.clone()));
-                                            }
-                                        }
-
-                                        // Accumulate tool calls
-                                        if let Some(calls) = &choice.delta.tool_calls {
-                                            if !calls.is_empty() {
-                                                saw_payload = true;
-                                                last_progress = Instant::now();
-                                            }
-                                            for call in calls {
-                                                let index = call.index.unwrap_or(0);
-                                                let acc = tool_calls.entry(index).or_default();
-                                                if let Some(id) = &call.id {
-                                                    acc.id = Some(id.clone());
-                                                }
-                                                if let Some(function) = &call.function {
-                                                    if let Some(name) = &function.name {
-                                                        acc.name = Some(name.clone());
-                                                    }
-                                                    if let Some(args) = &function.arguments {
-                                                        acc.arguments.push_str(args);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    yield Err(CopilotError::Json(e));
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            yield Err(CopilotError::Stream(e));
-                            return;
-                        }
-                    }
-                }
-                NextEvent::Event(None) => {
-                    break;
-                }
+                NextEvent::Event(None) => break,
                 NextEvent::Timeout => {
+                    // Going quiet after real output is an ended stream; going
+                    // quiet before any is a request that never started.
                     if saw_payload {
                         tracing::warn!("Copilot SSE idle timeout; ending stream");
                         break;
@@ -822,27 +870,51 @@ fn chat_completions_stream_inner(
                     yield Err(CopilotError::Timeout);
                     return;
                 }
+            };
+
+            let data = event.text_data();
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
             }
-            if saw_finish {
+            if data == "[DONE]" {
+                break;
+            }
+            tracing::trace!(sse_event = %data, "Received Copilot SSE event");
+            event_count += 1;
+
+            if let Some(err) = sse_payload_error(data) {
+                yield Err(err);
+                return;
+            }
+
+            let chunk = match serde_json::from_str::<ChatCompletionChunk>(data) {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    yield Err(CopilotError::Json(e));
+                    return;
+                }
+            };
+
+            let outcome = apply_chunk(&chunk, &mut tool_calls, &mut usage);
+            if outcome.made_progress {
+                saw_payload = true;
+                last_progress = Instant::now();
+            }
+            for event in outcome.events {
+                yield Ok(event);
+            }
+            if outcome.finished {
                 break;
             }
         }
 
         tracing::debug!(event_count, "Processed Copilot SSE events");
 
-        // Emit accumulated tool calls at the end
-        let mut sorted_calls: Vec<_> = tool_calls.into_iter().collect();
-        sorted_calls.sort_by_key(|(index, _)| *index);
-        for (_, acc) in sorted_calls {
-            if let (Some(id), Some(name)) = (acc.id, acc.name) {
-                let arguments = if acc.arguments.is_empty() {
-                    Value::Object(serde_json::Map::default())
-                } else {
-                    serde_json::from_str(&acc.arguments)
-                        .unwrap_or_else(|_| Value::Object(serde_json::Map::default()))
-                };
-                yield Ok(Event::ToolCall(ToolCall { id, name, arguments }));
-            }
+        // Copilot only reports tool calls in deltas, so they are all emitted
+        // once the stream has ended.
+        for tool_call in drain_chat_tool_calls(tool_calls) {
+            yield Ok(Event::ToolCall(tool_call));
         }
         if let Some(final_usage) = usage {
             yield Ok(Event::Usage(final_usage));
