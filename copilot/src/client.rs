@@ -451,8 +451,9 @@ fn build_content(message: &Message) -> ContentPayload {
 
 fn url_to_data_url(url: &url::Url) -> Option<String> {
     match url.scheme() {
-        "data" => Some(url.as_str().to_string()),
-        "http" | "https" => Some(url.as_str().to_string()),
+        // Data URLs are already in the wire format, and Copilot fetches http(s)
+        // itself, so both go across untouched.
+        "data" | "http" | "https" => Some(url.as_str().to_string()),
         "file" => read_file_to_data_url(url),
         _ => {
             tracing::warn!("Unsupported attachment URL scheme: {}", url.scheme());

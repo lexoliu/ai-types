@@ -376,7 +376,10 @@ async fn main() -> Result<()> {
     // Create cloud provider
     let base_url = args.base_url.as_deref();
     let (cloud, model, provider_name) = if let Some(provider) = args.provider {
-        let model = args.model.as_deref().unwrap_or(provider.default_model());
+        let model = args
+            .model
+            .as_deref()
+            .unwrap_or_else(|| provider.default_model());
         (
             provider.create(model, base_url)?,
             model.to_string(),
@@ -408,12 +411,13 @@ async fn main() -> Result<()> {
         return run_acp_server(cloud).await;
     }
 
-    // Headless mode: run single prompt and exit
+    // Headless mode: run single prompt and exit. Both of these futures hold a
+    // whole agent, so they are boxed rather than left on `main`'s stack frame.
     if let Some(ref prompt) = args.prompt {
-        return run_headless(cloud, &args, prompt).await;
+        return Box::pin(run_headless(cloud, &args, prompt)).await;
     }
 
-    run_repl(cloud, &args).await
+    Box::pin(run_repl(cloud, &args)).await
 }
 
 /// Run as ACP server for editor integration.
@@ -593,7 +597,7 @@ async fn build_agent(
 async fn run_headless(cloud: CloudProvider, args: &Args, prompt: &str) -> Result<()> {
     let mut agent = build_agent(cloud, args).await?;
 
-    match agent.query(prompt).await {
+    match Box::pin(agent.query(prompt)).await {
         Ok(response) => {
             println!("{response}");
             Ok(())
@@ -661,7 +665,7 @@ async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
 
         // Query the agent
         println!("\nAgent>");
-        match agent.query(input).await {
+        match Box::pin(agent.query(input)).await {
             Ok(response) => {
                 println!("{response}");
             }

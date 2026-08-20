@@ -130,14 +130,12 @@ impl LanguageModel for CloudProvider {
         }
     }
 
-    fn profile(&self) -> impl std::future::Future<Output = Profile> + Send {
-        async move {
-            match self {
-                Self::OpenAI(inner) => inner.profile().await,
-                Self::Claude(inner) => inner.profile().await,
-                Self::Gemini(inner) => inner.profile().await,
-                Self::Copilot(inner) => inner.profile().await,
-            }
+    async fn profile(&self) -> Profile {
+        match self {
+            Self::OpenAI(inner) => inner.profile().await,
+            Self::Claude(inner) => inner.profile().await,
+            Self::Gemini(inner) => inner.profile().await,
+            Self::Copilot(inner) => inner.profile().await,
         }
     }
 }

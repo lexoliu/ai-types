@@ -161,6 +161,12 @@ pub async fn poll_for_token(
 ///
 /// This is useful when you want to implement your own polling loop
 /// with custom timeout handling.
+///
+/// # Errors
+///
+/// Returns [`CopilotError::AuthorizationPending`] while the user has not yet
+/// approved the device code, and other [`CopilotError`] variants if the request
+/// fails or GitHub rejects the code.
 pub async fn try_get_token(device_code: &str) -> Result<CopilotToken, CopilotError> {
     let mut backend = client();
 
@@ -184,8 +190,8 @@ pub async fn try_get_token(device_code: &str) -> Result<CopilotToken, CopilotErr
     // Check for errors
     if let Some(error) = response.error {
         return match error.as_str() {
-            "authorization_pending" => Err(CopilotError::AuthorizationPending),
-            "slow_down" => Err(CopilotError::AuthorizationPending), // Treat as pending, caller will wait
+            // `slow_down` is still pending; the caller's poll interval handles it.
+            "authorization_pending" | "slow_down" => Err(CopilotError::AuthorizationPending),
             "expired_token" => Err(CopilotError::DeviceCodeExpired),
             "access_denied" => Err(CopilotError::AccessDenied),
             _ => Err(CopilotError::Api(
@@ -270,6 +276,11 @@ struct SessionTokenResponse {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// # Errors
+///
+/// Returns a [`CopilotError`] if the request fails or the OAuth token is not
+/// accepted — most often because it has expired or lacks Copilot access.
 pub async fn get_session_token(oauth_token: &str) -> Result<SessionToken, CopilotError> {
     use crate::constant::{COPILOT_TOKEN_URL, EDITOR_VERSION};
 

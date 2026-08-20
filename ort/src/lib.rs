@@ -159,30 +159,11 @@ impl EmbeddingModel for OrtEmbedding {
             ort::value::Tensor::from_array(([1, seq_len], attention_mask.into_boxed_slice()))
                 .map_err(OrtError::from)?;
 
-        // Run inference and extract to owned array (before releasing session lock)
-        let hidden_states_owned = {
-            let mut session = self.session.lock().expect("session lock poisoned");
-            let outputs = session
-                .run(ort::inputs![
-                    "input_ids" => input_ids_tensor,
-                    "attention_mask" => attention_mask_tensor,
-                ])
-                .map_err(OrtError::from)?;
-
-            // Extract hidden states - try common output names
-            let hidden_states = outputs
-                .get("last_hidden_state")
-                .or_else(|| outputs.get("hidden_states"))
-                .or_else(|| outputs.get("output"))
-                .ok_or(OrtError::InvalidOutputShape(0))?;
-
-            let view = hidden_states
-                .try_extract_array::<f32>()
-                .map_err(OrtError::from)?;
-
-            // Convert to owned array before releasing lock
-            view.to_owned()
-        };
+        let hidden_states_owned = run_hidden_states(
+            &mut self.session.lock().expect("session lock poisoned"),
+            input_ids_tensor,
+            attention_mask_tensor,
+        )?;
 
         let rank = hidden_states_owned.shape().len();
         let hidden_states_3d = match rank {
@@ -209,6 +190,31 @@ impl EmbeddingModel for OrtEmbedding {
 
         Ok(embedding)
     }
+}
+
+/// Runs one forward pass and copies the hidden states out of the session.
+///
+/// The outputs borrow the session, so they cannot outlive the lock the caller
+/// holds; returning an owned array is what lets the lock be released before the
+/// (comparatively slow) pooling and normalisation run.
+fn run_hidden_states(
+    session: &mut Session,
+    input_ids: ort::value::Tensor<i64>,
+    attention_mask: ort::value::Tensor<i64>,
+) -> Result<ndarray::ArrayD<f32>, OrtError> {
+    let outputs = session.run(ort::inputs![
+        "input_ids" => input_ids,
+        "attention_mask" => attention_mask,
+    ])?;
+
+    // Models disagree on what to call this output, so try the common names.
+    let hidden_states = outputs
+        .get("last_hidden_state")
+        .or_else(|| outputs.get("hidden_states"))
+        .or_else(|| outputs.get("output"))
+        .ok_or(OrtError::InvalidOutputShape(0))?;
+
+    Ok(hidden_states.try_extract_array::<f32>()?.to_owned())
 }
 
 /// Builder for [`OrtEmbedding`].
@@ -275,7 +281,7 @@ impl OrtEmbeddingBuilder {
         })?;
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| OrtError::tokenizer(&tokenizer_path, e))?;
+            .map_err(|e| OrtError::tokenizer(&tokenizer_path, &e))?;
 
         // Load ONNX session with optimizations
         let session = Session::builder()?

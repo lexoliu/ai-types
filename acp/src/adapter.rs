@@ -65,11 +65,11 @@ pub fn agent_event_to_session_update(event: &AgentEvent) -> Option<SessionUpdate
             }))
         }
 
-        // These events are handled at a higher level
-        AgentEvent::TurnComplete { .. } => None,
-        AgentEvent::Complete { .. } => None,
-        AgentEvent::Error(_) => None,
-        AgentEvent::Usage(_) => None,
+        // These events are handled at a higher level.
+        AgentEvent::TurnComplete { .. }
+        | AgentEvent::Complete { .. }
+        | AgentEvent::Error(_)
+        | AgentEvent::Usage(_) => None,
     }
 }
 

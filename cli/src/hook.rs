@@ -122,7 +122,7 @@ fn parse_bash_args(arguments: &str) -> Option<(String, Option<String>)> {
 struct BashOutput {
     stdout: Option<String>,
     stderr: Option<String>,
-    exit_code: i32,
+    exit_code: i64,
     task_id: Option<String>,
     status: Option<String>,
 }
@@ -152,7 +152,7 @@ fn parse_bash_result(result: &str) -> Option<BashOutput> {
     let exit_code = parsed
         .get("exit_code")
         .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0) as i32;
+        .unwrap_or(0);
     let task_id = parsed
         .get("task_id")
         .and_then(|v| v.as_str())

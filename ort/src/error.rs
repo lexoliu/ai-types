@@ -60,7 +60,7 @@ impl From<ort::Error<ort::session::builder::SessionBuilder>> for OrtError {
 
 impl OrtError {
     /// Creates a tokenizer error from a path and error message.
-    pub fn tokenizer(path: impl Into<PathBuf>, message: impl ToString) -> Self {
+    pub fn tokenizer(path: impl Into<PathBuf>, message: &impl core::fmt::Display) -> Self {
         Self::Tokenizer {
             path: path.into(),
             message: message.to_string(),

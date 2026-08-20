@@ -43,9 +43,11 @@ async fn main() -> Result<()> {
 }
 
 async fn structured_output(gemini: &Gemini) -> Result<()> {
-    let mut params = Parameters::default();
-    params.structured_outputs = true;
-    params.response_format = Some(schemars::schema_for!(SimpleStruct));
+    let params = Parameters {
+        structured_outputs: true,
+        response_format: Some(schemars::schema_for!(SimpleStruct)),
+        ..Default::default()
+    };
 
     let req = oneshot(
         "Return a JSON object matching the provided schema.",
@@ -97,10 +99,12 @@ impl Tool for EchoTool {
 
 async fn tool_call(gemini: &Gemini) -> Result<()> {
     let mut tools = Tools::new();
-    tools.register(EchoTool);
+    tools.register(EchoTool)?;
 
-    let mut params = Parameters::default();
-    params.tool_choice = ToolChoice::Exact("echo_tool".into());
+    let params = Parameters {
+        tool_choice: ToolChoice::Exact("echo_tool".into()),
+        ..Default::default()
+    };
 
     let request = LLMRequest::new([
         Message::system("You are a tool tester."),

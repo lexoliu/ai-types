@@ -182,7 +182,7 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
             "initialize" => self.handle_initialize(req),
             "session/new" => self.handle_session_new(req).await,
             "session/prompt" => self.handle_session_prompt(req).await,
-            "session/stop" => self.handle_session_stop(req).await,
+            "session/stop" => self.handle_session_stop(req),
             method => JsonRpcResponse::error(req.id, JsonRpcError::method_not_found(method)),
         }
     }
@@ -334,7 +334,7 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
     }
 
     /// Handle session/stop request.
-    async fn handle_session_stop(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
+    fn handle_session_stop(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
         let params: SessionStopParams = match req.params.map(serde_json::from_value).transpose() {
             Ok(Some(p)) => p,
             Ok(None) => {
@@ -361,6 +361,10 @@ impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
     }
 
     /// Send a session update notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the notification cannot be written to the client.
     pub async fn send_update(&mut self, session_id: &str, update: SessionUpdate) -> Result<()> {
         let notif = JsonRpcNotification::with_params(
             "session/update",
