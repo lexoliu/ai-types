@@ -12,6 +12,16 @@ use std::collections::HashMap;
 
 use crate::attachments::parse_openai_file_url;
 use crate::error::OpenAIError;
+/// The server-side tools `OpenAI` may run on the model's behalf.
+///
+/// Grouped rather than left loose in [`ParameterSnapshot`] because they are
+/// answered together: a request either offers built-in tools or it does not.
+#[derive(Clone, Copy, Default)]
+pub struct BuiltinTools {
+    pub(crate) websearch: bool,
+    pub(crate) code_execution: bool,
+}
+
 #[derive(Clone)]
 pub struct ParameterSnapshot {
     pub(crate) temperature: Option<f32>,
@@ -29,8 +39,7 @@ pub struct ParameterSnapshot {
     pub(crate) include_reasoning: bool,
     pub(crate) structured_outputs: bool,
     pub(crate) response_format: Option<Schema>,
-    pub(crate) websearch: bool,
-    pub(crate) code_execution: bool,
+    pub(crate) builtin_tools: BuiltinTools,
     pub(crate) legacy_max_tokens: bool,
     pub(crate) prompt_cache_key: Option<String>,
     pub(crate) prompt_cache_retention: Option<OpenAIPromptCacheRetention>,
@@ -57,8 +66,10 @@ impl From<&Parameters> for ParameterSnapshot {
             include_reasoning: value.include_reasoning,
             structured_outputs: value.structured_outputs,
             response_format: value.response_format.clone(),
-            websearch: value.websearch,
-            code_execution: value.code_execution,
+            builtin_tools: BuiltinTools {
+                websearch: value.websearch,
+                code_execution: value.code_execution,
+            },
             legacy_max_tokens: false,
             prompt_cache_key: value
                 .cache
@@ -351,8 +362,9 @@ fn flatten_content(message: &Message) -> String {
 /// - HTTP/HTTPS URLs - passed through as-is (`OpenAI` can fetch them)
 fn url_to_data_url(url: &url::Url) -> Option<String> {
     match url.scheme() {
-        "data" => Some(url.as_str().to_string()),
-        "http" | "https" => Some(url.as_str().to_string()),
+        // Data URLs are already in the wire format, and OpenAI fetches http(s)
+        // itself, so both go across untouched.
+        "data" | "http" | "https" => Some(url.as_str().to_string()),
         "file" => {
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -543,20 +555,19 @@ pub enum ResponsesMessageContent {
 #[derive(Debug, Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponsesInputContent {
-    InputText {
-        text: String,
-    },
-    InputImage {
+    #[serde(rename = "input_text")]
+    Text { text: String },
+    #[serde(rename = "input_image")]
+    Image {
         #[serde(flatten)]
         source: InputImageSource,
     },
-    InputFile {
-        file_id: String,
-    },
+    #[serde(rename = "input_file")]
+    File { file_id: String },
 }
 
 #[derive(Debug, Serialize, Clone)]
-pub(crate) struct InputImageSource {
+pub struct InputImageSource {
     #[serde(skip_serializing_if = "Option::is_none")]
     image_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -728,7 +739,7 @@ pub fn to_responses_input(messages: &[Message]) -> Result<Vec<ResponsesInputItem
                         parts.push(attachment_to_responses_part(attachment)?);
                     }
                     if !message.content().is_empty() {
-                        parts.push(ResponsesInputContent::InputText {
+                        parts.push(ResponsesInputContent::Text {
                             text: message.content().to_owned(),
                         });
                     }
@@ -796,15 +807,15 @@ pub fn to_responses_input(messages: &[Message]) -> Result<Vec<ResponsesInputItem
 fn attachment_to_responses_part(url: &Url) -> Result<ResponsesInputContent, OpenAIError> {
     if let Some((kind, id)) = parse_openai_file_url(url) {
         if kind.is_image() {
-            return Ok(ResponsesInputContent::InputImage {
+            return Ok(ResponsesInputContent::Image {
                 source: InputImageSource::from_file_id(id),
             });
         }
-        return Ok(ResponsesInputContent::InputFile { file_id: id });
+        return Ok(ResponsesInputContent::File { file_id: id });
     }
 
     match url.scheme() {
-        "http" | "https" | "data" => Ok(ResponsesInputContent::InputImage {
+        "http" | "https" | "data" => Ok(ResponsesInputContent::Image {
             source: InputImageSource::from_url(url.as_str().to_string()),
         }),
         "file" => Err(OpenAIError::Api(

@@ -451,7 +451,12 @@ where
             // Load subagent from file
             // Resolve paths using explicit search roots.
             let file_path = PathBuf::from(&args.subagent);
-            let resolved_path = Self::resolve_subagent_path(&self.effective_mounts(), self.base_dir.as_deref(), &file_path).await?;
+            let resolved_path = Self::resolve_subagent_path(
+                &self.effective_mounts(),
+                self.base_dir.as_deref(),
+                &file_path,
+            )
+            .await?;
 
             let def = SubagentDefinition::from_file_async(&resolved_path)
                 .await
@@ -564,9 +569,13 @@ mod tests {
             SubagentFileMount::new(".", root.join("workspace")),
             SubagentFileMount::new(".skills", skills_root.clone()),
         ]);
-        let resolved = SubagentTool::<()>::resolve_subagent_path(&tool.effective_mounts(), tool.base_dir.as_deref(), Path::new(".skills/slide/SKILL.md"))
-            .await
-            .expect("resolve mounted skill path");
+        let resolved = SubagentTool::<()>::resolve_subagent_path(
+            &tool.effective_mounts(),
+            tool.base_dir.as_deref(),
+            Path::new(".skills/slide/SKILL.md"),
+        )
+        .await
+        .expect("resolve mounted skill path");
         assert_eq!(resolved, skill_file);
 
         let _ = std::fs::remove_dir_all(root);
@@ -578,9 +587,13 @@ mod tests {
         let tool = SubagentTool::new(())
             .with_file_mounts([SubagentFileMount::new(".skills", root.join("skills"))]);
 
-        let error = SubagentTool::<()>::resolve_subagent_path(&tool.effective_mounts(), tool.base_dir.as_deref(), Path::new("../outside.md"))
-            .await
-            .expect_err("parent traversal should fail");
+        let error = SubagentTool::<()>::resolve_subagent_path(
+            &tool.effective_mounts(),
+            tool.base_dir.as_deref(),
+            Path::new("../outside.md"),
+        )
+        .await
+        .expect_err("parent traversal should fail");
         assert!(
             error
                 .to_string()
@@ -599,9 +612,13 @@ mod tests {
         let tool = SubagentTool::new(())
             .with_file_mounts([SubagentFileMount::new(".skills", skills_root.clone())]);
 
-        let error = SubagentTool::<()>::resolve_subagent_path(&tool.effective_mounts(), tool.base_dir.as_deref(), Path::new(".skills/missing.md"))
-            .await
-            .expect_err("missing file should fail");
+        let error = SubagentTool::<()>::resolve_subagent_path(
+            &tool.effective_mounts(),
+            tool.base_dir.as_deref(),
+            Path::new(".skills/missing.md"),
+        )
+        .await
+        .expect_err("missing file should fail");
         let message = error.to_string();
         assert!(
             message.contains(".skills/missing.md"),
@@ -635,9 +652,13 @@ mod tests {
                 SubagentFileMount::new(".skills", skills_root.clone()),
             ]);
 
-        let resolved = SubagentTool::<()>::resolve_subagent_path(&tool.effective_mounts(), tool.base_dir.as_deref(), &session_skills_file)
-            .await
-            .expect("resolve absolute workspace .skills path");
+        let resolved = SubagentTool::<()>::resolve_subagent_path(
+            &tool.effective_mounts(),
+            tool.base_dir.as_deref(),
+            &session_skills_file,
+        )
+        .await
+        .expect("resolve absolute workspace .skills path");
         assert_eq!(resolved, mounted_skill_file);
 
         let _ = std::fs::remove_dir_all(root);

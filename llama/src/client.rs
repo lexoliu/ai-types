@@ -287,7 +287,8 @@ fn response_stream(
     match thread::Builder::new()
         .name("aither-llama-respond".to_string())
         .spawn(move || {
-            if let Err(err) = run_response_generation(&model, &backend, &cfg, request, &worker_sender)
+            if let Err(err) =
+                run_response_generation(&model, &backend, &cfg, request, &worker_sender)
             {
                 let _ = worker_sender.send_blocking(Err(err));
             }

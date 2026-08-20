@@ -9,8 +9,8 @@ use crate::{
         responses_tool_choice, to_chat_messages, to_responses_input,
     },
     response::{
-        ChatCompletionChunk, ChatCompletionUsage, ResponsesOutputItem, ResponsesStreamEvent,
-        ResponsesUsage, should_skip_event,
+        ChatCompletionChunk, ChatCompletionUsage, DeltaToolCall, ResponsesOutputItem,
+        ResponsesStreamEvent, ResponsesUsage, should_skip_event,
     },
 };
 use aither_core::{
@@ -554,6 +554,64 @@ struct ToolCallAccumulator {
     arguments: String,
 }
 
+/// Folds one chunk's tool-call deltas into the per-index accumulators.
+///
+/// Chat Completions sends the id and name in the first delta for an index and
+/// then the arguments in pieces, so every field is optional on every delta.
+fn accumulate_tool_call_deltas(
+    tool_calls: &mut HashMap<usize, ToolCallAccumulator>,
+    calls: &[DeltaToolCall],
+) {
+    for call in calls {
+        let acc = tool_calls.entry(call.index.unwrap_or(0)).or_default();
+        if let Some(id) = &call.id {
+            acc.id = Some(id.clone());
+        }
+        let Some(function) = &call.function else {
+            continue;
+        };
+        if let Some(name) = &function.name {
+            acc.name = Some(name.clone());
+        }
+        if let Some(args) = &function.arguments {
+            acc.arguments.push_str(args);
+        }
+    }
+}
+
+/// Turns the accumulators into tool calls, in the index order the API used.
+///
+/// An accumulator that never received both an id and a name is incomplete and
+/// is dropped rather than emitted as a call the caller cannot answer.
+fn drain_chat_tool_calls(tool_calls: HashMap<usize, ToolCallAccumulator>) -> Vec<ToolCall> {
+    let mut sorted: Vec<_> = tool_calls.into_iter().collect();
+    sorted.sort_by_key(|(index, _)| *index);
+    sorted
+        .into_iter()
+        .filter_map(|(_, acc)| {
+            let (Some(id), Some(name)) = (acc.id, acc.name) else {
+                return None;
+            };
+            Some(ToolCall {
+                id,
+                name,
+                arguments: parse_tool_call_arguments(&acc.arguments),
+            })
+        })
+        .collect()
+}
+
+/// Reads an `{"error": ...}` body that arrived in place of a stream chunk.
+fn sse_payload_error(data: &str) -> Option<OpenAIError> {
+    let value = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    let error = value.get("error")?;
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Unknown API error");
+    Some(OpenAIError::Api(message.to_string()))
+}
+
 /// Make a chat completions SSE request (single attempt).
 async fn chat_completions_request(
     cfg: &Config,
@@ -632,15 +690,9 @@ fn chat_completions_stream_inner(
                     }
                     tracing::debug!(sse_event = %data, "Received SSE event");
 
-                    // Check for API error response
-                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(error) = error_obj.get("error") {
-                            let msg = error.get("message")
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("Unknown API error");
-                            yield Err(OpenAIError::Api(msg.to_string()));
-                            return;
-                        }
+                    if let Some(err) = sse_payload_error(data) {
+                        yield Err(err);
+                        return;
                     }
 
                     match serde_json::from_str::<ChatCompletionChunk>(data) {
@@ -671,23 +723,8 @@ fn chat_completions_stream_inner(
                                         }
                                     }
                                 }
-                                // Accumulate tool calls
                                 if let Some(calls) = &choice.delta.tool_calls {
-                                    for call in calls {
-                                        let index = call.index.unwrap_or(0);
-                                        let acc = tool_calls.entry(index).or_default();
-                                        if let Some(id) = &call.id {
-                                            acc.id = Some(id.clone());
-                                        }
-                                        if let Some(function) = &call.function {
-                                            if let Some(name) = &function.name {
-                                                acc.name = Some(name.clone());
-                                            }
-                                            if let Some(args) = &function.arguments {
-                                                acc.arguments.push_str(args);
-                                            }
-                                        }
-                                    }
+                                    accumulate_tool_call_deltas(&mut tool_calls, calls);
                                 }
                             }
                         }
@@ -704,23 +741,10 @@ fn chat_completions_stream_inner(
             }
         }
 
-        // Emit accumulated tool calls at the end
-        let mut sorted_calls: Vec<_> = tool_calls.into_iter().collect();
-        sorted_calls.sort_by_key(|(index, _)| *index);
-        for (_, acc) in sorted_calls {
-            if let (Some(id), Some(name)) = (acc.id, acc.name) {
-                let arguments = if acc.arguments.is_empty() {
-                    serde_json::Value::Object(serde_json::Map::default())
-                } else {
-                    serde_json::from_str(&acc.arguments)
-                        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::default()))
-                };
-                yield Ok(Event::ToolCall(ToolCall {
-                    id,
-                    name,
-                    arguments,
-                }));
-            }
+        // Chat Completions only reports tool calls in deltas, so they are all
+        // emitted once the stream has ended.
+        for tool_call in drain_chat_tool_calls(tool_calls) {
+            yield Ok(Event::ToolCall(tool_call));
         }
         if let Some(final_usage) = usage {
             yield Ok(Event::Usage(final_usage));
@@ -801,17 +825,18 @@ fn mark_and_emit_done_function_call(
     arguments: String,
 ) -> ToolCall {
     let resolved_call_id = call_id.unwrap_or_else(|| id.clone());
+    let parsed = parse_tool_call_arguments(&arguments);
 
     let acc = function_calls.entry(id).or_default();
     acc.call_id = Some(resolved_call_id.clone());
     acc.name = Some(name.clone());
-    acc.arguments.clone_from(&arguments);
+    acc.arguments = arguments;
     acc.emitted = true;
 
     ToolCall {
         id: resolved_call_id,
         name,
-        arguments: parse_tool_call_arguments(&arguments),
+        arguments: parsed,
     }
 }
 
@@ -864,41 +889,179 @@ async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStrea
     }
 }
 
+/// Assembles the streaming Responses request, including any built-in tools.
+///
+/// Built-in tools are only offered when the caller left the choice open: with
+/// an explicit tool choice, adding them would let the model answer with a tool
+/// the caller did not ask about.
+fn build_responses_request(
+    cfg: &Config,
+    input: Vec<ResponsesInputItem>,
+    snapshot: &ParameterSnapshot,
+    tool_defs: Vec<aither_core::llm::tool::ToolDefinition>,
+) -> ResponsesRequest {
+    let mut response_tools = convert_responses_tools(tool_defs);
+    let allow_builtins = matches!(
+        snapshot.tool_choice,
+        ToolChoice::Auto | ToolChoice::Required
+    );
+    if allow_builtins {
+        if snapshot.builtin_tools.websearch {
+            response_tools.push(ResponsesTool::WebSearch);
+        }
+        if snapshot.builtin_tools.code_execution {
+            response_tools.push(ResponsesTool::CodeInterpreter);
+        }
+    }
+    let response_tools = (!response_tools.is_empty()).then_some(response_tools);
+    let tool_choice = responses_tool_choice(snapshot, response_tools.is_some());
+
+    ResponsesRequest::new(
+        cfg.chat_model.clone(),
+        input,
+        snapshot,
+        response_tools,
+        tool_choice,
+        true, // stream: true
+    )
+}
+
+/// What one Responses stream event asks the caller to do next.
+enum ResponsesStep {
+    /// The event only advanced accumulated state; nothing to emit.
+    Continue,
+    /// Emit this event to the caller.
+    Emit(Box<Event>),
+    /// Give up on the stream with this error.
+    Fail(OpenAIError),
+}
+
+/// Everything the Responses stream carries between events.
+///
+/// Kept out of the `stream!` body so the event handling below is an ordinary
+/// function that can be read — and tested — on its own.
+struct ResponsesStreamState {
+    function_calls: HashMap<String, FunctionCallAccumulator>,
+    usage: Option<Usage>,
+    usage_emitted: bool,
+    include_reasoning: bool,
+}
+
+impl ResponsesStreamState {
+    fn new(include_reasoning: bool) -> Self {
+        Self {
+            function_calls: HashMap::new(),
+            usage: None,
+            usage_emitted: false,
+            include_reasoning,
+        }
+    }
+
+    fn apply(&mut self, event: ResponsesStreamEvent) -> ResponsesStep {
+        match event {
+            ResponsesStreamEvent::ResponseCreated { response } => {
+                if let Some(meta) = response.and_then(|resp| resp.usage) {
+                    self.usage = Some(usage_from_responses(&meta));
+                }
+                ResponsesStep::Continue
+            }
+            ResponsesStreamEvent::OutputTextDelta { delta, .. } => {
+                Self::emit_delta(Event::Text, delta, true)
+            }
+            ResponsesStreamEvent::ReasoningTextDelta { delta, .. }
+            | ResponsesStreamEvent::ReasoningSummaryTextDelta { delta, .. } => {
+                Self::emit_delta(Event::Reasoning, delta, self.include_reasoning)
+            }
+            // A function_call item is announced before its arguments stream in.
+            ResponsesStreamEvent::OutputItemAdded {
+                item:
+                    ResponsesOutputItem::FunctionCall {
+                        id, call_id, name, ..
+                    },
+                ..
+            } => {
+                let acc = self.function_calls.entry(id.clone()).or_default();
+                acc.call_id = call_id.or(Some(id));
+                acc.name = Some(name);
+                ResponsesStep::Continue
+            }
+            ResponsesStreamEvent::FunctionCallArgumentsDelta { delta, item_id, .. } => {
+                self.function_calls
+                    .entry(item_id)
+                    .or_default()
+                    .arguments
+                    .push_str(&delta);
+                ResponsesStep::Continue
+            }
+            ResponsesStreamEvent::FunctionCallArgumentsDone {
+                arguments, item_id, ..
+            } => {
+                self.function_calls.entry(item_id).or_default().arguments = arguments;
+                ResponsesStep::Continue
+            }
+            // The call is complete once its item is done.
+            ResponsesStreamEvent::OutputItemDone {
+                item:
+                    ResponsesOutputItem::FunctionCall {
+                        id,
+                        call_id,
+                        name,
+                        arguments,
+                    },
+                ..
+            } => {
+                let tool_call = mark_and_emit_done_function_call(
+                    &mut self.function_calls,
+                    id,
+                    call_id,
+                    name,
+                    arguments,
+                );
+                ResponsesStep::Emit(Box::new(Event::ToolCall(tool_call)))
+            }
+            ResponsesStreamEvent::ResponseCompleted { response } => {
+                let Some(meta) = response.usage else {
+                    return ResponsesStep::Continue;
+                };
+                let final_usage = usage_from_responses(&meta);
+                self.usage = Some(final_usage.clone());
+                self.usage_emitted = true;
+                ResponsesStep::Emit(Box::new(Event::Usage(final_usage)))
+            }
+            ResponsesStreamEvent::ResponseFailed { error } => {
+                ResponsesStep::Fail(OpenAIError::Api(
+                    error
+                        .and_then(|e| e.message)
+                        .unwrap_or_else(|| "Response failed".to_string()),
+                ))
+            }
+            ResponsesStreamEvent::Error { message, .. } => ResponsesStep::Fail(OpenAIError::Api(
+                message.unwrap_or_else(|| "Unknown error".to_string()),
+            )),
+            _ => ResponsesStep::Continue,
+        }
+    }
+
+    /// Emits a text-like delta, skipping empty ones and disabled channels.
+    fn emit_delta(wrap: fn(String) -> Event, delta: String, enabled: bool) -> ResponsesStep {
+        if enabled && !delta.is_empty() {
+            ResponsesStep::Emit(Box::new(wrap(delta)))
+        } else {
+            ResponsesStep::Continue
+        }
+    }
+}
+
 fn responses_stream_inner(
     cfg: Arc<Config>,
     input: Vec<ResponsesInputItem>,
     snapshot: ParameterSnapshot,
     tool_defs: Vec<aither_core::llm::tool::ToolDefinition>,
 ) -> impl Stream<Item = Result<Event, OpenAIError>> + Send {
-    let include_reasoning = snapshot.include_reasoning;
+    let mut state = ResponsesStreamState::new(snapshot.include_reasoning);
 
     async_stream::stream! {
-        let mut response_tools = convert_responses_tools(tool_defs);
-        let allow_builtins = matches!(snapshot.tool_choice, ToolChoice::Auto | ToolChoice::Required);
-        if allow_builtins {
-            if snapshot.websearch {
-                response_tools.push(ResponsesTool::WebSearch);
-            }
-            if snapshot.code_execution {
-                response_tools.push(ResponsesTool::CodeInterpreter);
-            }
-        }
-        let response_tools = if response_tools.is_empty() {
-            None
-        } else {
-            Some(response_tools)
-        };
-        let has_tools = response_tools.is_some();
-        let tool_choice = responses_tool_choice(&snapshot, has_tools);
-
-        let request = ResponsesRequest::new(
-            cfg.chat_model.clone(),
-            input,
-            &snapshot,
-            response_tools,
-            tool_choice,
-            true, // stream: true
-        );
+        let request = build_responses_request(&cfg, input, &snapshot, tool_defs);
 
         tracing::debug!(request = %serde_json::to_string_pretty(&request).unwrap_or_default(), "Sending responses request");
 
@@ -912,123 +1075,48 @@ fn responses_stream_inner(
         };
         futures_lite::pin!(sse_stream);
 
-        // Accumulate function calls by item_id
-        let mut function_calls: HashMap<String, FunctionCallAccumulator> = HashMap::new();
-        let mut usage: Option<Usage> = None;
-        let mut usage_emitted = false;
-
         while let Some(event) = sse_stream.next().await {
-            match event {
-                Ok(e) => {
-                    if should_skip_event(&e) {
-                        continue;
-                    }
-                    let data = e.text_data();
-                    if data == "[DONE]" {
-                        continue;
-                    }
-                    tracing::trace!(sse_event = %data, "Received Responses API SSE event");
-
-                    // Check for API error response
-                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(error) = error_obj.get("error") {
-                            let msg = error.get("message")
-                                .and_then(|m| m.as_str())
-                                .unwrap_or("Unknown API error");
-                            yield Err(OpenAIError::Api(msg.to_string()));
-                            return;
-                        }
-                    }
-
-                    match serde_json::from_str::<ResponsesStreamEvent>(data) {
-                        Ok(stream_event) => {
-                            match stream_event {
-                                ResponsesStreamEvent::ResponseCreated { response } => {
-                                    if let Some(meta) = response.and_then(|resp| resp.usage) {
-                                        usage = Some(usage_from_responses(&meta));
-                                    }
-                                }
-                                ResponsesStreamEvent::OutputTextDelta { delta, .. } => {
-                                    if !delta.is_empty() {
-                                        yield Ok(Event::Text(delta));
-                                    }
-                                }
-                                ResponsesStreamEvent::ReasoningTextDelta { delta, .. } |
-                                ResponsesStreamEvent::ReasoningSummaryTextDelta { delta, .. } => {
-                                    if include_reasoning && !delta.is_empty() {
-                                        yield Ok(Event::Reasoning(delta));
-                                    }
-                                }
-                                ResponsesStreamEvent::OutputItemAdded { item, .. } => {
-                                    // When a function_call item is added, capture id and name
-                                    if let ResponsesOutputItem::FunctionCall { id, call_id, name, .. } = item {
-                                        let acc = function_calls.entry(id.clone()).or_default();
-                                        acc.call_id = call_id.or(Some(id));
-                                        acc.name = Some(name);
-                                    }
-                                }
-                                ResponsesStreamEvent::FunctionCallArgumentsDelta { delta, item_id, .. } => {
-                                    let acc = function_calls.entry(item_id).or_default();
-                                    acc.arguments.push_str(&delta);
-                                }
-                                ResponsesStreamEvent::FunctionCallArgumentsDone { arguments, item_id, .. } => {
-                                    let acc = function_calls.entry(item_id).or_default();
-                                    acc.arguments = arguments;
-                                }
-                                ResponsesStreamEvent::OutputItemDone { item, .. } => {
-                                    // Emit function call when item is done
-                                    if let ResponsesOutputItem::FunctionCall { id, call_id, name, arguments } = item {
-                                        let tool_call = mark_and_emit_done_function_call(
-                                            &mut function_calls,
-                                            id,
-                                            call_id,
-                                            name,
-                                            arguments,
-                                        );
-                                        yield Ok(Event::ToolCall(tool_call));
-                                    }
-                                }
-                                ResponsesStreamEvent::ResponseCompleted { response } => {
-                                    if let Some(meta) = response.usage {
-                                        let final_usage = usage_from_responses(&meta);
-                                        usage = Some(final_usage.clone());
-                                        yield Ok(Event::Usage(final_usage));
-                                        usage_emitted = true;
-                                    }
-                                }
-                                ResponsesStreamEvent::ResponseFailed { error } => {
-                                    let msg = error
-                                        .and_then(|e| e.message)
-                                        .unwrap_or_else(|| "Response failed".to_string());
-                                    yield Err(OpenAIError::Api(msg));
-                                    return;
-                                }
-                                ResponsesStreamEvent::Error { message, .. } => {
-                                    let msg = message.unwrap_or_else(|| "Unknown error".to_string());
-                                    yield Err(OpenAIError::Api(msg));
-                                    return;
-                                }
-                                // Ignore other events
-                                _ => {}
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, data = %data, "Failed to parse Responses API event");
-                        }
-                    }
-                }
+            let event = match event {
+                Ok(event) => event,
                 Err(e) => {
                     yield Err(OpenAIError::from(e));
                     return;
                 }
+            };
+            if should_skip_event(&event) {
+                continue;
+            }
+            let data = event.text_data();
+            if data == "[DONE]" {
+                continue;
+            }
+            tracing::trace!(sse_event = %data, "Received Responses API SSE event");
+
+            if let Some(err) = sse_payload_error(data) {
+                yield Err(err);
+                return;
+            }
+
+            match serde_json::from_str::<ResponsesStreamEvent>(data) {
+                Ok(stream_event) => match state.apply(stream_event) {
+                    ResponsesStep::Continue => {}
+                    ResponsesStep::Emit(event) => yield Ok(*event),
+                    ResponsesStep::Fail(err) => {
+                        yield Err(err);
+                        return;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, data = %data, "Failed to parse Responses API event");
+                }
             }
         }
 
-        // Emit any remaining accumulated function calls (fallback if OutputItemDone wasn't received)
-        for tool_call in drain_pending_function_calls(function_calls) {
+        // Emit any call the API never closed with an `output_item.done`.
+        for tool_call in drain_pending_function_calls(state.function_calls) {
             yield Ok(Event::ToolCall(tool_call));
         }
-        if !usage_emitted && let Some(final_usage) = usage {
+        if !state.usage_emitted && let Some(final_usage) = state.usage {
             yield Ok(Event::Usage(final_usage));
         }
     }

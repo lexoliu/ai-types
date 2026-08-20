@@ -70,7 +70,7 @@ pub struct OpenAIFile {
     /// Size of the file in bytes.
     pub bytes: u64,
     /// Unix timestamp when the file was created.
-    pub created_at: i64,
+    pub created_at: u64,
     /// Name of the file.
     pub filename: String,
     /// Purpose of the file.
@@ -87,7 +87,7 @@ impl OpenAIFile {
     /// Get the creation time as `SystemTime`.
     #[must_use]
     pub fn created(&self) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(self.created_at as u64)
+        UNIX_EPOCH + Duration::from_secs(self.created_at)
     }
 
     /// Check if the file is ready for use.

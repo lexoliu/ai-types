@@ -384,7 +384,10 @@ pub fn json<T: Serialize>(value: &T) -> Result<String> {
 
 trait ToolImpl: Send + Sync + Any {
     fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + '_>>;
-    fn definition(&self) -> ToolDefinition;
+
+    /// The cached definition. Borrowed, so registering a tool does not have to
+    /// clone its argument schema.
+    fn definition(&self) -> &ToolDefinition;
 
     /// Upcast to [`Any`] so [`Tools::get`] can recover the concrete tool.
     ///
@@ -413,8 +416,8 @@ where
         (self.handler)(args)
     }
 
-    fn definition(&self) -> ToolDefinition {
-        self.definition.clone()
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -508,8 +511,8 @@ impl<T: Tool + 'static> ToolImpl for RegisteredTool<T> {
         Box::pin(async move { Tool::call(&self.tool, arguments).await })
     }
 
-    fn definition(&self) -> ToolDefinition {
-        self.definition.clone()
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -934,7 +937,10 @@ impl Tools {
     /// Returns definitions of all registered tools.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.values().map(|tool| tool.definition()).collect()
+        self.tools
+            .values()
+            .map(|tool| tool.definition().clone())
+            .collect()
     }
 
     /// Registers a new tool.
@@ -951,8 +957,7 @@ impl Tools {
         &mut self,
         tool: T,
     ) -> core::result::Result<(), RegisterError> {
-        let registered = RegisteredTool::new(tool);
-        self.insert(registered.definition.clone(), Box::new(registered))
+        self.insert(Box::new(RegisteredTool::new(tool)))
     }
 
     /// Registers a dynamic tool with a pre-made definition and handler.
@@ -974,23 +979,18 @@ impl Tools {
             + Sync
             + 'static,
     {
-        let tool = DynToolImpl {
-            definition: definition.clone(),
+        self.insert(Box::new(DynToolImpl {
+            definition,
             handler,
-        };
-        self.insert(definition, Box::new(tool))
+        }))
     }
 
-    fn insert(
-        &mut self,
-        definition: ToolDefinition,
-        tool: Box<dyn ToolImpl>,
-    ) -> core::result::Result<(), RegisterError> {
-        let name = definition.name.clone();
+    fn insert(&mut self, tool: Box<dyn ToolImpl>) -> core::result::Result<(), RegisterError> {
+        let name = tool.definition().name.clone();
         if self.tools.contains_key(&name) {
             return Err(RegisterError::DuplicateName(name));
         }
-        if definition.description().trim().is_empty() {
+        if tool.definition().description().trim().is_empty() {
             return Err(RegisterError::EmptyDescription(name));
         }
         self.tools.insert(name, tool);

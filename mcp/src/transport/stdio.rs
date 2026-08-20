@@ -62,7 +62,7 @@ impl StdioTransport {
     }
 
     /// Write a message to stdout.
-    async fn write_message(&mut self, msg: &impl serde::Serialize) -> Result<()> {
+    async fn write_message(&mut self, msg: &(impl serde::Serialize + Sync)) -> Result<()> {
         let json = serde_json::to_string(msg)?;
         debug!("MCP TX: {}", json);
 

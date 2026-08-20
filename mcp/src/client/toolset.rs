@@ -364,10 +364,10 @@ impl McpConnection {
 impl McpToolService {
     /// Creates a new MCP tool service and starts its background worker.
     #[must_use]
-    pub fn new(mut conn: McpConnection) -> Self {
+    pub fn new(conn: McpConnection) -> Self {
         let tools = conn.mcp_definitions().to_vec();
         let (tx, rx) = async_channel::unbounded();
-        std::thread::spawn(move || run_service(rx, &mut conn));
+        std::thread::spawn(move || run_service(&rx, conn));
         Self { tx, tools }
     }
 
@@ -423,7 +423,12 @@ impl McpToolService {
     }
 }
 
-fn run_service(rx: Receiver<McpCommand>, conn: &mut McpConnection) {
+/// Drives one MCP connection until every command sender has gone away.
+///
+/// The caller's closure owns the receiver, so the loop ends when the last
+/// [`McpToolService`] handle is dropped; `conn` is owned here so the transport
+/// closes when this worker returns.
+fn run_service(rx: &Receiver<McpCommand>, mut conn: McpConnection) {
     async_io::block_on(async {
         while let Ok(cmd) = rx.recv().await {
             match cmd {
