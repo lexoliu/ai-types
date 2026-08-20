@@ -17,7 +17,6 @@ aither-claude.workspace = true
 aither-copilot.workspace = true
 aither-gemini.workspace = true
 aither-openai.workspace = true
-anyhow = "1.0"
 async-stream = "0.3"
 futures-core = "0.3"
 futures-lite = "2.6"
