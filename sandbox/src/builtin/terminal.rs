@@ -8,18 +8,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::job_registry::JobRegistry;
 
+/// Terminates a background bash task.
 #[derive(Debug, Clone)]
 pub struct KillTerminalTool {
     registry: JobRegistry,
 }
 
 impl KillTerminalTool {
+    /// Creates the tool over the given job registry.
     #[must_use]
     pub const fn new(registry: JobRegistry) -> Self {
         Self { registry }
     }
 }
 
+/// Terminate a background bash task by its task id.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct KillTerminalArgs {
     /// Task identifier returned by bash when the task is backgrounded.
@@ -53,18 +56,21 @@ impl Tool for KillTerminalTool {
     }
 }
 
+/// Writes to the stdin of a running background bash task.
 #[derive(Debug, Clone)]
 pub struct InputTerminalTool {
     registry: JobRegistry,
 }
 
 impl InputTerminalTool {
+    /// Creates the tool over the given job registry.
     #[must_use]
     pub const fn new(registry: JobRegistry) -> Self {
         Self { registry }
     }
 }
 
+/// Send input to a background bash task that is waiting on stdin.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InputTerminalArgs {
     /// Task identifier returned by bash when the task is backgrounded.

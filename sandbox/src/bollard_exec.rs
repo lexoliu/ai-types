@@ -237,14 +237,15 @@ impl ContainerExec for BollardContainerExec {
                 };
 
                 match event {
-                    StreamEvent::Output(Some(Ok(LogOutput::StdOut { message }))) => {
+                    // Console output is not separated by stream, so it joins
+                    // stdout alongside genuine stdout writes.
+                    StreamEvent::Output(Some(Ok(
+                        LogOutput::StdOut { message } | LogOutput::Console { message },
+                    ))) => {
                         stdout.extend_from_slice(&message);
                     }
                     StreamEvent::Output(Some(Ok(LogOutput::StdErr { message }))) => {
                         stderr.extend_from_slice(&message);
-                    }
-                    StreamEvent::Output(Some(Ok(LogOutput::Console { message }))) => {
-                        stdout.extend_from_slice(&message);
                     }
                     StreamEvent::Output(Some(Ok(LogOutput::StdIn { .. }))) => {}
                     StreamEvent::Output(Some(Err(e))) => {
@@ -307,6 +308,9 @@ impl ContainerExec for BollardContainerExec {
                 .await
                 .map_err(|e| format!("failed to inspect exec: {e}"))?;
 
+            // Docker reports exit codes as i64 but they are always in i32
+            // range; -1 stands in for "the daemon did not say".
+            #[allow(clippy::cast_possible_truncation)]
             let exit_code = inspect.exit_code.unwrap_or(-1) as i32;
             Ok(ContainerExecOutcome::Completed(Output {
                 status: ExitStatusExt::from_raw(exit_code),

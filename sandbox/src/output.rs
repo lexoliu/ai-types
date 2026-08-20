@@ -97,12 +97,9 @@ impl Serialize for OutputEntry {
                 let map = serializer.serialize_map(Some(0))?;
                 map.end()
             }
-            Self::Inline { content } => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("content", content)?;
-                map.end()
-            }
-            Self::Loaded { content, .. } => {
+            // Loaded output carries provenance the caller does not need on the
+            // wire, so it serializes exactly like inline output.
+            Self::Inline { content } | Self::Loaded { content, .. } => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("content", content)?;
                 map.end()
@@ -709,9 +706,9 @@ fn detect_format(data: &[u8]) -> OutputFormat {
 const fn format_extension(format: OutputFormat) -> &'static str {
     match format {
         OutputFormat::Text | OutputFormat::Auto => "txt",
-        OutputFormat::Image => "bin", // Generic, actual type detected from content
         OutputFormat::Video => "mp4",
-        OutputFormat::Binary => "bin",
+        // Image type is detected from content, so it gets the generic extension.
+        OutputFormat::Image | OutputFormat::Binary => "bin",
     }
 }
 
@@ -795,7 +792,6 @@ mod tests {
     #[test]
     fn test_generate_word_filename() {
         let name = generate_word_filename();
-        let parts: Vec<&str> = name.split('-').collect();
-        assert_eq!(parts.len(), 4, "Should have 4 words: {name}");
+        assert_eq!(name.split('-').count(), 4, "Should have 4 words: {name}");
     }
 }

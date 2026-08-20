@@ -395,11 +395,16 @@ fn append_numbered_line(out: &mut String, line_num: usize, line: &str, width: us
 }
 
 #[cfg(feature = "code-folding")]
-fn digit_count(n: usize) -> usize {
-    if n == 0 {
-        return 1;
+const fn digit_count(n: usize) -> usize {
+    // Counting digits by repeated division avoids a float round-trip, and so
+    // cannot be thrown off by rounding near a power of ten.
+    let mut count = 1;
+    let mut remaining = n;
+    while remaining >= 10 {
+        remaining /= 10;
+        count += 1;
     }
-    ((n as f64).log10().floor() as usize) + 1
+    count
 }
 
 // ---------------------------------------------------------------------------

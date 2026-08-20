@@ -31,7 +31,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -74,7 +74,7 @@ use crate::output::{INLINE_OUTPUT_LIMIT, generate_word_filename};
 ///
 /// Returns the output as-is if small enough, or saves to file and returns
 /// a reference message if the output exceeds the limit.
-async fn handle_large_output(output: String, output_dir: &PathBuf) -> String {
+async fn handle_large_output(output: String, output_dir: &Path) -> String {
     if output.len() <= INLINE_OUTPUT_LIMIT {
         return output;
     }
@@ -127,7 +127,7 @@ impl std::fmt::Debug for DynBashTool {
 }
 
 /// Builder for tool registries.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ToolRegistryBuilder {
     entries: HashMap<String, ToolEntry>,
 }
@@ -1120,11 +1120,9 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
     let positional_fields: Vec<String> = required
         .iter()
         .filter(|name| {
-            if let Some(prop_schema) = properties.get(name.as_str()) {
-                get_instance_type(prop_schema) != Some("array")
-            } else {
-                true
-            }
+            properties
+                .get(name.as_str())
+                .is_none_or(|prop_schema| get_instance_type(prop_schema) != Some("array"))
         })
         .cloned()
         .collect();
@@ -1167,22 +1165,24 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
         if !end_of_options && arg.starts_with("--") {
             // Named argument
             let flag = &arg[2..];
-            let (mut name, value) = if let Some(eq_pos) = flag.find('=') {
-                (
-                    flag[..eq_pos].to_string(),
-                    Some(flag[eq_pos + 1..].to_string()),
-                )
-            } else {
-                (flag.to_string(), None)
-            };
+            let (mut name, value) = flag.find('=').map_or_else(
+                || (flag.to_string(), None),
+                |eq_pos| {
+                    (
+                        flag[..eq_pos].to_string(),
+                        Some(flag[eq_pos + 1..].to_string()),
+                    )
+                },
+            );
 
             // Normalize long name (allow underscores)
             name = name.replace('_', "-");
 
-            let mut negated = false;
-            if let Some(stripped) = name.strip_prefix("no-") {
-                name = stripped.to_string();
-                negated = true;
+            // `--no-foo` negates a boolean flag; strip the prefix so the rest
+            // of the matching sees the field's real name.
+            let negated = name.starts_with("no-");
+            if negated {
+                name.drain(.."no-".len());
             }
 
             // Convert kebab-case to snake_case for matching
@@ -1199,11 +1199,7 @@ fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
                     if negated && value.is_some() {
                         anyhow::bail!("unexpected value for --no-{name}");
                     }
-                    if let Some(v) = value {
-                        parse_value(&v, prop_type)
-                    } else {
-                        Value::Bool(!negated)
-                    }
+                    value.map_or(Value::Bool(!negated), |v| parse_value(&v, prop_type))
                 } else {
                     let val = value.or_else(|| {
                         i += 1;
@@ -2026,6 +2022,9 @@ mod tests {
         use std::borrow::Cow;
 
         #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+        // `question` names the prompt text within a `Question`; the repetition
+        // is the wire format's, not ours.
+        #[allow(clippy::struct_field_names)]
         struct Question {
             section: String,
             question: String,

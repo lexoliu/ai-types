@@ -12,7 +12,7 @@ use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
 use std::{
     borrow::Cow,
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc,
@@ -325,6 +325,10 @@ pub fn bash_tool_factory_channel() -> (BashToolFactory, BashToolFactoryReceiver)
 
 impl BashToolFactory {
     /// Requests a new child bash tool from the factory service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the factory service has stopped.
     pub async fn create(&self) -> Result<crate::command::DynBashTool, BashToolFactoryError> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
@@ -435,6 +439,11 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
     ///
     /// Creates a random four-word working directory under the specified parent directory.
     /// The executor is used to spawn async tasks for the IPC server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the working directory cannot be created or the IPC
+    /// socket cannot be bound.
     pub async fn new_in(
         parent_dir: impl AsRef<std::path::Path>,
         permission_handler: P,
@@ -491,6 +500,11 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
     /// Unlike `new_in` which creates a random subdirectory, this method
     /// uses the exact path provided. Use this when you want explicit control
     /// over the working directory location.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the working directory cannot be created or the IPC
+    /// socket cannot be bound.
     pub async fn new_exact(
         working_dir: impl AsRef<std::path::Path>,
         permission_handler: P,
@@ -993,7 +1007,7 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
 
 async fn start_background_output_redirect(
     job_registry: &JobRegistry,
-    store_dir: &PathBuf,
+    store_dir: &Path,
     task_id: &str,
     max_lines: usize,
     promotion_reason: Option<&str>,
@@ -1215,14 +1229,12 @@ where
         }
     } else {
         let is_text = matches!(expect, OutputFormat::Text | OutputFormat::Auto);
-        let compressed = if !raw && is_text && !output.stdout.is_empty() {
-            if let Ok(text) = std::str::from_utf8(&output.stdout) {
-                crate::output_compress::compress_text(text)
-            } else {
-                None
-            }
-        } else {
+        let compressed = if raw || !is_text || output.stdout.is_empty() {
             None
+        } else {
+            std::str::from_utf8(&output.stdout)
+                .ok()
+                .and_then(crate::output_compress::compress_text)
         };
 
         if let Some(ref c) = compressed {
@@ -1315,7 +1327,7 @@ where
         execution_id,
     } = ids;
 
-    let router = create_ipc_router(registry);
+    let router = create_ipc_router(&registry);
     let config = SandboxConfig::builder()
         .network(policy)
         .working_dir(working_dir)
@@ -1407,7 +1419,7 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
         task_id,
         execution_id,
     } = ids;
-    let router = create_ipc_gateway_router(registry);
+    let router = create_ipc_gateway_router(&registry);
     let config = SandboxConfig::builder()
         .network(AllowAll)
         .working_dir(working_dir)
@@ -1502,7 +1514,9 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
         BashError::Execution("missing container executor for container backend".into())
     })?;
 
-    // Use lower 32 bits of a UUID as a synthetic PID for job tracking.
+    // Use the lower 32 bits of a UUID as a synthetic PID for job tracking.
+    // Truncation is the point: we want a compact, arbitrary identifier.
+    #[allow(clippy::cast_possible_truncation)]
     let pid = uuid::Uuid::new_v4().as_u128() as u32;
     let (kill_tx, kill_rx) = async_channel::bounded::<()>(1);
     job_registry
@@ -2048,7 +2062,7 @@ async fn wait_for_terminal_stream_close(job_registry: &JobRegistry, pid: u32) {
 }
 
 /// Creates the IPC router with built-in and tool commands (standalone version).
-fn create_ipc_router(registry: Arc<ToolRegistry>) -> IpcRouter {
+fn create_ipc_router(registry: &Arc<ToolRegistry>) -> IpcRouter {
     let mut router = builtin_router();
 
     // Register all configured tools as IPC commands
@@ -2061,7 +2075,7 @@ fn create_ipc_router(registry: Arc<ToolRegistry>) -> IpcRouter {
     router
 }
 
-fn create_ipc_gateway_router(registry: Arc<ToolRegistry>) -> IpcRouter {
+fn create_ipc_gateway_router(registry: &Arc<ToolRegistry>) -> IpcRouter {
     let mut router = crate::register_ipc_gateway_command(IpcRouter::new(), registry.clone());
 
     // In unsafe mode, keep tool commands usable (websearch/webfetch/ask/task/todo...),
