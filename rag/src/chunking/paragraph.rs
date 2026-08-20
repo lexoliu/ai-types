@@ -121,11 +121,10 @@ impl Chunker for ParagraphChunker {
                 ));
                 idx += 1;
                 current.clear();
-                current.push_str(paragraph);
             } else {
                 current.push_str("\n\n");
-                current.push_str(paragraph);
             }
+            current.push_str(paragraph);
         }
 
         if !current.is_empty() {

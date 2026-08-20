@@ -117,6 +117,9 @@ where
     /// # Returns
     /// The number of chunks actually inserted (may be less than total chunks
     /// if deduplication is enabled and duplicates are found).
+    /// # Errors
+    ///
+    /// Returns an error if the document cannot be embedded or stored.
     pub async fn insert(&self, document: Document) -> Result<usize> {
         let cleaned = self.cleaner.clean(&document);
         let chunks = self.chunker.chunk(&cleaned)?;
@@ -144,6 +147,9 @@ where
     ///
     /// # Returns
     /// The total number of chunks inserted across all documents.
+    /// # Errors
+    ///
+    /// Returns an error if any document cannot be embedded or stored.
     pub async fn insert_batch(&self, documents: Vec<Document>) -> Result<usize> {
         let mut total_inserted = 0;
         for doc in documents {
@@ -155,6 +161,9 @@ where
     /// Inserts a pre-chunked chunk with a precomputed embedding.
     ///
     /// Useful for loading from persistence or custom chunking workflows.
+    /// # Errors
+    ///
+    /// Returns an error if the embedding's dimension does not match the index.
     pub fn insert_with_embedding(&self, chunk: Chunk, embedding: Vec<f32>) -> Result<()> {
         self.index.insert(chunk, embedding)
     }
@@ -181,11 +190,19 @@ where
     }
 
     /// Searches for chunks similar to the query.
+    /// # Errors
+    ///
+    /// Returns an error if the query cannot be embedded, or its dimension does
+    /// not match the index.
     pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
         self.search_with_k(query, self.config.default_top_k).await
     }
 
     /// Searches for chunks similar to the query with a custom result count.
+    /// # Errors
+    ///
+    /// Returns an error if the query cannot be embedded, or its dimension does
+    /// not match the index.
     pub async fn search_with_k(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         let embedding = self
             .embedder
@@ -270,7 +287,10 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {
-                *value = ((text.len() + idx) % 10) as f32 / 10.0;
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    *value = ((text.len() + idx) % 10) as f32 / 10.0;
+                }
             }
             Ok(vec)
         }

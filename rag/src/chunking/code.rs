@@ -32,9 +32,11 @@ impl CodeChunker {
     }
 
     fn detect_rust(doc: &Document) -> bool {
-        doc.metadata
-            .get("path")
-            .is_some_and(|path| path.ends_with(".rs"))
+        doc.metadata.get("path").is_some_and(|path| {
+            std::path::Path::new(path)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("rs"))
+        })
     }
 
     fn chunk_rust(&self, doc: &Document) -> Result<Vec<Chunk>> {

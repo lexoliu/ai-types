@@ -51,7 +51,7 @@ impl LanceDbPersistence {
         ])
     }
 
-    fn block_on<F, T>(&self, fut: F) -> Result<T>
+    fn block_on<F, T>(fut: F) -> Result<T>
     where
         F: std::future::Future<Output = Result<T>>,
     {
@@ -80,8 +80,13 @@ impl LanceDbPersistence {
             StringArray::from_iter_values(entries.iter().map(|e| e.chunk.text.as_str()));
         let chunk_source_id =
             StringArray::from_iter_values(entries.iter().map(|e| e.chunk.source_id.as_str()));
-        let chunk_index =
-            UInt32Array::from_iter_values(entries.iter().map(|e| e.chunk.index as u32));
+        let chunk_index = UInt32Array::from_iter_values(entries.iter().map(|e| {
+            // Chunk indices are per-document and far below u32::MAX.
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                e.chunk.index as u32
+            }
+        }));
         let chunk_content_hash =
             UInt64Array::from_iter_values(entries.iter().map(|e| e.chunk.content_hash));
         let chunk_metadata = StringArray::from_iter_values(entries.iter().map(|e| {
@@ -115,7 +120,7 @@ impl LanceDbPersistence {
 
 impl Persistence for LanceDbPersistence {
     fn save(&self, entries: &[IndexEntry]) -> Result<()> {
-        self.block_on(async {
+        Self::block_on(async {
             let uri = self.path.to_string_lossy().to_string();
             let db = connect(&uri)
                 .execute()
@@ -153,7 +158,7 @@ impl Persistence for LanceDbPersistence {
     }
 
     fn load(&self) -> Result<Vec<IndexEntry>> {
-        self.block_on(async {
+        Self::block_on(async {
             let uri = self.path.to_string_lossy().to_string();
             let db = connect(&uri)
                 .execute()

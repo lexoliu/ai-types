@@ -64,9 +64,8 @@ pub(crate) fn collect_files(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
 
     while let Some(path) = stack.pop() {
-        let metadata = match fs::metadata(&path) {
-            Ok(meta) => meta,
-            Err(_) => continue,
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
         };
 
         if metadata.is_dir() {

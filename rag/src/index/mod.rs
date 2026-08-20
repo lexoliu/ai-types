@@ -18,6 +18,9 @@ pub trait VectorIndex: Send + Sync {
     /// Inserts or updates a chunk with its embedding vector.
     ///
     /// If a chunk with the same ID already exists, it will be replaced.
+    /// # Errors
+    ///
+    /// Returns an error if the embedding's dimension does not match the index.
     fn insert(&self, chunk: Chunk, embedding: Vec<f32>) -> Result<()>;
 
     /// Removes a chunk by its ID.
@@ -31,6 +34,9 @@ pub trait VectorIndex: Send + Sync {
     /// * `query` - The query embedding vector
     /// * `top_k` - Maximum number of results to return
     /// * `threshold` - Minimum similarity score (0.0 to 1.0 for cosine)
+    /// # Errors
+    ///
+    /// Returns an error if the query's dimension does not match the index.
     fn search(&self, query: &[f32], top_k: usize, threshold: f32) -> Result<Vec<SearchResult>>;
 
     /// Returns the embedding dimension.
@@ -51,6 +57,9 @@ pub trait VectorIndex: Send + Sync {
     fn entries(&self) -> Vec<IndexEntry>;
 
     /// Loads entries into the index, replacing existing content.
+    /// # Errors
+    ///
+    /// Returns an error if any entry's dimension does not match the index.
     fn load(&self, entries: Vec<IndexEntry>) -> Result<()>;
 
     /// Checks if a content hash already exists in the index.

@@ -209,6 +209,9 @@ impl HnswIndex {
 }
 
 impl VectorIndex for HnswIndex {
+    // The write guard has to span the whole update: releasing it between the
+    // lookup and the mutation would let another writer interleave.
+    #[allow(clippy::significant_drop_tightening)]
     fn insert(&self, chunk: Chunk, embedding: Vec<f32>) -> Result<()> {
         if embedding.len() != self.dimension {
             return Err(RagError::DimensionMismatch {
@@ -273,6 +276,9 @@ impl VectorIndex for HnswIndex {
         true
     }
 
+    // The guard is downgraded rather than dropped, so it necessarily outlives
+    // the rebuild it protects.
+    #[allow(clippy::significant_drop_tightening)]
     fn search(&self, query: &[f32], top_k: usize, threshold: f32) -> Result<Vec<SearchResult>> {
         if query.len() != self.dimension {
             return Err(RagError::DimensionMismatch {
@@ -341,6 +347,9 @@ impl VectorIndex for HnswIndex {
             .collect()
     }
 
+    // The write guard has to span the whole update: releasing it between the
+    // lookup and the mutation would let another writer interleave.
+    #[allow(clippy::significant_drop_tightening)]
     fn load(&self, entries: Vec<IndexEntry>) -> Result<()> {
         let mut state = self.state.write();
 

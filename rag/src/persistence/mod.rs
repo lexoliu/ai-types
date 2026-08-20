@@ -22,11 +22,20 @@ use std::path::Path;
 /// Persistence backends handle saving and loading index entries to/from storage.
 pub trait Persistence: Send + Sync {
     /// Saves all index entries to storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backing store cannot be written.
     fn save(&self, entries: &[IndexEntry]) -> Result<()>;
 
     /// Loads all index entries from storage.
     ///
     /// Returns an empty vector if no data exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backing store exists but cannot be read or
+    /// decoded.
     fn load(&self) -> Result<Vec<IndexEntry>>;
 
     /// Returns the file extension used by this backend.

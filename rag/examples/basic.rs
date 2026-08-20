@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
                     eprintln!("Skipped {}: {}", path.display(), reason);
                 }
             }
-            _ => {}
+            IndexStage::Chunking => {}
         })
         .await?;
 

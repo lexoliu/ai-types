@@ -99,7 +99,10 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {
-                *value = ((text.len() + idx) % 10) as f32 / 10.0;
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    *value = ((text.len() + idx) % 10) as f32 / 10.0;
+                }
             }
             Ok(vec)
         }

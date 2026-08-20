@@ -108,7 +108,7 @@ mod tests {
     fn default_config() {
         let config = RagConfig::default();
         assert_eq!(config.index_path, PathBuf::from("./rag_index.redb"));
-        assert_eq!(config.similarity_threshold, 0.0);
+        assert!((config.similarity_threshold - 0.0).abs() < f32::EPSILON);
         assert_eq!(config.default_top_k, 5);
         assert!(config.deduplication);
         assert!(config.auto_save);
@@ -125,7 +125,7 @@ mod tests {
             .build();
 
         assert_eq!(config.index_path, PathBuf::from("/custom/path.redb"));
-        assert_eq!(config.similarity_threshold, 0.5);
+        assert!((config.similarity_threshold - 0.5).abs() < f32::EPSILON);
         assert_eq!(config.default_top_k, 10);
         assert!(!config.deduplication);
         assert!(!config.auto_save);

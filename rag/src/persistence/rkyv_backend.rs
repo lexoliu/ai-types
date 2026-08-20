@@ -36,6 +36,8 @@ impl From<&IndexEntry> for EntryData {
             chunk_id: entry.chunk.id.clone(),
             chunk_text: entry.chunk.text.clone(),
             chunk_source_id: entry.chunk.source_id.clone(),
+            // Chunk indices are per-document and far below u32::MAX.
+            #[allow(clippy::cast_possible_truncation)]
             chunk_index: entry.chunk.index as u32,
             chunk_content_hash: entry.chunk.content_hash,
             chunk_metadata: entry
