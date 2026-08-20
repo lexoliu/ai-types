@@ -675,6 +675,18 @@ where
     }
 }
 
+/// Where and how one bash invocation will run, resolved from its mode.
+struct ResolvedTarget {
+    backend: ShellBackend,
+    mode: BashMode,
+    /// SSH destination, when the backend is SSH.
+    ssh_target: Option<String>,
+    /// How the sandbox runtime is available on that host.
+    ssh_runtime: Option<SshRuntimeProfile>,
+    /// Container to exec into, when the backend is a container.
+    container_id: Option<String>,
+}
+
 impl<P, E> BashTool<P, E, Configured>
 where
     P: PermissionHandler + 'static,
@@ -682,6 +694,235 @@ where
 {
     const fn registry(&self) -> &Arc<ToolRegistry> {
         &self.registry.registry
+    }
+
+    /// Works out which shell a request should run in, and confirms this
+    /// sandbox can actually reach it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the mode is unavailable in this runtime, an SSH
+    /// request names no server, or the configured container backend is missing
+    /// its id or executor.
+    async fn resolve_target(&self, arguments: &BashArgs) -> aither_core::Result<ResolvedTarget> {
+        let resolved = match arguments.mode {
+            BashExecutionMode::Default => {
+                let backend = self
+                    .shell_sessions
+                    .resolve_local_backend()
+                    .map_err(anyhow::Error::msg)?;
+                let container_id = if matches!(backend, ShellBackend::Container) {
+                    Some(self.shell_sessions.container_id().ok_or_else(|| {
+                        anyhow::anyhow!("missing container_id for container backend")
+                    })?)
+                } else {
+                    None
+                };
+                ResolvedTarget {
+                    backend,
+                    mode: BashMode::Network,
+                    ssh_target: None,
+                    ssh_runtime: None,
+                    container_id,
+                }
+            }
+            BashExecutionMode::Unsafe => {
+                let backend = self
+                    .shell_sessions
+                    .resolve_local_backend()
+                    .map_err(anyhow::Error::msg)?;
+                if !matches!(backend, ShellBackend::Local) {
+                    return Err(anyhow::anyhow!(
+                        "unsafe mode is only available in heel local runtime"
+                    ));
+                }
+                ResolvedTarget {
+                    backend,
+                    mode: BashMode::Unsafe,
+                    ssh_target: None,
+                    ssh_runtime: None,
+                    container_id: None,
+                }
+            }
+            BashExecutionMode::Ssh => {
+                self.shell_sessions
+                    .ensure_ssh_available()
+                    .map_err(anyhow::Error::msg)?;
+                let server_id = arguments
+                    .ssh_server_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("ssh_server_id is required for ssh mode"))?;
+                let server = self
+                    .shell_sessions
+                    .resolve_ssh_server(server_id)
+                    .map_err(anyhow::Error::msg)?;
+                let runtime =
+                    bootstrap_ssh_runtime(&server.target, &self.shell_sessions.ssh_authorizer())
+                        .await?;
+                ResolvedTarget {
+                    backend: ShellBackend::Ssh,
+                    mode: BashMode::Network,
+                    ssh_target: Some(server.target),
+                    ssh_runtime: Some(runtime),
+                    container_id: None,
+                }
+            }
+        };
+
+        if matches!(resolved.backend, ShellBackend::Container)
+            && self.shell_sessions.container_exec().is_none()
+        {
+            return Err(anyhow::anyhow!(
+                "missing container executor for container backend"
+            ));
+        }
+
+        Ok(resolved)
+    }
+
+    /// Starts the script on the executor and hands back the channels the
+    /// caller watches while it runs.
+    ///
+    /// The script always runs detached, whether or not the caller waits for it:
+    /// that is what lets a slow one be promoted to the background without
+    /// restarting it.
+    fn spawn_script(
+        &self,
+        target: ResolvedTarget,
+        arguments: &BashArgs,
+        task_id: &str,
+        store_dir: PathBuf,
+    ) -> RunningScript {
+        let ResolvedTarget {
+            backend,
+            mode,
+            ssh_target,
+            ssh_runtime,
+            container_id,
+        } = target;
+
+        let script = arguments.script.clone();
+        let execution_id = format!("exec-{task_id}");
+        let expect = arguments.expect;
+        let max_lines = arguments.max_lines.min(MAX_LINES_CEILING) as usize;
+        let raw = arguments.raw;
+
+        let container_exec = self.shell_sessions.container_exec();
+        let working_dir = self.working_dir.clone();
+        let writable_paths = self.writable_paths.clone();
+        let readable_paths = self.readable_paths.clone();
+        let executor = self.executor.clone();
+        let registry = self.registry().clone();
+        let permission_handler = self.permission_handler.clone();
+        let completed_tx = self.completed_tx.clone();
+        let job_registry = self.job_registry.clone();
+        let background_mode = Arc::new(AtomicBool::new(arguments.timeout == 0));
+
+        let (result_tx, result_rx) = async_channel::bounded(1);
+        let (stdin_blocked_tx, stdin_blocked_rx) = async_channel::bounded(1);
+        // Only the container backend can see that a process is stuck on stdin.
+        let stdin_blocked_notice =
+            matches!(backend, ShellBackend::Container).then_some(stdin_blocked_tx);
+
+        let task_id_for_spawn = task_id.to_string();
+        let background_mode_for_spawn = background_mode.clone();
+        self.executor
+            .spawn(async move {
+                let result = execute_script_standalone(
+                    SandboxPaths {
+                        working_dir: &working_dir,
+                        writable_paths: &writable_paths,
+                        readable_paths: &readable_paths,
+                    },
+                    ExecutionIds {
+                        task_id: &task_id_for_spawn,
+                        execution_id: &execution_id,
+                    },
+                    ShellTarget {
+                        backend,
+                        ssh_target: ssh_target.as_deref(),
+                        ssh_runtime: ssh_runtime.as_ref(),
+                        container_id: container_id.as_deref(),
+                        container_exec: container_exec.as_ref(),
+                    },
+                    OutputOptions {
+                        expect,
+                        store_dir: &store_dir,
+                        max_lines,
+                        raw,
+                    },
+                    ExecutionContext {
+                        executor,
+                        registry,
+                        permission_handler,
+                        job_registry,
+                        background_mode: background_mode_for_spawn,
+                        stdin_blocked_notice,
+                    },
+                    &script,
+                    mode,
+                )
+                .await;
+
+                // The waiting caller only needs to know how it went; the
+                // completion channel carries the full record.
+                let quick_result = match &result {
+                    Ok(ok) => Ok(ok.clone()),
+                    Err(err) => Err(err.to_string()),
+                };
+                let _ = result_tx.send(quick_result).await;
+
+                let _ = completed_tx
+                    .send(CompletedTask {
+                        task_id: task_id_for_spawn,
+                        script,
+                        result,
+                    })
+                    .await;
+            })
+            .detach();
+
+        RunningScript {
+            result_rx,
+            stdin_blocked_rx,
+            background_mode,
+        }
+    }
+
+    /// Reports a still-running script as a background job.
+    ///
+    /// The output collected so far is redirected to a file and summarised, so
+    /// the caller gets a task id it can poll rather than a truncated snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the redirect cannot be started or the summary cannot
+    /// be serialised.
+    async fn background_response(
+        &self,
+        store_dir: &Path,
+        task_id: String,
+        max_lines: usize,
+        promotion_reason: Option<&str>,
+    ) -> aither_core::Result<ToolOutput> {
+        let stdout = start_background_output_redirect(
+            &self.job_registry,
+            store_dir,
+            &task_id,
+            max_lines,
+            promotion_reason,
+        )
+        .await?;
+
+        let running = BashResult {
+            stdout,
+            stderr: None,
+            exit_code: 0,
+            task_id: Some(task_id),
+            status: Some("running".to_string()),
+        };
+        let json = serde_json::to_string(&running).map_err(|e| anyhow::anyhow!(e))?;
+        Ok(ToolOutput::text(json))
     }
 
     /// Starts a background service that produces child bash tools on demand.
@@ -751,258 +992,111 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
 
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
         let task_id = random_task_id();
-        let script = arguments.script.clone();
-        let execution_id = format!("exec-{task_id}");
-        let expect = arguments.expect;
         let max_lines = arguments.max_lines.min(MAX_LINES_CEILING) as usize;
-        let raw = arguments.raw;
         let timeout = arguments.timeout;
-
-        let (backend, mode, ssh_target, ssh_runtime, container_id) = match arguments.mode {
-            BashExecutionMode::Default => {
-                let backend = self
-                    .shell_sessions
-                    .resolve_local_backend()
-                    .map_err(anyhow::Error::msg)?;
-                let container_id = if matches!(backend, ShellBackend::Container) {
-                    Some(self.shell_sessions.container_id().ok_or_else(|| {
-                        anyhow::anyhow!("missing container_id for container backend")
-                    })?)
-                } else {
-                    None
-                };
-                (backend, BashMode::Network, None, None, container_id)
-            }
-            BashExecutionMode::Unsafe => {
-                let backend = self
-                    .shell_sessions
-                    .resolve_local_backend()
-                    .map_err(anyhow::Error::msg)?;
-                if !matches!(backend, ShellBackend::Local) {
-                    return Err(anyhow::anyhow!(
-                        "unsafe mode is only available in heel local runtime"
-                    ));
-                }
-                (backend, BashMode::Unsafe, None, None, None)
-            }
-            BashExecutionMode::Ssh => {
-                self.shell_sessions
-                    .ensure_ssh_available()
-                    .map_err(anyhow::Error::msg)?;
-                let server_id = arguments
-                    .ssh_server_id
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("ssh_server_id is required for ssh mode"))?;
-                let server = self
-                    .shell_sessions
-                    .resolve_ssh_server(server_id)
-                    .map_err(anyhow::Error::msg)?;
-                let runtime =
-                    bootstrap_ssh_runtime(&server.target, &self.shell_sessions.ssh_authorizer())
-                        .await?;
-                (
-                    ShellBackend::Ssh,
-                    BashMode::Network,
-                    Some(server.target),
-                    Some(runtime),
-                    None,
-                )
-            }
-        };
-
-        ensure_mode_allowed(self.permission_handler.as_ref(), mode, &script)
-            .await
-            .map_err(anyhow::Error::new)?;
-
-        if matches!(backend, ShellBackend::Container)
-            && self.shell_sessions.container_exec().is_none()
-        {
-            return Err(anyhow::anyhow!(
-                "missing container executor for container backend"
-            ));
-        }
-
-        let container_exec = self.shell_sessions.container_exec();
-        let working_dir = self.working_dir.clone();
-        let writable_paths = self.writable_paths.clone();
-        let readable_paths = self.readable_paths.clone();
-        let executor = self.executor.clone();
-        let registry = self.registry().clone();
-        let permission_handler = self.permission_handler.clone();
         let store_dir = self.output_store.dir().to_path_buf();
-        let store_dir_for_spawn = store_dir.clone();
-        let completed_tx = self.completed_tx.clone();
-        let job_registry = self.job_registry.clone();
-        let background_mode = Arc::new(AtomicBool::new(timeout == 0));
-        let (result_tx, result_rx) = async_channel::bounded(1);
-        let (stdin_blocked_tx, stdin_blocked_rx) = async_channel::bounded(1);
-        let stdin_blocked_notice = if matches!(backend, ShellBackend::Container) {
-            Some(stdin_blocked_tx)
-        } else {
-            None
-        };
 
-        let task_id_for_spawn = task_id.clone();
-        let background_mode_for_spawn = background_mode.clone();
-        self.executor
-            .spawn(async move {
-                let result = execute_script_standalone(
-                    SandboxPaths {
-                        working_dir: &working_dir,
-                        writable_paths: &writable_paths,
-                        readable_paths: &readable_paths,
-                    },
-                    ExecutionIds {
-                        task_id: &task_id_for_spawn,
-                        execution_id: &execution_id,
-                    },
-                    ShellTarget {
-                        backend,
-                        ssh_target: ssh_target.as_deref(),
-                        ssh_runtime: ssh_runtime.as_ref(),
-                        container_id: container_id.as_deref(),
-                        container_exec: container_exec.as_ref(),
-                    },
-                    OutputOptions {
-                        expect,
-                        store_dir: &store_dir_for_spawn,
-                        max_lines,
-                        raw,
-                    },
-                    ExecutionContext {
-                        executor,
-                        registry,
-                        permission_handler,
-                        job_registry,
-                        background_mode: background_mode_for_spawn,
-                        stdin_blocked_notice,
-                    },
-                    &script,
-                    mode,
-                )
-                .await;
+        let target = self.resolve_target(&arguments).await?;
+        ensure_mode_allowed(
+            self.permission_handler.as_ref(),
+            target.mode,
+            &arguments.script,
+        )
+        .await
+        .map_err(anyhow::Error::new)?;
 
-                let quick_result = match &result {
-                    Ok(ok) => Ok(ok.clone()),
-                    Err(err) => Err(err.to_string()),
-                };
-                let _ = result_tx.send(quick_result).await;
+        let running = self.spawn_script(target, &arguments, &task_id, store_dir.clone());
 
-                let _ = completed_tx
-                    .send(CompletedTask {
-                        task_id: task_id_for_spawn,
-                        script,
-                        result,
-                    })
-                    .await;
-            })
-            .detach();
-
+        // A zero timeout means the caller wants the job backgrounded outright.
         if timeout == 0 {
-            let stdout = start_background_output_redirect(
-                &self.job_registry,
-                &store_dir,
-                &task_id,
-                max_lines,
-                None,
-            )
-            .await?;
-            let running = BashResult {
-                stdout,
-                stderr: None,
-                exit_code: 0,
-                task_id: Some(task_id),
-                status: Some("running".to_string()),
-            };
-            let json = serde_json::to_string(&running).map_err(|e| anyhow::anyhow!(e))?;
-            return Ok(ToolOutput::text(json));
+            return self
+                .background_response(&store_dir, task_id, max_lines, None)
+                .await;
         }
 
-        let timeout = std::time::Duration::from_secs(timeout);
-        let immediate = futures_lite::future::or(
-            async {
-                result_rx
-                    .recv()
-                    .await
-                    .ok()
-                    .map(ForegroundDecision::Completed)
-            },
-            async {
-                futures_lite::future::or(
-                    async {
-                        stdin_blocked_rx
-                            .recv()
-                            .await
-                            .ok()
-                            .map(|reason| ForegroundDecision::PromoteToBackground(Some(reason)))
-                    },
-                    async {
-                        async_io::Timer::after(timeout).await;
-                        Some(ForegroundDecision::PromoteToBackground(None))
-                    },
-                )
-                .await
-            },
+        let decision = await_foreground(
+            &running.result_rx,
+            &running.stdin_blocked_rx,
+            std::time::Duration::from_secs(timeout),
         )
         .await;
 
-        match immediate {
-            Some(ForegroundDecision::Completed(Ok(mut result))) => {
-                result.task_id = None;
-                result.status = None;
-
-                let failed = result.exit_code != 0;
-                let json = serde_json::to_string(&result).map_err(|e| anyhow::anyhow!(e))?;
-
-                if failed {
-                    return Err(anyhow::anyhow!(format!("bash command failed: {json}")));
-                }
-
-                Ok(ToolOutput::text(json))
+        // Anything other than a completed run means the script outlived its
+        // foreground budget, so it keeps going as a background job.
+        let promotion_reason = match decision {
+            Some(ForegroundDecision::Completed(Ok(result))) => {
+                return foreground_response(result);
             }
-            Some(ForegroundDecision::Completed(Err(err))) => Err(anyhow::anyhow!(err)),
-            Some(ForegroundDecision::PromoteToBackground(reason)) => {
-                background_mode.store(true, Ordering::Release);
-                let stdout = start_background_output_redirect(
-                    &self.job_registry,
-                    &store_dir,
-                    &task_id,
-                    max_lines,
-                    reason.as_deref(),
-                )
-                .await?;
-                let running = BashResult {
-                    stdout,
-                    stderr: None,
-                    exit_code: 0,
-                    task_id: Some(task_id),
-                    status: Some("running".to_string()),
-                };
-                let json = serde_json::to_string(&running).map_err(|e| anyhow::anyhow!(e))?;
-                Ok(ToolOutput::text(json))
-            }
-            None => {
-                background_mode.store(true, Ordering::Release);
-                let stdout = start_background_output_redirect(
-                    &self.job_registry,
-                    &store_dir,
-                    &task_id,
-                    max_lines,
-                    None,
-                )
-                .await?;
-                let running = BashResult {
-                    stdout,
-                    stderr: None,
-                    exit_code: 0,
-                    task_id: Some(task_id),
-                    status: Some("running".to_string()),
-                };
-                let json = serde_json::to_string(&running).map_err(|e| anyhow::anyhow!(e))?;
-                Ok(ToolOutput::text(json))
-            }
-        }
+            Some(ForegroundDecision::Completed(Err(err))) => return Err(anyhow::anyhow!(err)),
+            Some(ForegroundDecision::PromoteToBackground(reason)) => reason,
+            None => None,
+        };
+
+        running.background_mode.store(true, Ordering::Release);
+        self.background_response(&store_dir, task_id, max_lines, promotion_reason.as_deref())
+            .await
     }
+}
+
+/// The channels a spawned script reports through while it runs.
+struct RunningScript {
+    /// Carries the script's outcome once it finishes, either way.
+    result_rx: async_channel::Receiver<Result<BashResult, String>>,
+    /// Fires if the script parks on a read from stdin, which it will never
+    /// return from on its own.
+    stdin_blocked_rx: async_channel::Receiver<String>,
+    /// Set to tell the running script it has been promoted to the background.
+    background_mode: Arc<AtomicBool>,
+}
+
+/// Waits for the script to finish, giving up on the foreground when it blocks
+/// on stdin or runs past `timeout`.
+async fn await_foreground(
+    result_rx: &async_channel::Receiver<Result<BashResult, String>>,
+    stdin_blocked_rx: &async_channel::Receiver<String>,
+    timeout: std::time::Duration,
+) -> Option<ForegroundDecision> {
+    futures_lite::future::or(
+        async {
+            result_rx
+                .recv()
+                .await
+                .ok()
+                .map(ForegroundDecision::Completed)
+        },
+        futures_lite::future::or(
+            async {
+                stdin_blocked_rx
+                    .recv()
+                    .await
+                    .ok()
+                    .map(|reason| ForegroundDecision::PromoteToBackground(Some(reason)))
+            },
+            async {
+                async_io::Timer::after(timeout).await;
+                Some(ForegroundDecision::PromoteToBackground(None))
+            },
+        ),
+    )
+    .await
+}
+
+/// Renders a finished run as tool output.
+///
+/// A non-zero exit is returned as an error so the model sees the failure, with
+/// the full result kept in the message rather than reduced to a status code.
+fn foreground_response(mut result: BashResult) -> aither_core::Result<ToolOutput> {
+    // The task id and status only mean something for a background job.
+    result.task_id = None;
+    result.status = None;
+
+    let failed = result.exit_code != 0;
+    let json = serde_json::to_string(&result).map_err(|e| anyhow::anyhow!(e))?;
+
+    if failed {
+        return Err(anyhow::anyhow!(format!("bash command failed: {json}")));
+    }
+    Ok(ToolOutput::text(json))
 }
 
 async fn start_background_output_redirect(
@@ -1100,6 +1194,153 @@ struct ExecutionContext<P, E> {
     stdin_blocked_notice: Option<async_channel::Sender<String>>,
 }
 
+/// Records a storage failure against the job before surfacing it.
+///
+/// A script whose output could not be stored has not really succeeded, so the
+/// job is marked failed rather than left looking complete.
+async fn fail_job(job_registry: &JobRegistry, pid: u32, err: std::io::Error) -> BashError {
+    job_registry.fail(pid, &err.to_string(), None).await;
+    BashError::Io(err)
+}
+
+/// Saves a finished script's stdout, folding source code where that helps.
+///
+/// A backgrounded run is stored verbatim: its output is read from the file
+/// later, where the compressed form would be a lie about what the script
+/// printed. Compression is also skipped when the caller asked for raw output or
+/// the output is not text.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error if the output store cannot be written.
+async fn store_stdout(
+    stdout: &[u8],
+    opts: &OutputOptions<'_>,
+    background: bool,
+) -> Result<OutputEntry, std::io::Error> {
+    let byte_limit = Some(INLINE_OUTPUT_LIMIT);
+
+    if background {
+        return crate::output::save_text_with_line_limit(
+            opts.store_dir,
+            stdout,
+            opts.expect,
+            opts.max_lines,
+            byte_limit,
+        )
+        .await;
+    }
+
+    let is_text = matches!(opts.expect, OutputFormat::Text | OutputFormat::Auto);
+    let compressed = if opts.raw || !is_text || stdout.is_empty() {
+        None
+    } else {
+        std::str::from_utf8(stdout)
+            .ok()
+            .and_then(crate::output_compress::compress_text)
+    };
+
+    // Folding hides lines the caller may still want, so the unfolded text is
+    // kept on disk alongside it. Failing to do so costs detail, not the run.
+    if let Some(raw_text) = compressed.as_ref().and_then(|c| c.raw_for_file.as_ref())
+        && let Err(err) = crate::output::save_raw_to_file(opts.store_dir, raw_text.as_bytes()).await
+    {
+        warn!(error = %err, "failed to save raw source code output");
+    }
+
+    let data_to_save = compressed.as_ref().map_or(stdout, |c| c.text.as_bytes());
+
+    crate::output::save_text_with_line_limit(
+        opts.store_dir,
+        data_to_save,
+        opts.expect,
+        opts.max_lines,
+        byte_limit,
+    )
+    .await
+}
+
+/// One script's run, addressed to whichever backend the target names.
+struct BackendRun<'a, P, E> {
+    paths: SandboxPaths<'a>,
+    ids: ExecutionIds<'a>,
+    target: ShellTarget<'a>,
+    executor: E,
+    registry: Arc<ToolRegistry>,
+    permission_handler: Arc<P>,
+    job_registry: &'a JobRegistry,
+    stdin_blocked_notice: Option<async_channel::Sender<String>>,
+    script: &'a str,
+    mode: BashMode,
+}
+
+impl<P, E> BackendRun<'_, P, E>
+where
+    P: PermissionHandler + 'static,
+    E: Executor + Clone + 'static,
+{
+    /// Runs the script and returns its pid and captured output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BashError`] if the backend refuses the request or the script
+    /// cannot be started.
+    async fn run(self) -> Result<(u32, std::process::Output), BashError> {
+        let ipc_commands = self.registry.registered_tool_names();
+        let run = ScriptRun {
+            ids: self.ids,
+            executor: self.executor,
+            registry: self.registry,
+            script: self.script,
+            mode: self.mode,
+            job_registry: self.job_registry,
+        };
+
+        if matches!(self.target.backend, ShellBackend::Container) {
+            return execute_container_background(
+                run,
+                ContainerTarget {
+                    container_id: self.target.container_id,
+                    container_exec: self.target.container_exec,
+                    ipc_commands: &ipc_commands,
+                    stdin_blocked_notice: self.stdin_blocked_notice,
+                },
+            )
+            .await;
+        }
+
+        if matches!(self.target.backend, ShellBackend::Ssh) {
+            return execute_ssh_background(
+                self.ids.task_id,
+                self.ids.execution_id,
+                self.script,
+                self.mode,
+                self.target.ssh_target,
+                self.target.ssh_runtime.cloned(),
+                self.job_registry,
+            )
+            .await;
+        }
+
+        match self.mode {
+            BashMode::Network => {
+                execute_sandboxed_background(
+                    run,
+                    self.paths,
+                    PermissionNetworkPolicy {
+                        permission_handler: self.permission_handler,
+                    },
+                )
+                .await
+            }
+            BashMode::Unsafe => execute_unsafe_background(run, self.paths).await,
+            BashMode::Sandboxed => Err(BashError::Execution(
+                "sandboxed mode is unsupported; use mode=default or mode=unsafe".to_string(),
+            )),
+        }
+    }
+}
+
 /// Standalone script execution that can be spawned in a background task.
 async fn execute_script_standalone<P, E>(
     paths: SandboxPaths<'_>,
@@ -1114,23 +1355,6 @@ where
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
-    let ExecutionIds {
-        task_id,
-        execution_id,
-    } = ids;
-    let ShellTarget {
-        backend,
-        ssh_target,
-        ssh_runtime,
-        container_id,
-        container_exec,
-    } = target;
-    let OutputOptions {
-        expect,
-        store_dir,
-        max_lines,
-        raw,
-    } = output_opts;
     let ExecutionContext {
         executor,
         registry,
@@ -1147,151 +1371,49 @@ where
     );
     debug!(script = %script, "script content");
 
-    let ipc_commands = registry.registered_tool_names();
+    let (pid, output) = BackendRun {
+        paths,
+        ids,
+        target,
+        executor,
+        registry,
+        permission_handler,
+        job_registry: &job_registry,
+        stdin_blocked_notice,
+        script,
+        mode,
+    }
+    .run()
+    .await?;
 
-    let (pid, output) = if matches!(backend, ShellBackend::Container) {
-        execute_container_background(
-            ids,
-            executor.clone(),
-            registry.clone(),
-            script,
-            mode,
-            container_id,
-            container_exec,
-            &ipc_commands,
-            &job_registry,
-            stdin_blocked_notice,
-        )
-        .await?
-    } else if matches!(backend, ShellBackend::Ssh) {
-        execute_ssh_background(
-            task_id,
-            execution_id,
-            script,
-            mode,
-            ssh_target,
-            ssh_runtime.cloned(),
-            &job_registry,
-        )
-        .await?
-    } else {
-        match mode {
-            BashMode::Network => {
-                execute_sandboxed_background(
-                    paths,
-                    ids,
-                    executor.clone(),
-                    registry.clone(),
-                    script,
-                    mode,
-                    PermissionNetworkPolicy { permission_handler },
-                    &job_registry,
-                )
-                .await?
-            }
-            BashMode::Unsafe => {
-                execute_unsafe_background(
-                    paths,
-                    ids,
-                    executor,
-                    registry,
-                    script,
-                    mode,
-                    &job_registry,
-                )
-                .await?
-            }
-            BashMode::Sandboxed => {
-                return Err(BashError::Execution(
-                    "sandboxed mode is unsupported; use mode=default or mode=unsafe".to_string(),
-                ));
-            }
-        }
-    };
-
+    // The job may have been promoted while it ran, which decides whether the
+    // output is returned inline or only stored.
     let background_output = background_mode.load(Ordering::Acquire);
-    let byte_limit = Some(INLINE_OUTPUT_LIMIT);
-    let stdout = if background_output {
-        match crate::output::save_text_with_line_limit(
-            store_dir,
-            &output.stdout,
-            expect,
-            max_lines,
-            byte_limit,
-        )
-        .await
-        {
-            Ok(entry) => entry,
-            Err(err) => {
-                job_registry.fail(pid, &err.to_string(), None).await;
-                return Err(BashError::Io(err));
-            }
-        }
-    } else {
-        let is_text = matches!(expect, OutputFormat::Text | OutputFormat::Auto);
-        let compressed = if raw || !is_text || output.stdout.is_empty() {
-            None
-        } else {
-            std::str::from_utf8(&output.stdout)
-                .ok()
-                .and_then(crate::output_compress::compress_text)
-        };
-
-        if let Some(ref c) = compressed {
-            if let Some(ref raw_text) = c.raw_for_file {
-                if let Err(err) =
-                    crate::output::save_raw_to_file(store_dir, raw_text.as_bytes()).await
-                {
-                    warn!(error = %err, "failed to save raw source code output");
-                }
-            }
-        }
-
-        let data_to_save = compressed
-            .as_ref()
-            .map_or(&output.stdout[..], |c| c.text.as_bytes());
-
-        match crate::output::save_text_with_line_limit(
-            store_dir,
-            data_to_save,
-            expect,
-            max_lines,
-            byte_limit,
-        )
-        .await
-        {
-            Ok(entry) => entry,
-            Err(err) => {
-                job_registry.fail(pid, &err.to_string(), None).await;
-                return Err(BashError::Io(err));
-            }
-        }
+    let stdout = match store_stdout(&output.stdout, &output_opts, background_output).await {
+        Ok(entry) => entry,
+        Err(err) => return Err(fail_job(&job_registry, pid, err).await),
     };
 
-    // Save stderr if non-empty
     let stderr = if output.stderr.is_empty() {
         None
     } else {
         match OutputStore::save_to_dir_with_limit(
-            store_dir,
+            output_opts.store_dir,
             &output.stderr,
             OutputFormat::Text,
-            byte_limit,
+            Some(INLINE_OUTPUT_LIMIT),
         )
         .await
         {
             Ok(entry) => Some(entry),
-            Err(err) => {
-                job_registry.fail(pid, &err.to_string(), None).await;
-                return Err(BashError::Io(err));
-            }
+            Err(err) => return Err(fail_job(&job_registry, pid, err).await),
         }
     };
 
     let exit_code = output.status.code().unwrap_or(-1);
     debug!(exit_code, "background script completed");
 
-    let output_path = stdout.stored_path(store_dir);
+    let output_path = stdout.stored_path(output_opts.store_dir);
     job_registry.complete(pid, exit_code, output_path).await;
 
     Ok(BashResult {
@@ -1303,15 +1425,37 @@ where
     })
 }
 
-async fn execute_sandboxed_background<E, N>(
-    paths: SandboxPaths<'_>,
-    ids: ExecutionIds<'_>,
+/// The parts of a run that every local backend needs.
+///
+/// Grouped because they travel together: each backend below takes the same
+/// script, on behalf of the same registered job, with the same tools reachable
+/// over IPC.
+struct ScriptRun<'a, E> {
+    ids: ExecutionIds<'a>,
+    /// Spawns the work.
     executor: E,
+    /// Tools reachable from the script as IPC commands.
     registry: Arc<ToolRegistry>,
-    script: &str,
+    script: &'a str,
     mode: BashMode,
+    /// Records the job so it can be inspected and killed.
+    job_registry: &'a JobRegistry,
+}
+
+/// The container a script should be executed inside.
+struct ContainerTarget<'a> {
+    container_id: Option<&'a str>,
+    container_exec: Option<&'a Arc<dyn crate::shell_session::ContainerExecObject>>,
+    /// Tool names to expose as commands inside the container.
+    ipc_commands: &'a [String],
+    /// Notified when the script blocks on stdin.
+    stdin_blocked_notice: Option<async_channel::Sender<String>>,
+}
+
+async fn execute_sandboxed_background<E, N>(
+    run: ScriptRun<'_, E>,
+    paths: SandboxPaths<'_>,
     policy: N,
-    job_registry: &JobRegistry,
 ) -> Result<(u32, std::process::Output), BashError>
 where
     E: Executor + Clone + 'static,
@@ -1322,10 +1466,17 @@ where
         writable_paths,
         readable_paths,
     } = paths;
-    let ExecutionIds {
-        task_id,
-        execution_id,
-    } = ids;
+    let ScriptRun {
+        ids: ExecutionIds {
+            task_id,
+            execution_id,
+        },
+        executor,
+        registry,
+        script,
+        mode,
+        job_registry,
+    } = run;
 
     let router = create_ipc_router(&registry);
     let config = SandboxConfig::builder()
@@ -1402,19 +1553,22 @@ where
 }
 
 async fn execute_unsafe_background<E: Executor + Clone + 'static>(
+    run: ScriptRun<'_, E>,
     paths: SandboxPaths<'_>,
-    ids: ExecutionIds<'_>,
-    executor: E,
-    registry: Arc<ToolRegistry>,
-    script: &str,
-    mode: BashMode,
-    job_registry: &JobRegistry,
 ) -> Result<(u32, std::process::Output), BashError> {
     let SandboxPaths {
         working_dir,
         writable_paths,
         readable_paths,
     } = paths;
+    let ScriptRun {
+        ids,
+        executor,
+        registry,
+        script,
+        mode,
+        job_registry,
+    } = run;
     let ExecutionIds {
         task_id,
         execution_id,
@@ -1493,21 +1647,26 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
 }
 
 async fn execute_container_background<E: Executor + Clone + 'static>(
-    ids: ExecutionIds<'_>,
-    executor: E,
-    registry: Arc<ToolRegistry>,
-    script: &str,
-    mode: BashMode,
-    container_id: Option<&str>,
-    container_exec: Option<&Arc<dyn crate::shell_session::ContainerExecObject>>,
-    ipc_commands: &[String],
-    job_registry: &JobRegistry,
-    stdin_blocked_notice: Option<async_channel::Sender<String>>,
+    run: ScriptRun<'_, E>,
+    container: ContainerTarget<'_>,
 ) -> Result<(u32, std::process::Output), BashError> {
-    let ExecutionIds {
-        task_id,
-        execution_id,
-    } = ids;
+    let ScriptRun {
+        ids: ExecutionIds {
+            task_id,
+            execution_id,
+        },
+        executor,
+        registry,
+        script,
+        mode,
+        job_registry,
+    } = run;
+    let ContainerTarget {
+        container_id,
+        container_exec,
+        ipc_commands,
+        stdin_blocked_notice,
+    } = container;
     let container_id = container_id
         .ok_or_else(|| BashError::Execution("missing container_id for container backend".into()))?;
     let exec = container_exec.ok_or_else(|| {
