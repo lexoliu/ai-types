@@ -6,6 +6,7 @@
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use aither_core::{
@@ -183,6 +184,73 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
 /// error text it failed with.
 type ToolOutcome = (String, String, Result<String, String>);
 
+/// What one provider event asks the run loop to do.
+enum TurnStep {
+    /// The event only advanced accumulated state; nothing to emit.
+    Continue,
+    /// Model text: tell the hooks, then emit it.
+    EmitText(String),
+    /// Emit this event as-is.
+    Emit(AgentEvent),
+    /// Stop consuming this turn's stream.
+    Stop,
+}
+
+/// What one turn accumulates from the model's stream.
+///
+/// Kept outside the `run` stream so the per-tier arms are the same short loop
+/// rather than three copies of the same event handling.
+#[derive(Default)]
+struct Turn {
+    text_chunks: Vec<String>,
+    tool_calls: Vec<aither_core::llm::ToolCall>,
+    /// The model emitted a tool call the provider could not parse.
+    malformed_function_call: bool,
+    /// The provider failed outright.
+    error: Option<String>,
+}
+
+impl Turn {
+    /// Folds one provider event into the turn.
+    fn apply<E: core::fmt::Display>(&mut self, event: Result<Event, E>) -> TurnStep {
+        let event = match event {
+            Ok(event) => event,
+            Err(e) => {
+                let error_msg = e.to_string();
+                // A malformed call is worth another attempt; anything else is
+                // the provider telling us the turn is over.
+                if error_msg.contains("malformed function call") {
+                    tracing::warn!("Model generated malformed function call, retrying...");
+                    self.malformed_function_call = true;
+                } else {
+                    self.error = Some(error_msg);
+                }
+                return TurnStep::Stop;
+            }
+        };
+
+        match event {
+            Event::Text(text) => {
+                self.text_chunks.push(text.clone());
+                TurnStep::EmitText(text)
+            }
+            Event::Reasoning(r) => TurnStep::Emit(AgentEvent::Reasoning(r)),
+            Event::ToolCall(call) => {
+                self.tool_calls.push(call);
+                TurnStep::Continue
+            }
+            // Built-in results are the provider's own tools reporting back, so
+            // they read as model output rather than as a tool call of ours.
+            Event::BuiltInToolResult { tool, result } => {
+                let formatted = format!("[{tool}] {result}");
+                self.text_chunks.push(formatted.clone());
+                TurnStep::Emit(AgentEvent::Text(formatted))
+            }
+            Event::Usage(u) => TurnStep::Emit(AgentEvent::Usage(u)),
+        }
+    }
+}
+
 /// How long to wait for outstanding background bash tasks before giving up.
 const MAX_WAIT: Duration = Duration::from_secs(300);
 /// How often to check whether a background task has finished.
@@ -322,145 +390,40 @@ where
                     })?;
                 }
 
-                // Build messages
                 let messages = self.build_request_messages().await;
-
-                // Create request with tool definitions
                 let tool_defs = self.tools.active_definitions();
                 let request = LLMRequest::new(messages).with_tool_definitions(tool_defs);
 
-                // Stream the response and yield text events as they arrive
-                let mut text_chunks: Vec<String> = Vec::new();
-                let mut tool_calls = Vec::new();
-                let mut malformed_function_call = false;
-                let mut error: Option<String> = None;
-
-                // Process stream based on tier
-                match self.tier {
-                    ModelTier::Advanced => {
-                        let stream = self.advanced.respond(request);
-                        futures_lite::pin!(stream);
-
-                        while let Some(event) = stream.next().await {
-                            match event {
-                                Ok(Event::Text(text)) => {
-                                    self.hooks.on_text(&text).await;
-                                    // Yield text event for streaming display
-                                    yield AgentEvent::Text(text.clone());
-                                    text_chunks.push(text);
-                                }
-                                Ok(Event::Reasoning(r)) => {
-                                    yield AgentEvent::Reasoning(r);
-                                }
-                                Ok(Event::ToolCall(call)) => tool_calls.push(call),
-                                Ok(Event::BuiltInToolResult { tool, result }) => {
-                                    let formatted = format!("[{tool}] {result}");
-                                    yield AgentEvent::Text(formatted.clone());
-                                    text_chunks.push(formatted);
-                                }
-                                Ok(Event::Usage(u)) => {
-                                    yield AgentEvent::Usage(u);
-                                }
-                                Err(e) => {
-                                    let error_msg = e.to_string();
-                                    if error_msg.contains("malformed function call") {
-                                        tracing::warn!("Model generated malformed function call, retrying...");
-                                        malformed_function_call = true;
-                                        break;
-                                    }
-                                    error = Some(error_msg);
-                                    break;
-                                }
-                            }
+                let mut stream = self.respond_on_tier(request);
+                let mut turn = Turn::default();
+                while let Some(event) = stream.next().await {
+                    match turn.apply(event) {
+                        TurnStep::Continue => {}
+                        TurnStep::EmitText(text) => {
+                            self.hooks.on_text(&text).await;
+                            yield AgentEvent::Text(text);
                         }
-                    }
-                    ModelTier::Balanced => {
-                        let stream = self.balanced.respond(request);
-                        futures_lite::pin!(stream);
-
-                        while let Some(event) = stream.next().await {
-                            match event {
-                                Ok(Event::Text(text)) => {
-                                    self.hooks.on_text(&text).await;
-                                    yield AgentEvent::Text(text.clone());
-                                    text_chunks.push(text);
-                                }
-                                Ok(Event::Reasoning(r)) => {
-                                    yield AgentEvent::Reasoning(r);
-                                }
-                                Ok(Event::ToolCall(call)) => tool_calls.push(call),
-                                Ok(Event::BuiltInToolResult { tool, result }) => {
-                                    let formatted = format!("[{tool}] {result}");
-                                    yield AgentEvent::Text(formatted.clone());
-                                    text_chunks.push(formatted);
-                                }
-                                Ok(Event::Usage(u)) => {
-                                    yield AgentEvent::Usage(u);
-                                }
-                                Err(e) => {
-                                    let error_msg = e.to_string();
-                                    if error_msg.contains("malformed function call") {
-                                        tracing::warn!("Model generated malformed function call, retrying...");
-                                        malformed_function_call = true;
-                                        break;
-                                    }
-                                    error = Some(error_msg);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    ModelTier::Fast => {
-                        let stream = self.fast.respond(request);
-                        futures_lite::pin!(stream);
-
-                        while let Some(event) = stream.next().await {
-                            match event {
-                                Ok(Event::Text(text)) => {
-                                    self.hooks.on_text(&text).await;
-                                    yield AgentEvent::Text(text.clone());
-                                    text_chunks.push(text);
-                                }
-                                Ok(Event::Reasoning(r)) => {
-                                    yield AgentEvent::Reasoning(r);
-                                }
-                                Ok(Event::ToolCall(call)) => tool_calls.push(call),
-                                Ok(Event::BuiltInToolResult { tool, result }) => {
-                                    let formatted = format!("[{tool}] {result}");
-                                    yield AgentEvent::Text(formatted.clone());
-                                    text_chunks.push(formatted);
-                                }
-                                Ok(Event::Usage(u)) => {
-                                    yield AgentEvent::Usage(u);
-                                }
-                                Err(e) => {
-                                    let error_msg = e.to_string();
-                                    if error_msg.contains("malformed function call") {
-                                        tracing::warn!("Model generated malformed function call, retrying...");
-                                        malformed_function_call = true;
-                                        break;
-                                    }
-                                    error = Some(error_msg);
-                                    break;
-                                }
-                            }
-                        }
+                        TurnStep::Emit(event) => yield event,
+                        TurnStep::Stop => break,
                     }
                 }
+                drop(stream);
 
-                if let Some(e) = error {
+                if let Some(e) = turn.error {
                     Err(AgentError::Llm(e))?;
                 }
 
-                // If malformed function call, retry this iteration
-                if malformed_function_call {
+                // A malformed call is the model's mistake, not the caller's:
+                // spend another iteration rather than fail the run.
+                if turn.malformed_function_call {
                     continue;
                 }
 
-                let response_text = text_chunks.join("");
+                let response_text = turn.text_chunks.join("");
 
-                // If no tool calls, we're done unless working-doc supervision requires continuation.
-                if tool_calls.is_empty() {
+                // No tool calls means the model is done, unless working-doc
+                // supervision says there is more to do.
+                if turn.tool_calls.is_empty() {
                     if !response_text.is_empty() {
                         self.context.push(Message::assistant(&response_text));
                         if let Some(transcript) = &self.transcript {
@@ -473,229 +436,24 @@ where
                     break response_text;
                 }
 
-                // Store assistant response with tool calls in memory
                 self.context.push(Message::assistant_with_tool_calls(
                     &response_text,
-                    tool_calls.clone(),
+                    turn.tool_calls.clone(),
                 ));
 
-                // Snapshot todo state BEFORE executing tool calls
-                let old_todo_items: Vec<TodoItem> = self
-                    .todo_list
-                    .as_ref()
-                    .map(super::todo::TodoList::items)
-                    .unwrap_or_default();
-
-                // Track tool names for later todo detection
-                let tool_names: Vec<_> = tool_calls.iter().map(|c| c.name.clone()).collect();
-
-                // Yield tool call start events
-                for call in &tool_calls {
-                    let args = call.arguments.to_string();
-                    if let Some(transcript) = &self.transcript {
-                        transcript.write_tool_call(&call.name, &args).await;
-                    }
-                    yield AgentEvent::ToolCallStart {
-                        id: call.id.clone(),
-                        name: call.name.clone(),
-                        arguments: args,
-                    };
-                }
-
-                // Execute tool calls in parallel
-                let tools = &self.tools;
-                let hooks = &self.hooks;
-                let tool_futures = tool_calls.iter().map(|call| {
-                    let args_json = call.arguments.to_string();
-                    let message_count = self.context.len_recent();
-
-                    async move {
-                        let tool_ctx = ToolUseContext {
-                            tool_name: &call.name,
-                            arguments: &args_json,
-                            turn: iteration,
-                            message_count,
-                        };
-
-                        let (result, duration) = match hooks.pre_tool_use(&tool_ctx).await {
-                            PreToolAction::Abort(reason) => {
-                                return Err(AgentError::HookRejected {
-                                    hook: "pre_tool_use",
-                                    reason,
-                                });
-                            }
-                            PreToolAction::Deny(reason) => {
-                                (Err(anyhow::anyhow!(reason)), Duration::ZERO)
-                            }
-                            PreToolAction::Allow => {
-                                let start = Instant::now();
-                                let result = tools.call(&call.name, &args_json).await;
-                                let result = result.map(|output| output.as_str().unwrap_or("").to_string());
-                                (result, start.elapsed())
-                            }
-                        };
-
-                        let result_ref = result
-                            .as_ref()
-                            .map(std::string::String::as_str)
-                            .map_err(std::string::ToString::to_string);
-                        let result_ctx = ToolResultContext {
-                            tool_name: &call.name,
-                            arguments: &args_json,
-                            result: result_ref.as_ref().map(|s| *s).map_err(std::string::String::as_str),
-                            duration,
-                        };
-
-                        let tool_result = match hooks.post_tool_use(&result_ctx).await {
-                            PostToolAction::Abort(reason) => {
-                                return Err(AgentError::HookRejected {
-                                    hook: "post_tool_use",
-                                    reason,
-                                });
-                            }
-                            PostToolAction::Replace(replacement) => {
-                                if result.is_ok() {
-                                    Ok(replacement)
-                                } else {
-                                    Err(replacement)
-                                }
-                            }
-                            PostToolAction::Keep => result
-                                .map_err(|e| format!("Error: {e}")),
-                        };
-
-                        Ok((call.id.clone(), call.name.clone(), tool_result))
-                    }
-                });
-
-                // Wait for all tool calls to complete
-                let results: Vec<Result<ToolOutcome, AgentError>> =
-                    futures::future::join_all(tool_futures).await;
-
-                // Check if todo tool was called
-                let todo_tool_called = tool_names.iter().any(|name| name == "todo");
-
-                // Add results to memory and yield tool end events
-                let mut has_tool_error = false;
-                for result in results {
-                    let (call_id, call_name, tool_result) = result?;
-                    let is_bash_call = call_name == "bash";
-
-                    if let Some(transcript) = &self.transcript {
-                        transcript.write_tool_result(&call_name, &tool_result).await;
-                    }
-
-                    // Yield tool call end event
-                    yield AgentEvent::ToolCallEnd {
-                        id: call_id.clone(),
-                        name: call_name.clone(),
-                        result: tool_result.clone(),
-                    };
-
-                    let content = match &tool_result {
-                        Ok(content) => content,
-                        Err(error) => error,
-                    };
-
-                    if tool_result.is_err()
-                        || content.contains("ssh_server_id is required")
-                        || content.contains("unknown ssh_server_id")
-                        || content.contains("not found")
-                        || content.contains("Invalid arguments")
-                    {
-                        has_tool_error = true;
-                    }
-                    let processed_content = Self::process_reload_marker(content);
-                    self.context.push(Message::tool(&call_id, processed_content));
-                    if is_bash_call
-                        && tool_result.is_ok()
-                        && let Some(reminder) = Self::format_background_started_reminder(content)
-                    {
-                        self.context.push(Message::system(reminder));
-                    }
-                }
-
-                // If there was a tool error, inject a reminder
-                if has_tool_error {
-                    self.context.push(Message::system(include_str!("prompts/tool_error_reminder.txt")));
-                }
-
-                // If todo tool was called, inject updated todo list
-                if todo_tool_called {
-                    let new_items = self
-                        .todo_list
-                        .as_ref()
-                        .map(super::todo::TodoList::items)
-                        .unwrap_or_default();
-
-                    let newly_completed: Vec<_> = new_items
-                        .iter()
-                        .filter(|new_item| {
-                            new_item.status == TodoStatus::Completed
-                                && old_todo_items.iter().any(|old| {
-                                    old.content == new_item.content
-                                        && old.status != TodoStatus::Completed
-                                })
-                        })
-                        .collect();
-
-                    if let Some(completed) = newly_completed.first() {
-                        if let Some(reminder) = self.format_next_task_reminder(&completed.content) {
-                            self.context.push(Message::system(&reminder));
-                        }
-                    } else if let Some(reminder) = self.format_todo_reminder() {
-                        self.context.push(Message::system(&reminder));
-                    }
-                }
-
-                // Poll for completed background tasks
-                if let Some(ref receiver) = self.background_receiver {
-                    let completed_tasks = receiver.take_completed();
-                    for task in completed_tasks {
-                        tracing::info!(task_id = %task.task_id, "background task completed");
-                        let result_msg = Self::format_background_task_result(&task);
-                        self.context.push(Message::system(&result_msg));
-                    }
+                for event in self.run_tool_calls(&turn.tool_calls, iteration).await? {
+                    yield event;
                 }
             };
 
             // Handle background tasks before completing
-            if let Some(ref receiver) = self.background_receiver {
-                let completed_tasks = receiver.take_completed();
-                let mut had_completed = !completed_tasks.is_empty();
-                for task in completed_tasks {
-                    tracing::info!(task_id = %task.task_id, "background task completed (final check)");
-                    let result_msg = Self::format_background_task_result(&task);
-                    self.context.push(Message::system(&result_msg));
+            if self.drain_background_tasks().await {
+                // Continue processing with background results
+                let continuation = self.continue_after_background_streaming().await;
+                for event in continuation {
+                    yield event?;
                 }
-
-                let start = Instant::now();
-
-                while start.elapsed() < MAX_WAIT {
-                    if let Some(task) = receiver.recv_timeout(POLL_INTERVAL).await {
-                        tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
-                        let result_msg = Self::format_background_task_result(&task);
-                        self.context.push(Message::system(&result_msg));
-                        had_completed = true;
-                    } else {
-                        let has_running = self
-                            .background_receiver
-                            .as_ref()
-                            .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running);
-                        if !has_running {
-                            break;
-                        }
-                    }
-                }
-
-                if had_completed {
-                    // Continue processing with background results
-                    let continuation = self.continue_after_background_streaming().await;
-                    for event in continuation {
-                        yield event?;
-                    }
-                    return;
-                }
+                return;
             }
 
             // Notify hooks
@@ -718,6 +476,269 @@ where
                 turns: iteration,
             };
         }
+    }
+
+    /// Streams a response from whichever tier is active.
+    ///
+    /// The tier picks the model at run time, so the three streams are boxed to
+    /// a common type rather than driving three copies of the caller's loop.
+    /// Their errors only ever get displayed, so they collapse to a string at
+    /// the same boundary.
+    fn respond_on_tier(
+        &self,
+        request: LLMRequest,
+    ) -> Pin<Box<dyn Stream<Item = Result<Event, String>> + Send + '_>> {
+        match self.tier {
+            ModelTier::Advanced => Box::pin(
+                self.advanced
+                    .respond(request)
+                    .map(|event| event.map_err(|e| e.to_string())),
+            ),
+            ModelTier::Balanced => Box::pin(
+                self.balanced
+                    .respond(request)
+                    .map(|event| event.map_err(|e| e.to_string())),
+            ),
+            ModelTier::Fast => Box::pin(
+                self.fast
+                    .respond(request)
+                    .map(|event| event.map_err(|e| e.to_string())),
+            ),
+        }
+    }
+
+    /// Runs one turn's tool calls and returns the events the caller should emit.
+    ///
+    /// Every call runs concurrently; results are folded back into the context in
+    /// call order so the transcript stays deterministic regardless of which
+    /// finished first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::HookRejected`] if a hook aborts the turn.
+    async fn run_tool_calls(
+        &mut self,
+        tool_calls: &[aither_core::llm::ToolCall],
+        iteration: usize,
+    ) -> Result<Vec<AgentEvent>, AgentError> {
+        // Snapshot todo state BEFORE executing tool calls
+        let old_todo_items: Vec<TodoItem> = self
+            .todo_list
+            .as_ref()
+            .map(super::todo::TodoList::items)
+            .unwrap_or_default();
+        let todo_tool_called = tool_calls.iter().any(|call| call.name == "todo");
+
+        let mut events = Vec::with_capacity(tool_calls.len() * 2);
+        for call in tool_calls {
+            let args = call.arguments.to_string();
+            if let Some(transcript) = &self.transcript {
+                transcript.write_tool_call(&call.name, &args).await;
+            }
+            events.push(AgentEvent::ToolCallStart {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: args,
+            });
+        }
+
+        let results = self.dispatch_tool_calls(tool_calls, iteration).await;
+
+        let mut has_tool_error = false;
+        for result in results {
+            let (call_id, call_name, tool_result) = result?;
+
+            if let Some(transcript) = &self.transcript {
+                transcript.write_tool_result(&call_name, &tool_result).await;
+            }
+            events.push(AgentEvent::ToolCallEnd {
+                id: call_id.clone(),
+                name: call_name.clone(),
+                result: tool_result.clone(),
+            });
+
+            let content = match &tool_result {
+                Ok(content) | Err(content) => content,
+            };
+            if Self::is_tool_failure(&tool_result, content) {
+                has_tool_error = true;
+            }
+
+            self.context.push(Message::tool(
+                &call_id,
+                Self::process_reload_marker(content),
+            ));
+            if call_name == "bash"
+                && tool_result.is_ok()
+                && let Some(reminder) = Self::format_background_started_reminder(content)
+            {
+                self.context.push(Message::system(reminder));
+            }
+        }
+
+        if has_tool_error {
+            self.context.push(Message::system(include_str!(
+                "prompts/tool_error_reminder.txt"
+            )));
+        }
+        if todo_tool_called {
+            self.inject_todo_reminder(&old_todo_items);
+        }
+
+        // Poll for completed background tasks
+        if let Some(ref receiver) = self.background_receiver {
+            for task in receiver.take_completed() {
+                tracing::info!(task_id = %task.task_id, "background task completed");
+                let result_msg = Self::format_background_task_result(&task);
+                self.context.push(Message::system(&result_msg));
+            }
+        }
+
+        Ok(events)
+    }
+
+    /// Runs every tool call concurrently, applying the hooks around each one.
+    async fn dispatch_tool_calls(
+        &self,
+        tool_calls: &[aither_core::llm::ToolCall],
+        iteration: usize,
+    ) -> Vec<Result<ToolOutcome, AgentError>> {
+        let tools = &self.tools;
+        let hooks = &self.hooks;
+        let message_count = self.context.len_recent();
+
+        let tool_futures = tool_calls.iter().map(|call| {
+            let args_json = call.arguments.to_string();
+
+            async move {
+                let tool_ctx = ToolUseContext {
+                    tool_name: &call.name,
+                    arguments: &args_json,
+                    turn: iteration,
+                    message_count,
+                };
+
+                let (result, duration) = match hooks.pre_tool_use(&tool_ctx).await {
+                    PreToolAction::Abort(reason) => {
+                        return Err(AgentError::HookRejected {
+                            hook: "pre_tool_use",
+                            reason,
+                        });
+                    }
+                    PreToolAction::Deny(reason) => (Err(anyhow::anyhow!(reason)), Duration::ZERO),
+                    PreToolAction::Allow => {
+                        let start = Instant::now();
+                        let result = tools.call(&call.name, &args_json).await;
+                        let result = result.map(|output| output.as_str().unwrap_or("").to_string());
+                        (result, start.elapsed())
+                    }
+                };
+
+                let result_ref = result
+                    .as_ref()
+                    .map(String::as_str)
+                    .map_err(ToString::to_string);
+                let result_ctx = ToolResultContext {
+                    tool_name: &call.name,
+                    arguments: &args_json,
+                    result: result_ref.as_ref().map(|s| *s).map_err(String::as_str),
+                    duration,
+                };
+
+                let tool_result = match hooks.post_tool_use(&result_ctx).await {
+                    PostToolAction::Abort(reason) => {
+                        return Err(AgentError::HookRejected {
+                            hook: "post_tool_use",
+                            reason,
+                        });
+                    }
+                    PostToolAction::Replace(replacement) => {
+                        if result.is_ok() {
+                            Ok(replacement)
+                        } else {
+                            Err(replacement)
+                        }
+                    }
+                    PostToolAction::Keep => result.map_err(|e| format!("Error: {e}")),
+                };
+
+                Ok((call.id.clone(), call.name.clone(), tool_result))
+            }
+        });
+
+        futures::future::join_all(tool_futures).await
+    }
+
+    /// Whether a tool result should count as a failure worth reminding about.
+    ///
+    /// Some tools report their own misuse in an `Ok` string rather than an
+    /// error, so the text is checked as well as the result.
+    fn is_tool_failure(tool_result: &Result<String, String>, content: &str) -> bool {
+        tool_result.is_err()
+            || content.contains("ssh_server_id is required")
+            || content.contains("unknown ssh_server_id")
+            || content.contains("not found")
+            || content.contains("Invalid arguments")
+    }
+
+    /// Reminds the model what to do next after it edited the todo list.
+    ///
+    /// Finishing a task earns a pointer at the next one; anything else gets the
+    /// list back, so the model always sees the state it just wrote.
+    fn inject_todo_reminder(&mut self, old_todo_items: &[TodoItem]) {
+        let new_items = self
+            .todo_list
+            .as_ref()
+            .map(super::todo::TodoList::items)
+            .unwrap_or_default();
+
+        let newly_completed = new_items.iter().find(|new_item| {
+            new_item.status == TodoStatus::Completed
+                && old_todo_items.iter().any(|old| {
+                    old.content == new_item.content && old.status != TodoStatus::Completed
+                })
+        });
+
+        let reminder = newly_completed.map_or_else(
+            || self.format_todo_reminder(),
+            |completed| self.format_next_task_reminder(&completed.content),
+        );
+        if let Some(reminder) = reminder {
+            self.context.push(Message::system(&reminder));
+        }
+    }
+
+    /// Collects background tasks that finished during the run, waiting briefly
+    /// for any still running.
+    ///
+    /// Returns whether anything completed, which tells the caller whether the
+    /// model needs another turn to react to the results.
+    async fn drain_background_tasks(&mut self) -> bool {
+        let Some(receiver) = self.background_receiver.clone() else {
+            return false;
+        };
+
+        let completed_tasks = receiver.take_completed();
+        let mut had_completed = !completed_tasks.is_empty();
+        for task in completed_tasks {
+            tracing::info!(task_id = %task.task_id, "background task completed (final check)");
+            let result_msg = Self::format_background_task_result(&task);
+            self.context.push(Message::system(&result_msg));
+        }
+
+        let start = Instant::now();
+        while start.elapsed() < MAX_WAIT {
+            if let Some(task) = receiver.recv_timeout(POLL_INTERVAL).await {
+                tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
+                let result_msg = Self::format_background_task_result(&task);
+                self.context.push(Message::system(&result_msg));
+                had_completed = true;
+            } else if !receiver.has_running() {
+                break;
+            }
+        }
+
+        had_completed
     }
 
     /// Registers a tool for the agent to use.
@@ -1094,97 +1115,34 @@ where
             let tool_defs = self.tools.active_definitions();
             let request = LLMRequest::new(messages).with_tool_definitions(tool_defs);
 
-            let mut text_chunks = Vec::new();
-            let mut tool_calls = Vec::new();
-            let mut error: Option<String> = None;
-
-            // Process stream based on tier
-            match self.tier {
-                ModelTier::Advanced => {
-                    let stream = self.advanced.respond(request);
-                    futures_lite::pin!(stream);
-                    while let Some(event) = stream.next().await {
-                        match event {
-                            Ok(Event::Text(text)) => {
-                                self.hooks.on_text(&text).await;
-                                events.push(Ok(AgentEvent::Text(text.clone())));
-                                text_chunks.push(text);
-                            }
-                            Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
-                            Ok(Event::ToolCall(call)) => tool_calls.push(call),
-                            Ok(Event::BuiltInToolResult { tool, result }) => {
-                                let formatted = format!("[{tool}] {result}");
-                                events.push(Ok(AgentEvent::Text(formatted.clone())));
-                                text_chunks.push(formatted);
-                            }
-                            Ok(Event::Usage(u)) => events.push(Ok(AgentEvent::Usage(u))),
-                            Err(e) => {
-                                error = Some(e.to_string());
-                                break;
-                            }
-                        }
+            let mut stream = self.respond_on_tier(request);
+            let mut turn = Turn::default();
+            while let Some(event) = stream.next().await {
+                match turn.apply(event) {
+                    TurnStep::Continue => {}
+                    TurnStep::EmitText(text) => {
+                        self.hooks.on_text(&text).await;
+                        events.push(Ok(AgentEvent::Text(text)));
                     }
-                }
-                ModelTier::Balanced => {
-                    let stream = self.balanced.respond(request);
-                    futures_lite::pin!(stream);
-                    while let Some(event) = stream.next().await {
-                        match event {
-                            Ok(Event::Text(text)) => {
-                                self.hooks.on_text(&text).await;
-                                events.push(Ok(AgentEvent::Text(text.clone())));
-                                text_chunks.push(text);
-                            }
-                            Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
-                            Ok(Event::ToolCall(call)) => tool_calls.push(call),
-                            Ok(Event::BuiltInToolResult { tool, result }) => {
-                                let formatted = format!("[{tool}] {result}");
-                                events.push(Ok(AgentEvent::Text(formatted.clone())));
-                                text_chunks.push(formatted);
-                            }
-                            Ok(Event::Usage(u)) => events.push(Ok(AgentEvent::Usage(u))),
-                            Err(e) => {
-                                error = Some(e.to_string());
-                                break;
-                            }
-                        }
-                    }
-                }
-                ModelTier::Fast => {
-                    let stream = self.fast.respond(request);
-                    futures_lite::pin!(stream);
-                    while let Some(event) = stream.next().await {
-                        match event {
-                            Ok(Event::Text(text)) => {
-                                self.hooks.on_text(&text).await;
-                                events.push(Ok(AgentEvent::Text(text.clone())));
-                                text_chunks.push(text);
-                            }
-                            Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
-                            Ok(Event::ToolCall(call)) => tool_calls.push(call),
-                            Ok(Event::BuiltInToolResult { tool, result }) => {
-                                let formatted = format!("[{tool}] {result}");
-                                events.push(Ok(AgentEvent::Text(formatted.clone())));
-                                text_chunks.push(formatted);
-                            }
-                            Ok(Event::Usage(u)) => events.push(Ok(AgentEvent::Usage(u))),
-                            Err(e) => {
-                                error = Some(e.to_string());
-                                break;
-                            }
-                        }
-                    }
+                    TurnStep::Emit(event) => events.push(Ok(event)),
+                    TurnStep::Stop => break,
                 }
             }
+            drop(stream);
 
-            if let Some(e) = error {
+            // As in the main loop, a malformed call is worth another attempt.
+            if turn.malformed_function_call {
+                continue;
+            }
+
+            if let Some(e) = turn.error {
                 events.push(Err(AgentError::Llm(e)));
                 return events;
             }
 
-            let response_text = text_chunks.join("");
+            let response_text = turn.text_chunks.join("");
 
-            if tool_calls.is_empty() {
+            if turn.tool_calls.is_empty() {
                 if !response_text.is_empty() {
                     self.context.push(Message::assistant(&response_text));
                 }
@@ -1197,12 +1155,12 @@ where
 
             self.context.push(Message::assistant_with_tool_calls(
                 &response_text,
-                tool_calls.clone(),
+                turn.tool_calls.clone(),
             ));
 
             // Execute tool calls
             let tools = &self.tools;
-            let tool_futures = tool_calls.iter().map(|call| {
+            let tool_futures = turn.tool_calls.iter().map(|call| {
                 let args_json = call.arguments.to_string();
                 async move {
                     let result = tools
