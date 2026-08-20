@@ -1084,178 +1084,231 @@ fn find_similar_option<'a>(input: &str, options: impl Iterator<Item = &'a str>) 
 }
 
 /// Parses an object schema from CLI arguments.
+/// The parts of a JSON-Schema object that the argument parser consults.
+///
+/// Derived once per parse so the argument loop below reads as a loop rather
+/// than as schema archaeology interleaved with parsing.
+struct ArgSchema {
+    properties: serde_json::Map<String, Value>,
+    required: Vec<String>,
+    /// Required non-array fields, in schema order: these accept positionals.
+    positional_fields: Vec<String>,
+    /// Whether leftover positionals fold into a `command` string field, the way
+    /// a shell wrapper passes a whole command line through.
+    command_capture: bool,
+    short_to_field: HashMap<char, String>,
+    /// Every long option name, in the kebab-case a user types, for suggestions.
+    long_names: Vec<String>,
+}
+
+impl ArgSchema {
+    fn new(schema: &Value) -> Self {
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+
+        let required: Vec<String> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let positional_fields: Vec<String> = required
+            .iter()
+            .filter(|name| {
+                properties
+                    .get(name.as_str())
+                    .is_none_or(|prop_schema| get_instance_type(prop_schema) != Some("array"))
+            })
+            .cloned()
+            .collect();
+
+        let command_capture = properties
+            .get("command")
+            .is_some_and(|schema| get_instance_type(schema) == Some("string"));
+        let (short_to_field, _) = build_short_option_maps(&properties);
+        let long_names: Vec<String> = properties.keys().map(|k| k.replace('_', "-")).collect();
+
+        Self {
+            properties,
+            required,
+            positional_fields,
+            command_capture,
+            short_to_field,
+            long_names,
+        }
+    }
+}
+
+/// What the argument loop has parsed so far.
+#[derive(Default)]
+struct ParsedArgs {
+    fields: HashMap<String, Value>,
+    /// How many positional fields have been filled.
+    positional_idx: usize,
+    /// Every positional seen, in order, for `command` capture.
+    positionals: Vec<String>,
+}
+
+impl ParsedArgs {
+    /// Consumes one positional argument.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if every positional field is already filled and the
+    /// schema has no `command` field to absorb the rest.
+    fn take_positional(&mut self, arg: &str, schema: &ArgSchema) -> anyhow::Result<()> {
+        if let Some(field_name) = schema.positional_fields.get(self.positional_idx) {
+            if let Some(prop_schema) = schema.properties.get(field_name) {
+                let prop_type = get_instance_type(prop_schema);
+                self.fields
+                    .insert(field_name.clone(), parse_value(arg, prop_type));
+            }
+            self.positional_idx += 1;
+        } else if !schema.command_capture {
+            anyhow::bail!("unexpected positional argument: {arg}");
+        }
+        self.positionals.push(arg.to_string());
+        Ok(())
+    }
+}
+
+/// Parses one `--name`, `--name=value`, or `--no-name` argument.
+///
+/// `i` indexes the argument being parsed and is advanced when the option takes
+/// its value from the following argument.
+///
+/// # Errors
+///
+/// Returns an error if the option is unknown, negates something that is not a
+/// boolean, or is missing its value.
+fn parse_long_option(
+    arg: &str,
+    args: &[String],
+    i: &mut usize,
+    schema: &ArgSchema,
+    result: &mut HashMap<String, Value>,
+) -> anyhow::Result<()> {
+    let flag = &arg[2..];
+    let (mut name, value) = flag.find('=').map_or_else(
+        || (flag.to_string(), None),
+        |eq_pos| {
+            (
+                flag[..eq_pos].to_string(),
+                Some(flag[eq_pos + 1..].to_string()),
+            )
+        },
+    );
+
+    // Underscores and dashes are interchangeable in what the user types.
+    name = name.replace('_', "-");
+
+    // `--no-foo` negates a boolean flag; strip the prefix so the rest of the
+    // matching sees the field's real name.
+    let negated = name.starts_with("no-");
+    if negated {
+        name.drain(.."no-".len());
+    }
+
+    let field_name = name.replace('-', "_");
+    let Some(prop_schema) = schema.properties.get(&field_name) else {
+        let suggestion = find_similar_option(&name, schema.long_names.iter().map(String::as_str));
+        match suggestion {
+            Some(similar) => {
+                anyhow::bail!("unknown option: --{name}. Did you mean --{similar}?")
+            }
+            None => anyhow::bail!("unknown option: --{name}"),
+        }
+    };
+
+    let prop_type = get_instance_type(prop_schema);
+    if negated && prop_type != Some("boolean") {
+        anyhow::bail!("--no-{name} is only valid for boolean options");
+    }
+
+    let parsed_value = if prop_type == Some("boolean") {
+        if negated && value.is_some() {
+            anyhow::bail!("unexpected value for --no-{name}");
+        }
+        value.map_or(Value::Bool(!negated), |v| parse_value(&v, prop_type))
+    } else {
+        let val = value.or_else(|| {
+            *i += 1;
+            args.get(*i).cloned()
+        });
+        match val {
+            Some(v) => parse_value(&v, prop_type),
+            None => anyhow::bail!("missing value for --{name}"),
+        }
+    };
+
+    insert_value(result, &field_name, parsed_value, prop_schema);
+    Ok(())
+}
+
 fn parse_object(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
     // Strip leading "--" separator (from heel-ipc wrapper) without disabling flag parsing.
     // A standalone "--" later in the args still acts as end-of-options.
-    let args = if args.first().map(std::string::String::as_str) == Some("--") {
+    let args = if args.first().map(String::as_str) == Some("--") {
         &args[1..]
     } else {
         args
     };
-    let start_idx = 0;
+
+    let schema = ArgSchema::new(schema);
+    let mut parsed = ParsedArgs::default();
     let mut end_of_options = false;
 
-    let mut result: HashMap<String, Value> = HashMap::new();
-    let mut positional_idx = 0;
-
-    // Get object properties
-    let properties = schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-
-    let required: Vec<String> = schema
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Positional fields are required non-array fields in schema order
-    let positional_fields: Vec<String> = required
-        .iter()
-        .filter(|name| {
-            properties
-                .get(name.as_str())
-                .is_none_or(|prop_schema| get_instance_type(prop_schema) != Some("array"))
-        })
-        .cloned()
-        .collect();
-    let command_capture_enabled = properties
-        .get("command")
-        .is_some_and(|schema| get_instance_type(schema) == Some("string"));
-    let mut seen_positionals: Vec<String> = Vec::new();
-    let (short_to_field, _) = build_short_option_maps(&properties);
-    let long_names: Vec<String> = properties.keys().map(|k| k.replace('_', "-")).collect();
-
-    let mut i = start_idx;
+    let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
+        let is_option = !end_of_options && arg.starts_with('-') && arg.len() > 1;
 
         if !end_of_options && arg == "--" {
             end_of_options = true;
-            i += 1;
-            continue;
-        }
-
-        if !end_of_options && arg == "-" {
-            // Single "-" is treated as positional
-            if positional_idx < positional_fields.len() {
-                let field_name = &positional_fields[positional_idx];
-                if let Some(prop_schema) = properties.get(field_name) {
-                    let prop_type = get_instance_type(prop_schema);
-                    result.insert(field_name.clone(), parse_value(arg, prop_type));
-                }
-                positional_idx += 1;
-                seen_positionals.push(arg.clone());
-            } else if command_capture_enabled {
-                seen_positionals.push(arg.clone());
-            } else {
-                anyhow::bail!("unexpected positional argument: {arg}");
-            }
-            i += 1;
-            continue;
-        }
-
-        if !end_of_options && arg.starts_with("--") {
-            // Named argument
-            let flag = &arg[2..];
-            let (mut name, value) = flag.find('=').map_or_else(
-                || (flag.to_string(), None),
-                |eq_pos| {
-                    (
-                        flag[..eq_pos].to_string(),
-                        Some(flag[eq_pos + 1..].to_string()),
-                    )
-                },
-            );
-
-            // Normalize long name (allow underscores)
-            name = name.replace('_', "-");
-
-            // `--no-foo` negates a boolean flag; strip the prefix so the rest
-            // of the matching sees the field's real name.
-            let negated = name.starts_with("no-");
-            if negated {
-                name.drain(.."no-".len());
-            }
-
-            // Convert kebab-case to snake_case for matching
-            let field_name = name.replace('-', "_");
-
-            if let Some(prop_schema) = properties.get(&field_name) {
-                let prop_type = get_instance_type(prop_schema);
-
-                if negated && prop_type != Some("boolean") {
-                    anyhow::bail!("--no-{name} is only valid for boolean options");
-                }
-
-                let parsed_value = if prop_type == Some("boolean") {
-                    if negated && value.is_some() {
-                        anyhow::bail!("unexpected value for --no-{name}");
-                    }
-                    value.map_or(Value::Bool(!negated), |v| parse_value(&v, prop_type))
-                } else {
-                    let val = value.or_else(|| {
-                        i += 1;
-                        args.get(i).cloned()
-                    });
-                    match val {
-                        Some(v) => parse_value(&v, prop_type),
-                        None => anyhow::bail!("missing value for --{name}"),
-                    }
-                };
-
-                insert_value(&mut result, &field_name, parsed_value, prop_schema);
-            } else {
-                let suggestion = find_similar_option(&name, long_names.iter().map(String::as_str));
-                if let Some(similar) = suggestion {
-                    anyhow::bail!("unknown option: --{name}. Did you mean --{similar}?");
-                }
-                anyhow::bail!("unknown option: --{name}");
-            }
-        } else if !end_of_options && arg.starts_with('-') && arg.len() > 1 {
-            parse_short_options(arg, args, &mut i, &properties, &short_to_field, &mut result)?;
+        } else if is_option && arg.starts_with("--") {
+            parse_long_option(arg, args, &mut i, &schema, &mut parsed.fields)?;
+        } else if is_option {
+            parse_short_options(
+                arg,
+                args,
+                &mut i,
+                &schema.properties,
+                &schema.short_to_field,
+                &mut parsed.fields,
+            )?;
         } else {
-            // Positional argument
-            if positional_idx < positional_fields.len() {
-                let field_name = &positional_fields[positional_idx];
-                if let Some(prop_schema) = properties.get(field_name) {
-                    let prop_type = get_instance_type(prop_schema);
-                    result.insert(field_name.clone(), parse_value(arg, prop_type));
-                }
-                positional_idx += 1;
-                seen_positionals.push(arg.clone());
-            } else if command_capture_enabled {
-                seen_positionals.push(arg.clone());
-            } else {
-                anyhow::bail!("unexpected positional argument: {arg}");
-            }
+            // Anything else — including a bare "-" — is a positional.
+            parsed.take_positional(arg, &schema)?;
         }
 
         i += 1;
     }
 
-    if command_capture_enabled && !seen_positionals.is_empty() && !result.contains_key("command") {
-        result.insert(
+    if schema.command_capture
+        && !parsed.positionals.is_empty()
+        && !parsed.fields.contains_key("command")
+    {
+        parsed.fields.insert(
             "command".to_string(),
-            Value::String(seen_positionals.join(" ")),
+            Value::String(parsed.positionals.join(" ")),
         );
     }
 
-    // Check required fields
-    for req in &required {
-        if !result.contains_key(req) {
+    for req in &schema.required {
+        if !parsed.fields.contains_key(req) {
             anyhow::bail!("missing required argument: {req}");
         }
     }
 
-    Ok(Value::Object(result.into_iter().collect()))
+    Ok(Value::Object(parsed.fields.into_iter().collect()))
 }
 
 fn parse_short_options(

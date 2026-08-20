@@ -163,6 +163,113 @@ enum StreamEvent {
     Cancel,
 }
 
+/// Waits for whichever comes first: stream output, a kill request, or — while
+/// the stdin watchdog is still interested — its next probe interval.
+async fn next_stream_event<S>(
+    output: &mut S,
+    kill_rx: &Receiver<()>,
+    watchdog_active: bool,
+) -> StreamEvent
+where
+    S: futures_lite::Stream<Item = Result<LogOutput, bollard::errors::Error>> + Unpin,
+{
+    let output_or_cancel =
+        futures_lite::future::or(async { StreamEvent::Output(output.next().await) }, async {
+            let _ = kill_rx.recv().await;
+            StreamEvent::Cancel
+        });
+
+    if watchdog_active {
+        futures_lite::future::or(output_or_cancel, async {
+            async_io::Timer::after(STDIN_WATCH_INTERVAL).await;
+            StreamEvent::WatchdogTick
+        })
+        .await
+    } else {
+        output_or_cancel.await
+    }
+}
+
+/// What one stdin-watchdog probe concluded.
+enum WatchdogVerdict {
+    /// Nothing decided yet; probe again after the next interval.
+    KeepWatching,
+    /// Stop probing — the exec has finished, or the notice has been sent.
+    Stop,
+}
+
+/// Checks whether the exec's process is parked on a read from stdin, and if so
+/// tells the caller once.
+///
+/// A process blocked on stdin will never finish on its own, so the notice is
+/// what lets the caller promote the task to the background rather than wait
+/// forever. A failed probe is not fatal: it just means trying again later.
+///
+/// # Errors
+///
+/// Returns an error only if the exec itself cannot be inspected.
+async fn probe_stdin_blocked(
+    client: &Docker,
+    container_id: &str,
+    exec_id: &str,
+    notice: Option<&Sender<String>>,
+) -> Result<WatchdogVerdict, String> {
+    let inspect = client
+        .inspect_exec(exec_id)
+        .await
+        .map_err(|e| format!("failed to inspect running exec for stdin watchdog: {e}"))?;
+
+    if !inspect.running.unwrap_or(false) {
+        return Ok(WatchdogVerdict::Stop);
+    }
+
+    let Some(pid) = inspect.pid.filter(|pid| *pid > 0) else {
+        return Ok(WatchdogVerdict::KeepWatching);
+    };
+
+    match detect_stdin_blocked_inside_container(client, container_id, pid).await {
+        Ok(true) => {
+            if let Some(notice_tx) = notice {
+                let _ = notice_tx.try_send(CONTAINER_STDIN_BLOCKED_NOTICE.to_string());
+            }
+            Ok(WatchdogVerdict::Stop)
+        }
+        Ok(false) => Ok(WatchdogVerdict::KeepWatching),
+        Err(error) => {
+            tracing::debug!(error = %error, pid, "stdin watchdog probe failed");
+            Ok(WatchdogVerdict::KeepWatching)
+        }
+    }
+}
+
+/// Reads the exec's final exit status back from the daemon.
+///
+/// # Errors
+///
+/// Returns an error if the finished exec cannot be inspected.
+async fn finished_outcome(
+    client: &Docker,
+    exec_id: &str,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) -> Result<ContainerExecOutcome, String> {
+    let inspect = client
+        .inspect_exec(exec_id)
+        .await
+        .map_err(|e| format!("failed to inspect exec: {e}"))?;
+
+    // Docker reports exit codes as i64 but they are always in i32
+    // range; -1 stands in for "the daemon did not say".
+    #[allow(clippy::cast_possible_truncation)]
+    let exit_code = inspect.exit_code.unwrap_or(-1) as i32;
+
+    Ok(ContainerExecOutcome::Completed(Output {
+        status: ExitStatusExt::from_raw(exit_code),
+        stdout,
+        stderr,
+    }))
+}
+
 impl ContainerExec for BollardContainerExec {
     fn exec(
         &self,
@@ -207,36 +314,9 @@ impl ContainerExec for BollardContainerExec {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let mut watchdog_active = stdin_blocked_notice.is_some();
-            let mut notice_sent = false;
 
             loop {
-                let event = if watchdog_active && !notice_sent {
-                    futures_lite::future::or(
-                        futures_lite::future::or(
-                            async { StreamEvent::Output(output.next().await) },
-                            async {
-                                let _ = kill_rx.recv().await;
-                                StreamEvent::Cancel
-                            },
-                        ),
-                        async {
-                            async_io::Timer::after(STDIN_WATCH_INTERVAL).await;
-                            StreamEvent::WatchdogTick
-                        },
-                    )
-                    .await
-                } else {
-                    futures_lite::future::or(
-                        async { StreamEvent::Output(output.next().await) },
-                        async {
-                            let _ = kill_rx.recv().await;
-                            StreamEvent::Cancel
-                        },
-                    )
-                    .await
-                };
-
-                match event {
+                match next_stream_event(&mut output, &kill_rx, watchdog_active).await {
                     // Console output is not separated by stream, so it joins
                     // stdout alongside genuine stdout writes.
                     StreamEvent::Output(Some(Ok(
@@ -251,9 +331,7 @@ impl ContainerExec for BollardContainerExec {
                     StreamEvent::Output(Some(Err(e))) => {
                         return Err(format!("exec stream error: {e}"));
                     }
-                    StreamEvent::Output(None) => {
-                        break;
-                    }
+                    StreamEvent::Output(None) => break,
                     StreamEvent::Cancel => {
                         if let Err(error) =
                             kill_exec_pid_inside_container(&client, &container_id, &exec_id).await
@@ -267,56 +345,19 @@ impl ContainerExec for BollardContainerExec {
                         return Ok(ContainerExecOutcome::Killed);
                     }
                     StreamEvent::WatchdogTick => {
-                        let inspect = client.inspect_exec(&exec_id).await.map_err(|e| {
-                            format!("failed to inspect running exec for stdin watchdog: {e}")
-                        })?;
-
-                        if !inspect.running.unwrap_or(false) {
-                            watchdog_active = false;
-                            continue;
-                        }
-
-                        let Some(pid) = inspect.pid else {
-                            continue;
-                        };
-                        if pid <= 0 {
-                            continue;
-                        }
-
-                        match detect_stdin_blocked_inside_container(&client, &container_id, pid)
-                            .await
-                        {
-                            Ok(true) => {
-                                if let Some(notice_tx) = stdin_blocked_notice.as_ref() {
-                                    let _ = notice_tx
-                                        .try_send(CONTAINER_STDIN_BLOCKED_NOTICE.to_string());
-                                }
-                                notice_sent = true;
-                                watchdog_active = false;
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
-                                tracing::debug!(error = %error, pid, "stdin watchdog probe failed");
-                            }
-                        }
+                        let verdict = probe_stdin_blocked(
+                            &client,
+                            &container_id,
+                            &exec_id,
+                            stdin_blocked_notice.as_ref(),
+                        )
+                        .await?;
+                        watchdog_active = matches!(verdict, WatchdogVerdict::KeepWatching);
                     }
                 }
             }
 
-            let inspect = client
-                .inspect_exec(&exec_id)
-                .await
-                .map_err(|e| format!("failed to inspect exec: {e}"))?;
-
-            // Docker reports exit codes as i64 but they are always in i32
-            // range; -1 stands in for "the daemon did not say".
-            #[allow(clippy::cast_possible_truncation)]
-            let exit_code = inspect.exit_code.unwrap_or(-1) as i32;
-            Ok(ContainerExecOutcome::Completed(Output {
-                status: ExitStatusExt::from_raw(exit_code),
-                stdout,
-                stderr,
-            }))
+            finished_outcome(&client, &exec_id, stdout, stderr).await
         }
     }
 }

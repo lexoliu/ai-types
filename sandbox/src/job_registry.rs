@@ -589,268 +589,346 @@ impl JobRegistry {
 impl JobRegistryService {
     /// Runs the registry service loop until all senders are dropped.
     pub async fn serve(self) {
-        let mut jobs: HashMap<u32, JobState> = HashMap::new();
-
+        let mut jobs = Jobs::default();
         while let Ok(cmd) = self.rx.recv().await {
-            match cmd {
-                JobCommand::Register {
-                    pid,
-                    task_id,
-                    execution_key,
-                    script,
-                    mode,
-                    output_path,
-                } => {
-                    let info = JobInfo {
-                        pid,
-                        task_id,
-                        execution_key,
-                        script,
-                        mode,
-                        started_at: Instant::now(),
-                        status: JobStatus::Running,
-                        output_path,
-                    };
-                    jobs.insert(
-                        pid,
-                        JobState {
-                            info,
-                            terminal_buffer: Vec::new(),
-                            stdout_buffer: Vec::new(),
-                            stderr_buffer: Vec::new(),
-                            stdout_closed: false,
-                            stderr_closed: false,
-                            input_tx: None,
-                            kill_switch: None,
-                            output_redirect: None,
-                            finished_at: None,
-                        },
-                    );
-                    tracing::debug!(pid = %pid, "registered background job");
-                }
-                JobCommand::AttachTerminalInput { pid, input_tx } => {
-                    if let Some(job) = jobs.get_mut(&pid) {
-                        job.input_tx = Some(input_tx);
-                    }
-                }
-                JobCommand::AttachKillSwitch { pid, kill_tx } => {
-                    if let Some(job) = jobs.get_mut(&pid) {
-                        job.kill_switch = Some(kill_tx);
-                    }
-                }
-                JobCommand::AppendTerminalOutput { pid, stream, chunk } => {
-                    if let Some(job) = jobs.get_mut(&pid) {
-                        if chunk.is_empty() {
-                            continue;
-                        }
-                        job.terminal_buffer.extend_from_slice(&chunk);
-                        if let Some(file) = job.output_redirect.as_mut()
-                            && let Err(error) = file.write_all(&chunk).await
-                        {
-                            mark_job_failed(
-                                job,
-                                format!(
-                                    "failed to append redirected output for task {}: {error}",
-                                    job.info.task_id
-                                ),
-                            );
-                            tracing::error!(
-                                pid = %pid,
-                                error = %error,
-                                "failed to append redirected output"
-                            );
-                        }
-                        match stream {
-                            TerminalStream::Stdout => job.stdout_buffer.extend_from_slice(&chunk),
-                            TerminalStream::Stderr => job.stderr_buffer.extend_from_slice(&chunk),
-                        }
-                    }
-                }
-                JobCommand::CloseTerminalStream { pid, stream } => {
-                    if let Some(job) = jobs.get_mut(&pid) {
-                        match stream {
-                            TerminalStream::Stdout => job.stdout_closed = true,
-                            TerminalStream::Stderr => job.stderr_closed = true,
-                        }
-                    }
-                }
-                JobCommand::Complete {
-                    pid,
-                    exit_code,
-                    output_path,
-                } => {
-                    if let Some(job) = jobs.get_mut(&pid) {
-                        if !matches!(job.info.status, JobStatus::Running) {
-                            tracing::debug!(
-                                pid = %pid,
-                                status = ?job.info.status,
-                                "ignoring complete for non-running job"
-                            );
-                            continue;
-                        }
-                        if let Err(error) = finalize_output_redirect(job).await {
-                            tracing::error!(
-                                pid = %pid,
-                                error = %error,
-                                "failed to flush redirected output on complete"
-                            );
-                            mark_job_failed(job, error);
-                            continue;
-                        }
-                        job.info.status = JobStatus::Completed { exit_code };
-                        job.finished_at = Some(Instant::now());
-                        job.kill_switch = None;
-                        if output_path.is_some() {
-                            job.info.output_path = output_path;
-                        }
-                        tracing::debug!(pid = %pid, exit_code = %exit_code, "job completed");
-                    }
-                }
-                JobCommand::Fail {
-                    pid,
-                    error,
-                    output_path,
-                } => {
-                    if let Some(job) = jobs.get_mut(&pid) {
-                        if !matches!(job.info.status, JobStatus::Running) {
-                            tracing::debug!(
-                                pid = %pid,
-                                status = ?job.info.status,
-                                "ignoring fail for non-running job"
-                            );
-                            continue;
-                        }
-                        let status_error = if let Err(finalize_error) =
-                            finalize_output_redirect(job).await
-                        {
-                            format!(
-                                "{error}; additionally failed to flush redirected output: {finalize_error}"
-                            )
-                        } else {
-                            error
-                        };
-                        mark_job_failed(job, status_error);
-                        job.kill_switch = None;
-                        if output_path.is_some() {
-                            job.info.output_path = output_path;
-                        }
-                        tracing::debug!(pid = %pid, "job failed");
-                    }
-                }
-                JobCommand::List { reply } => {
-                    let items = jobs.values().map(|state| state.info.clone()).collect();
-                    let _ = reply.send(items).await;
-                }
-                JobCommand::Get { pid, reply } => {
-                    let item = jobs.get(&pid).map(|state| state.info.clone());
-                    let _ = reply.send(item).await;
-                }
-                JobCommand::Kill { pid, reply } => {
-                    let result = kill_job(&mut jobs, pid).await;
-                    let _ = reply.send(result).await;
-                }
-                JobCommand::KillByTaskId { task_id, reply } => {
-                    let result = if let Some(pid) = find_pid_by_task_id(&jobs, &task_id) {
-                        kill_job(&mut jobs, pid).await
-                    } else {
-                        false
-                    };
-                    let _ = reply.send(result).await;
-                }
-                JobCommand::KillByExecutionKey {
-                    execution_key,
-                    reply,
-                } => {
-                    let pids: Vec<u32> = jobs
-                        .iter()
-                        .filter_map(|(pid, state)| {
-                            if state.info.execution_key == execution_key
-                                && matches!(state.info.status, JobStatus::Running)
-                            {
-                                Some(*pid)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
+            jobs.apply(cmd).await;
+        }
+    }
+}
 
-                    let mut killed = 0usize;
-                    for pid in pids {
-                        if kill_job(&mut jobs, pid).await {
-                            killed += 1;
-                        }
-                    }
-                    let _ = reply.send(killed).await;
-                }
-                JobCommand::InputTerminal {
-                    task_id,
-                    bytes,
-                    reply,
-                } => {
-                    let result = if let Some(pid) = find_pid_by_task_id(&jobs, &task_id) {
-                        if let Some(job) = jobs.get(&pid) {
-                            if !matches!(job.info.status, JobStatus::Running) {
-                                Err(format!(
-                                    "task {} is not running; current status: {:?}",
-                                    task_id, job.info.status
-                                ))
-                            } else if let Some(tx) = &job.input_tx {
-                                tx.send(bytes).await.map_err(|_| {
-                                    format!("terminal input channel closed for task {task_id}")
-                                })
-                            } else {
-                                Err(format!(
-                                    "task {task_id} does not support terminal input in this runtime"
-                                ))
-                            }
-                        } else {
-                            Err(format!("unknown task_id: {task_id}"))
-                        }
-                    } else {
-                        Err(format!("unknown task_id: {task_id}"))
-                    };
-                    let _ = reply.send(result).await;
-                }
-                JobCommand::StartOutputRedirect {
-                    task_id,
-                    output_path,
-                    reply,
-                } => {
-                    let result = if let Some(pid) = find_pid_by_task_id(&jobs, &task_id) {
-                        if let Some(job) = jobs.get_mut(&pid) {
-                            start_output_redirect(job, output_path).await
-                        } else {
-                            Err(format!("unknown task_id: {task_id}"))
-                        }
-                    } else {
-                        Err(format!("unknown task_id: {task_id}"))
-                    };
-                    let _ = reply.send(result).await;
-                }
-                JobCommand::TerminalOutput { pid, reply } => {
-                    let output = jobs
-                        .get(&pid)
-                        .map(|job| (job.stdout_buffer.clone(), job.stderr_buffer.clone()));
-                    let _ = reply.send(output).await;
-                }
-                JobCommand::TerminalStreamsClosed { pid, reply } => {
-                    let closed = jobs
-                        .get(&pid)
-                        .is_some_and(|job| job.stdout_closed && job.stderr_closed);
-                    let _ = reply.send(closed).await;
-                }
-                JobCommand::FormatRunning { reply } => {
-                    let summary = format_running_jobs(&jobs);
-                    let _ = reply.send(summary).await;
-                }
-                JobCommand::HasRunning { reply } => {
-                    let has_running = jobs
-                        .values()
-                        .any(|job| matches!(job.info.status, JobStatus::Running));
-                    let _ = reply.send(has_running).await;
+/// The registry's owned state: every background job, keyed by pid.
+///
+/// Only the service task touches this, which is what lets the handlers below
+/// take `&mut self` without any locking.
+#[derive(Default)]
+struct Jobs(HashMap<u32, JobState>);
+
+impl Jobs {
+    /// Applies one command from the registry's channel.
+    async fn apply(&mut self, cmd: JobCommand) {
+        match cmd {
+            JobCommand::Register {
+                pid,
+                task_id,
+                execution_key,
+                script,
+                mode,
+                output_path,
+            } => self.register(pid, task_id, execution_key, script, mode, output_path),
+            JobCommand::AttachTerminalInput { pid, input_tx } => {
+                if let Some(job) = self.0.get_mut(&pid) {
+                    job.input_tx = Some(input_tx);
                 }
             }
+            JobCommand::AttachKillSwitch { pid, kill_tx } => {
+                if let Some(job) = self.0.get_mut(&pid) {
+                    job.kill_switch = Some(kill_tx);
+                }
+            }
+            JobCommand::CloseTerminalStream { pid, stream } => self.close_stream(pid, stream),
+            JobCommand::AppendTerminalOutput { pid, stream, chunk } => {
+                self.append_terminal_output(pid, stream, &chunk).await;
+            }
+            JobCommand::Complete {
+                pid,
+                exit_code,
+                output_path,
+            } => self.complete(pid, exit_code, output_path).await,
+            JobCommand::Fail {
+                pid,
+                error,
+                output_path,
+            } => self.fail(pid, error, output_path).await,
+            JobCommand::List { reply } => {
+                let items = self.0.values().map(|state| state.info.clone()).collect();
+                let _ = reply.send(items).await;
+            }
+            JobCommand::Get { pid, reply } => {
+                let item = self.0.get(&pid).map(|state| state.info.clone());
+                let _ = reply.send(item).await;
+            }
+            JobCommand::Kill { pid, reply } => {
+                let result = kill_job(&mut self.0, pid).await;
+                let _ = reply.send(result).await;
+            }
+            JobCommand::KillByTaskId { task_id, reply } => {
+                let result = self.kill_by_task_id(&task_id).await;
+                let _ = reply.send(result).await;
+            }
+            JobCommand::KillByExecutionKey {
+                execution_key,
+                reply,
+            } => {
+                let killed = self.kill_by_execution_key(&execution_key).await;
+                let _ = reply.send(killed).await;
+            }
+            JobCommand::InputTerminal {
+                task_id,
+                bytes,
+                reply,
+            } => {
+                let result = self.send_terminal_input(&task_id, bytes).await;
+                let _ = reply.send(result).await;
+            }
+            JobCommand::StartOutputRedirect {
+                task_id,
+                output_path,
+                reply,
+            } => {
+                let result = match self.job_for_task_mut(&task_id) {
+                    Some(job) => start_output_redirect(job, output_path).await,
+                    None => Err(format!("unknown task_id: {task_id}")),
+                };
+                let _ = reply.send(result).await;
+            }
+            JobCommand::TerminalOutput { pid, reply } => {
+                let output = self
+                    .0
+                    .get(&pid)
+                    .map(|job| (job.stdout_buffer.clone(), job.stderr_buffer.clone()));
+                let _ = reply.send(output).await;
+            }
+            JobCommand::TerminalStreamsClosed { pid, reply } => {
+                let _ = reply.send(self.streams_closed(pid)).await;
+            }
+            JobCommand::FormatRunning { reply } => {
+                let _ = reply.send(format_running_jobs(&self.0)).await;
+            }
+            JobCommand::HasRunning { reply } => {
+                let _ = reply.send(self.has_running()).await;
+            }
         }
+    }
+
+    /// Records that one of a job's output streams reached end of file.
+    fn close_stream(&mut self, pid: u32, stream: TerminalStream) {
+        let Some(job) = self.0.get_mut(&pid) else {
+            return;
+        };
+        match stream {
+            TerminalStream::Stdout => job.stdout_closed = true,
+            TerminalStream::Stderr => job.stderr_closed = true,
+        }
+    }
+
+    /// Whether both of a job's output streams have reached end of file.
+    fn streams_closed(&self, pid: u32) -> bool {
+        self.0
+            .get(&pid)
+            .is_some_and(|job| job.stdout_closed && job.stderr_closed)
+    }
+
+    /// Whether any job is still running — the check that decides whether the
+    /// sandbox can be torn down.
+    fn has_running(&self) -> bool {
+        self.0
+            .values()
+            .any(|job| matches!(job.info.status, JobStatus::Running))
+    }
+
+    /// Kills the job running a given task id, reporting whether one was found
+    /// and killed.
+    async fn kill_by_task_id(&mut self, task_id: &str) -> bool {
+        match find_pid_by_task_id(&self.0, task_id) {
+            Some(pid) => kill_job(&mut self.0, pid).await,
+            None => false,
+        }
+    }
+
+    /// Looks up the job running a given task id.
+    fn job_for_task_mut(&mut self, task_id: &str) -> Option<&mut JobState> {
+        let pid = find_pid_by_task_id(&self.0, task_id)?;
+        self.0.get_mut(&pid)
+    }
+
+    fn register(
+        &mut self,
+        pid: u32,
+        task_id: String,
+        execution_key: String,
+        script: String,
+        mode: BashMode,
+        output_path: Option<PathBuf>,
+    ) {
+        let info = JobInfo {
+            pid,
+            task_id,
+            execution_key,
+            script,
+            mode,
+            started_at: Instant::now(),
+            status: JobStatus::Running,
+            output_path,
+        };
+        self.0.insert(
+            pid,
+            JobState {
+                info,
+                terminal_buffer: Vec::new(),
+                stdout_buffer: Vec::new(),
+                stderr_buffer: Vec::new(),
+                stdout_closed: false,
+                stderr_closed: false,
+                input_tx: None,
+                kill_switch: None,
+                output_redirect: None,
+                finished_at: None,
+            },
+        );
+        tracing::debug!(pid = %pid, "registered background job");
+    }
+
+    /// Buffers a chunk of a job's output, mirroring it to the redirect file if
+    /// one is attached.
+    ///
+    /// A redirect that cannot be written fails the job: its output would be
+    /// silently incomplete otherwise, and the caller reads that file expecting
+    /// the whole run.
+    async fn append_terminal_output(&mut self, pid: u32, stream: TerminalStream, chunk: &[u8]) {
+        let Some(job) = self.0.get_mut(&pid) else {
+            return;
+        };
+        if chunk.is_empty() {
+            return;
+        }
+
+        job.terminal_buffer.extend_from_slice(chunk);
+        if let Some(file) = job.output_redirect.as_mut()
+            && let Err(error) = file.write_all(chunk).await
+        {
+            mark_job_failed(
+                job,
+                format!(
+                    "failed to append redirected output for task {}: {error}",
+                    job.info.task_id
+                ),
+            );
+            tracing::error!(
+                pid = %pid,
+                error = %error,
+                "failed to append redirected output"
+            );
+        }
+
+        match stream {
+            TerminalStream::Stdout => job.stdout_buffer.extend_from_slice(chunk),
+            TerminalStream::Stderr => job.stderr_buffer.extend_from_slice(chunk),
+        }
+    }
+
+    /// Marks a job finished. Ignored for a job that already finished, so a late
+    /// duplicate cannot overwrite the first outcome.
+    async fn complete(&mut self, pid: u32, exit_code: i32, output_path: Option<PathBuf>) {
+        let Some(job) = self.0.get_mut(&pid) else {
+            return;
+        };
+        if !matches!(job.info.status, JobStatus::Running) {
+            tracing::debug!(
+                pid = %pid,
+                status = ?job.info.status,
+                "ignoring complete for non-running job"
+            );
+            return;
+        }
+
+        if let Err(error) = finalize_output_redirect(job).await {
+            tracing::error!(
+                pid = %pid,
+                error = %error,
+                "failed to flush redirected output on complete"
+            );
+            mark_job_failed(job, error);
+            return;
+        }
+
+        job.info.status = JobStatus::Completed { exit_code };
+        job.finished_at = Some(Instant::now());
+        job.kill_switch = None;
+        if output_path.is_some() {
+            job.info.output_path = output_path;
+        }
+        tracing::debug!(pid = %pid, exit_code = %exit_code, "job completed");
+    }
+
+    /// Marks a job failed, folding in any flush failure so neither error is
+    /// lost to the other.
+    async fn fail(&mut self, pid: u32, error: String, output_path: Option<PathBuf>) {
+        let Some(job) = self.0.get_mut(&pid) else {
+            return;
+        };
+        if !matches!(job.info.status, JobStatus::Running) {
+            tracing::debug!(
+                pid = %pid,
+                status = ?job.info.status,
+                "ignoring fail for non-running job"
+            );
+            return;
+        }
+
+        let status_error = match finalize_output_redirect(job).await {
+            Ok(()) => error,
+            Err(finalize_error) => {
+                format!("{error}; additionally failed to flush redirected output: {finalize_error}")
+            }
+        };
+        mark_job_failed(job, status_error);
+        job.kill_switch = None;
+        if output_path.is_some() {
+            job.info.output_path = output_path;
+        }
+        tracing::debug!(pid = %pid, "job failed");
+    }
+
+    /// Kills every running job started under one execution key, returning how
+    /// many were actually killed.
+    async fn kill_by_execution_key(&mut self, execution_key: &str) -> usize {
+        let pids: Vec<u32> = self
+            .0
+            .iter()
+            .filter(|(_, state)| {
+                state.info.execution_key == execution_key
+                    && matches!(state.info.status, JobStatus::Running)
+            })
+            .map(|(pid, _)| *pid)
+            .collect();
+
+        let mut killed = 0usize;
+        for pid in pids {
+            if kill_job(&mut self.0, pid).await {
+                killed += 1;
+            }
+        }
+        killed
+    }
+
+    /// Writes bytes to a running job's terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming what went wrong: no such task, the task is no
+    /// longer running, the runtime gives it no terminal, or the terminal has
+    /// since closed.
+    async fn send_terminal_input(&self, task_id: &str, bytes: Vec<u8>) -> Result<(), String> {
+        let job = find_pid_by_task_id(&self.0, task_id)
+            .and_then(|pid| self.0.get(&pid))
+            .ok_or_else(|| format!("unknown task_id: {task_id}"))?;
+
+        if !matches!(job.info.status, JobStatus::Running) {
+            return Err(format!(
+                "task {} is not running; current status: {:?}",
+                task_id, job.info.status
+            ));
+        }
+
+        let Some(tx) = &job.input_tx else {
+            return Err(format!(
+                "task {task_id} does not support terminal input in this runtime"
+            ));
+        };
+
+        tx.send(bytes)
+            .await
+            .map_err(|_| format!("terminal input channel closed for task {task_id}"))
     }
 }
 
