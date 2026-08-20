@@ -833,28 +833,38 @@ impl<P: PermissionHandler + 'static, E: Executor + Clone + 'static> Tool
         self.executor
             .spawn(async move {
                 let result = execute_script_standalone(
-                    &working_dir,
-                    &writable_paths,
-                    &readable_paths,
-                    executor,
-                    registry,
-                    permission_handler,
-                    job_registry,
-                    &task_id_for_spawn,
-                    &execution_id,
-                    background_mode_for_spawn,
+                    SandboxPaths {
+                        working_dir: &working_dir,
+                        writable_paths: &writable_paths,
+                        readable_paths: &readable_paths,
+                    },
+                    ExecutionIds {
+                        task_id: &task_id_for_spawn,
+                        execution_id: &execution_id,
+                    },
+                    ShellTarget {
+                        backend,
+                        ssh_target: ssh_target.as_deref(),
+                        ssh_runtime: ssh_runtime.as_ref(),
+                        container_id: container_id.as_deref(),
+                        container_exec: container_exec.as_ref(),
+                    },
+                    OutputOptions {
+                        expect,
+                        store_dir: &store_dir_for_spawn,
+                        max_lines,
+                        raw,
+                    },
+                    ExecutionContext {
+                        executor,
+                        registry,
+                        permission_handler,
+                        job_registry,
+                        background_mode: background_mode_for_spawn,
+                        stdin_blocked_notice,
+                    },
                     &script,
                     mode,
-                    backend,
-                    ssh_target.as_deref(),
-                    ssh_runtime.clone(),
-                    container_id.as_deref(),
-                    container_exec.as_ref(),
-                    stdin_blocked_notice,
-                    expect,
-                    &store_dir_for_spawn,
-                    max_lines,
-                    raw,
                 )
                 .await;
 
@@ -1007,35 +1017,120 @@ async fn start_background_output_redirect(
     })
 }
 
+/// Where a script may read and write on the host.
+///
+/// These three paths always travel together: they define the sandbox's view of
+/// the filesystem, and passing them separately through every execution helper
+/// was the bulk of those functions' parameter lists.
+#[derive(Debug, Clone, Copy)]
+struct SandboxPaths<'a> {
+    /// Directory the script runs in, and may write to.
+    working_dir: &'a PathBuf,
+    /// Additional writable paths.
+    writable_paths: &'a [PathBuf],
+    /// Paths readable but not writable.
+    readable_paths: &'a [PathBuf],
+}
+
+/// Identifies one execution for the job registry.
+#[derive(Debug, Clone, Copy)]
+struct ExecutionIds<'a> {
+    /// Stable id the agent uses to refer to the task.
+    task_id: &'a str,
+    /// Id of this particular run of it.
+    execution_id: &'a str,
+}
+
+/// Which runtime a script runs on, and how to reach it.
+#[derive(Clone, Copy)]
+struct ShellTarget<'a> {
+    /// Local, container, or SSH.
+    backend: ShellBackend,
+    /// SSH destination, when the backend is SSH.
+    ssh_target: Option<&'a str>,
+    /// How the sandbox runtime is available on that host.
+    ssh_runtime: Option<&'a SshRuntimeProfile>,
+    /// Container to exec into, when the backend is a container.
+    container_id: Option<&'a str>,
+    /// The container runtime bridge.
+    container_exec: Option<&'a Arc<dyn crate::shell_session::ContainerExecObject>>,
+}
+
+/// How a script's output should be captured and rendered.
+#[derive(Debug, Clone, Copy)]
+struct OutputOptions<'a> {
+    /// Expected output format.
+    expect: OutputFormat,
+    /// Directory saved output is written to.
+    store_dir: &'a PathBuf,
+    /// Maximum lines to keep inline.
+    max_lines: usize,
+    /// Skip compression and keep the output verbatim.
+    raw: bool,
+}
+
+/// The machinery a background execution needs: what runs it, what tools it can
+/// reach, who approves escalations, and where its progress is recorded.
+struct ExecutionContext<P, E> {
+    /// Spawns the work.
+    executor: E,
+    /// Tools reachable from the script as IPC commands.
+    registry: Arc<ToolRegistry>,
+    /// Approves network and unsafe escalations.
+    permission_handler: Arc<P>,
+    /// Records the job so it can be inspected and killed.
+    job_registry: JobRegistry,
+    /// Whether output should be stored rather than returned inline.
+    background_mode: Arc<AtomicBool>,
+    /// Notified when the script blocks on stdin.
+    stdin_blocked_notice: Option<async_channel::Sender<String>>,
+}
+
 /// Standalone script execution that can be spawned in a background task.
 async fn execute_script_standalone<P, E>(
-    working_dir: &PathBuf,
-    writable_paths: &[PathBuf],
-    readable_paths: &[PathBuf],
-    executor: E,
-    registry: Arc<ToolRegistry>,
-    permission_handler: Arc<P>,
-    job_registry: JobRegistry,
-    task_id: &str,
-    execution_id: &str,
-    background_mode: Arc<AtomicBool>,
+    paths: SandboxPaths<'_>,
+    ids: ExecutionIds<'_>,
+    target: ShellTarget<'_>,
+    output_opts: OutputOptions<'_>,
+    context: ExecutionContext<P, E>,
     script: &str,
     mode: BashMode,
-    backend: ShellBackend,
-    ssh_target: Option<&str>,
-    ssh_runtime: Option<SshRuntimeProfile>,
-    container_id: Option<&str>,
-    container_exec: Option<&Arc<dyn crate::shell_session::ContainerExecObject>>,
-    stdin_blocked_notice: Option<async_channel::Sender<String>>,
-    expect: OutputFormat,
-    store_dir: &PathBuf,
-    max_lines: usize,
-    raw: bool,
 ) -> Result<BashResult, BashError>
 where
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
+    let SandboxPaths {
+        working_dir,
+        writable_paths,
+        readable_paths,
+    } = paths;
+    let ExecutionIds {
+        task_id,
+        execution_id,
+    } = ids;
+    let ShellTarget {
+        backend,
+        ssh_target,
+        ssh_runtime,
+        container_id,
+        container_exec,
+    } = target;
+    let OutputOptions {
+        expect,
+        store_dir,
+        max_lines,
+        raw,
+    } = output_opts;
+    let ExecutionContext {
+        executor,
+        registry,
+        permission_handler,
+        job_registry,
+        background_mode,
+        stdin_blocked_notice,
+    } = context;
+
     info!(
         script_len = script.len(),
         ?mode,
@@ -1047,10 +1142,9 @@ where
 
     let (pid, output) = if matches!(backend, ShellBackend::Container) {
         execute_container_background(
+            ids,
             executor.clone(),
             registry.clone(),
-            task_id,
-            execution_id,
             script,
             mode,
             container_id,
@@ -1067,7 +1161,7 @@ where
             script,
             mode,
             ssh_target,
-            ssh_runtime,
+            ssh_runtime.cloned(),
             &job_registry,
         )
         .await?
@@ -1075,13 +1169,10 @@ where
         match mode {
             BashMode::Network => {
                 execute_sandboxed_background(
-                    working_dir,
-                    writable_paths,
-                    readable_paths,
+                    paths,
+                    ids,
                     executor.clone(),
                     registry.clone(),
-                    task_id,
-                    execution_id,
                     script,
                     mode,
                     PermissionNetworkPolicy { permission_handler },
@@ -1091,13 +1182,10 @@ where
             }
             BashMode::Unsafe => {
                 execute_unsafe_background(
-                    working_dir,
-                    writable_paths,
-                    readable_paths,
+                    paths,
+                    ids,
                     executor,
                     registry,
-                    task_id,
-                    execution_id,
                     script,
                     mode,
                     &job_registry,
@@ -1209,13 +1297,10 @@ where
 }
 
 async fn execute_sandboxed_background<E, N>(
-    working_dir: &PathBuf,
-    writable_paths: &[PathBuf],
-    readable_paths: &[PathBuf],
+    paths: SandboxPaths<'_>,
+    ids: ExecutionIds<'_>,
     executor: E,
     registry: Arc<ToolRegistry>,
-    task_id: &str,
-    execution_id: &str,
     script: &str,
     mode: BashMode,
     policy: N,
@@ -1225,6 +1310,16 @@ where
     E: Executor + Clone + 'static,
     N: NetworkPolicy + 'static,
 {
+    let SandboxPaths {
+        working_dir,
+        writable_paths,
+        readable_paths,
+    } = paths;
+    let ExecutionIds {
+        task_id,
+        execution_id,
+    } = ids;
+
     let router = create_ipc_router(registry);
     let config = SandboxConfig::builder()
         .network(policy)
@@ -1300,17 +1395,23 @@ where
 }
 
 async fn execute_unsafe_background<E: Executor + Clone + 'static>(
-    working_dir: &PathBuf,
-    writable_paths: &[PathBuf],
-    readable_paths: &[PathBuf],
+    paths: SandboxPaths<'_>,
+    ids: ExecutionIds<'_>,
     executor: E,
     registry: Arc<ToolRegistry>,
-    task_id: &str,
-    execution_id: &str,
     script: &str,
     mode: BashMode,
     job_registry: &JobRegistry,
 ) -> Result<(u32, std::process::Output), BashError> {
+    let SandboxPaths {
+        working_dir,
+        writable_paths,
+        readable_paths,
+    } = paths;
+    let ExecutionIds {
+        task_id,
+        execution_id,
+    } = ids;
     let router = create_ipc_gateway_router(registry);
     let config = SandboxConfig::builder()
         .network(AllowAll)
@@ -1385,10 +1486,9 @@ async fn execute_unsafe_background<E: Executor + Clone + 'static>(
 }
 
 async fn execute_container_background<E: Executor + Clone + 'static>(
+    ids: ExecutionIds<'_>,
     executor: E,
     registry: Arc<ToolRegistry>,
-    task_id: &str,
-    execution_id: &str,
     script: &str,
     mode: BashMode,
     container_id: Option<&str>,
@@ -1397,6 +1497,10 @@ async fn execute_container_background<E: Executor + Clone + 'static>(
     job_registry: &JobRegistry,
     stdin_blocked_notice: Option<async_channel::Sender<String>>,
 ) -> Result<(u32, std::process::Output), BashError> {
+    let ExecutionIds {
+        task_id,
+        execution_id,
+    } = ids;
     let container_id = container_id
         .ok_or_else(|| BashError::Execution("missing container_id for container backend".into()))?;
     let exec = container_exec.ok_or_else(|| {
