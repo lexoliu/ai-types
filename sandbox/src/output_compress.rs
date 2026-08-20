@@ -224,6 +224,7 @@ fn magika_label_to_ts_language(label: &str) -> Option<tree_sitter::Language> {
 
 /// Set of tree-sitter node types considered "foldable blocks".
 /// These are compound statements whose body can be collapsed.
+#[cfg(feature = "code-folding")]
 fn is_foldable_node(kind: &str) -> bool {
     matches!(
         kind,
@@ -254,6 +255,7 @@ fn is_foldable_node(kind: &str) -> bool {
 }
 
 /// Minimum number of lines a foldable block must span to be worth folding.
+#[cfg(feature = "code-folding")]
 const MIN_FOLD_LINES: usize = 4;
 
 /// Try to detect source code via magika and fold it with tree-sitter.
@@ -354,6 +356,7 @@ fn try_fold_source_code(text: &str) -> Option<FoldedCode> {
 }
 
 /// Recursively collect foldable ranges from the tree-sitter AST.
+#[cfg(feature = "code-folding")]
 fn collect_foldable_ranges(node: tree_sitter::Node, ranges: &mut Vec<(usize, usize)>) {
     if is_foldable_node(node.kind()) {
         let start_line = node.start_position().row;
@@ -370,6 +373,7 @@ fn collect_foldable_ranges(node: tree_sitter::Node, ranges: &mut Vec<(usize, usi
 }
 
 /// Merge overlapping or adjacent ranges.
+#[cfg(feature = "code-folding")]
 fn merge_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for &(start, end) in ranges {
@@ -384,11 +388,13 @@ fn merge_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     merged
 }
 
+#[cfg(feature = "code-folding")]
 fn append_numbered_line(out: &mut String, line_num: usize, line: &str, width: usize) {
     use std::fmt::Write;
     let _ = writeln!(out, "{line_num:>width$}  {line}");
 }
 
+#[cfg(feature = "code-folding")]
 fn digit_count(n: usize) -> usize {
     if n == 0 {
         return 1;

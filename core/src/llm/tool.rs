@@ -4,9 +4,14 @@
 //! Type-safe tool calling system for Large Language Models. Enables LLMs to execute external
 //! functions, access APIs, and interact with systems through well-defined interfaces.
 //!
-//! //! ## How LLM call external tools?
+//! ## How a model calls a tool
 //!
-//! TODO
+//! A [`Tool`] declares a name, a description, and an `Arguments` type whose
+//! JSON schema is sent to the provider. When the model decides to use a tool it
+//! emits a [`ToolCall`](crate::llm::ToolCall) event carrying the tool name and
+//! arguments as JSON; this crate does not execute it. Executing the call and
+//! feeding the result back is the job of a higher layer such as `aither-agent`,
+//! which keeps tool execution under the caller's control.
 //!
 //! ## Core Components
 //!
@@ -16,29 +21,33 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,ignore
-//! use aither::llm::Tool;
+//! ```rust
+//! use aither_core::llm::{Tool, ToolOutput};
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
+//! use std::borrow::Cow;
 //!
+//! /// Performs basic math operations.
 //! #[derive(JsonSchema, Deserialize)]
 //! struct MathArgs {
 //!     /// Operation: "add", "subtract", "multiply", "divide"
 //!     operation: String,
 //!     /// First number
 //!     a: f64,
-//!     /// Second number  
+//!     /// Second number
 //!     b: f64,
 //! }
 //!
 //! struct Calculator;
 //!
 //! impl Tool for Calculator {
-//!     const NAME: &str = "calculator";
-//!     const DESCRIPTION: &str = "Performs basic math operations";
+//!     fn name(&self) -> Cow<'static, str> {
+//!         Cow::Borrowed("calculator")
+//!     }
+//!
 //!     type Arguments = MathArgs;
 //!
-//!     async fn call(&self, args: Self::Arguments) -> aither::Result<ToolOutput> {
+//!     async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
 //!         let result = match args.operation.as_str() {
 //!             "add" => args.a + args.b,
 //!             "subtract" => args.a - args.b,
@@ -1111,7 +1120,7 @@ mod tests {
     #[tokio::test]
     async fn tools_register_and_call() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
+        tools.register(Calculator).expect("calculator registers");
 
         let definitions = tools.definitions();
         assert_eq!(definitions.len(), 1);
@@ -1127,7 +1136,7 @@ mod tests {
     #[tokio::test]
     async fn calculator_operations() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
+        tools.register(Calculator).expect("calculator registers");
 
         // Test addition
         let result = tools
@@ -1160,7 +1169,7 @@ mod tests {
     #[tokio::test]
     async fn calculator_division_by_zero() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
+        tools.register(Calculator).expect("calculator registers");
 
         let result = tools
             .call("calculator", r#"{"operation": "divide", "a": 10, "b": 0}"#)
@@ -1172,7 +1181,7 @@ mod tests {
     #[tokio::test]
     async fn calculator_unknown_operation() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
+        tools.register(Calculator).expect("calculator registers");
 
         let result = tools
             .call("calculator", r#"{"operation": "modulo", "a": 10, "b": 3}"#)
@@ -1189,8 +1198,8 @@ mod tests {
     #[tokio::test]
     async fn multiple_tools() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
-        tools.register(Greeter);
+        tools.register(Calculator).expect("calculator registers");
+        tools.register(Greeter).expect("greeter registers");
 
         let definitions = tools.definitions();
         assert_eq!(definitions.len(), 2);
@@ -1232,7 +1241,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_json() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
+        tools.register(Calculator).expect("calculator registers");
 
         let result = tools.call("calculator", "invalid json").await;
         assert!(result.is_err());
@@ -1241,8 +1250,8 @@ mod tests {
     #[test]
     fn tools_unregister() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
-        tools.register(Greeter);
+        tools.register(Calculator).expect("calculator registers");
+        tools.register(Greeter).expect("greeter registers");
 
         assert_eq!(tools.definitions().len(), 2);
 
@@ -1259,8 +1268,8 @@ mod tests {
     #[test]
     fn tools_debug() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
-        tools.register(Greeter);
+        tools.register(Calculator).expect("calculator registers");
+        tools.register(Greeter).expect("greeter registers");
 
         let debug_str = format!("{tools:?}");
         assert!(debug_str.contains("Tools"));

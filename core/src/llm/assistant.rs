@@ -2,7 +2,10 @@ use alloc::{string::String, vec::Vec};
 
 use crate::{
     LanguageModel,
-    llm::{LLMRequest, Message, Tool, collect_text, tool::Tools},
+    llm::{
+        LLMRequest, Message, Tool, collect_text,
+        tool::{RegisterError, Tools},
+    },
 };
 
 /// A struct representing an Assistant that interacts with a language model (LLM),
@@ -61,12 +64,12 @@ impl<LLM: LanguageModel> Assistant<LLM> {
     /// # Parameters
     /// - `tool`: The tool to register with the assistant.
     ///
-    /// # Returns
-    /// Returns the updated Assistant instance with the tool registered.
-    #[must_use]
-    pub fn tool(mut self, tool: impl Tool + 'static) -> Self {
-        self.tools.register(tool);
-        self
+    /// # Errors
+    /// Returns [`RegisterError`] if a tool of that name is already registered,
+    /// or the tool has no description for the model to read.
+    pub fn tool(mut self, tool: impl Tool + 'static) -> core::result::Result<Self, RegisterError> {
+        self.tools.register(tool)?;
+        Ok(self)
     }
 
     /// Sends a user message to the assistant, processes it with the language model, and appends the response to the conversation history.

@@ -28,7 +28,7 @@ cargo test --package aither-core test_name
 
 ### Core Layer (`core/`)
 `aither-core` defines provider-agnostic traits that all implementations must satisfy:
-- `LanguageModel` / `LLMResponse` – streaming chat with reasoning and tool calling
+- `LanguageModel` / `Event` – streaming chat with reasoning and tool calling
 - `EmbeddingModel` – text vectorization for RAG
 - `ImageGenerator` – progressive image generation
 - `AudioGenerator` / `AudioTranscriber` – TTS and speech recognition
@@ -70,9 +70,9 @@ Model Context Protocol client/server implementation for tool discovery and execu
 
 **Streaming-first**: Every `LanguageModel::respond` returns a stream. Use `futures_lite::StreamExt` for iteration.
 
-**Builders over constructors**: Prefer `Request::new([...]).with_tool(...)` pattern.
+**Builders over constructors**: Prefer the `LLMRequest::new([...]).with_tool(&...)` pattern.
 
-**Tool definition**: Implement the `Tool` trait or use `#[derive(Tool)]` with `schemars::JsonSchema` for argument schemas.
+**Tool definition**: Implement the `Tool` trait (`name()`, an `Arguments` type implementing `schemars::JsonSchema`, and `call(&self, args)` returning `Result<ToolOutput>`), or use the `#[tool]` attribute macro on a free function. A tool's description defaults to the rustdoc on its `Arguments` type; override `Tool::description()` to set it directly. Registration rejects a tool with no description.
 
 **Feature flags**: Provider crates are optional (`openai`, `gemini`, `claude`). Use `full` feature for everything.
 

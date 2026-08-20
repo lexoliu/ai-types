@@ -373,11 +373,6 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // ACP server mode
-    if args.acp {
-        return run_acp_server().await;
-    }
-
     // Create cloud provider
     let base_url = args.base_url.as_deref();
     let (cloud, model, provider_name) = if let Some(provider) = args.provider {
@@ -408,6 +403,11 @@ async fn main() -> Result<()> {
         println!();
     }
 
+    // ACP server mode: serve editors over stdio rather than running a REPL.
+    if args.acp {
+        return run_acp_server(cloud).await;
+    }
+
     // Headless mode: run single prompt and exit
     if let Some(ref prompt) = args.prompt {
         return run_headless(cloud, &args, prompt).await;
@@ -417,12 +417,43 @@ async fn main() -> Result<()> {
 }
 
 /// Run as ACP server for editor integration.
-async fn run_acp_server() -> Result<()> {
+///
+/// Each session the editor opens gets its own agent, sandboxed to the working
+/// directory the editor supplied for that session.
+async fn run_acp_server(cloud: CloudProvider) -> Result<()> {
     use aither_acp::AcpServer;
 
-    let mut server = AcpServer::stdio("aither", env!("CARGO_PKG_VERSION"))?;
+    let mut server = AcpServer::stdio("aither", env!("CARGO_PKG_VERSION"), move |cwd| {
+        let cloud = cloud.clone();
+        async move { acp_session_agent(cloud, cwd).await }
+    })?;
     server.run().await?;
     Ok(())
+}
+
+/// Build the agent backing a single ACP session.
+async fn acp_session_agent(
+    cloud: CloudProvider,
+    cwd: std::path::PathBuf,
+) -> std::result::Result<
+    Agent<CloudProvider, CloudProvider, CloudProvider>,
+    aither_acp::protocol::AcpError,
+> {
+    let to_acp = |err: anyhow::Error| aither_acp::protocol::AcpError::Transport(err.to_string());
+
+    let permission_handler = StatefulPermissionHandler::new(InteractivePermissionHandler::new());
+    let bash_tool = aither_agent::sandbox::BashTool::new_in(&cwd, permission_handler, TokioGlobal)
+        .await
+        .map_err(|err| to_acp(err.into()))?;
+
+    BashAgentBuilder::new(cloud.clone(), bash_tool)
+        .tool(aither_agent::websearch::WebSearchTool::default())
+        .tool(aither_agent::webfetch::WebFetchTool::new())
+        .tool(aither_agent::TodoTool::new())
+        .tool(aither_agent::sandbox::builtin::AskCommand::new(cloud))
+        .with_default_prompt()
+        .build()
+        .map_err(|err| to_acp(anyhow::anyhow!("{err}")))
 }
 
 async fn build_agent(

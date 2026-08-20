@@ -32,7 +32,7 @@ Unified Rust traits for building AI applications across providers
 ## Highlights
 
 - 🎯 **Provider-agnostic traits** – swap between OpenAI, Gemini, local adapters, or your own.
-- ⚡ **Streaming-first** – every `LanguageModel::respond` returns an [`LLMResponse`] stream with visible deltas plus reasoning updates.
+- ⚡ **Streaming-first** – every `LanguageModel::respond` returns a stream of [`Event`]s: visible text deltas, reasoning updates, and tool calls.
 - 🧠 **Reasoning controls** – request chain-of-thought summaries, budgets, or effort tiers without macros.
 - 🛠️ **Tooling & structured output** – JSON-schema tools, builders, and derive macros keep function calling type-safe.
 - 🧱 **No-std capable** – `aither-core` runs in embedded/WASM targets and re-exports only `alloc`.
@@ -42,7 +42,7 @@ Unified Rust traits for building AI applications across providers
 
 | Capability | Trait | Description |
 |------------|-------|-------------|
-| Language Models | `LanguageModel` / `LLMResponse` | Streaming chat, reasoning summaries, tool calling |
+| Language Models | `LanguageModel` / `Event` | Streaming chat, reasoning summaries, tool calling |
 | Embeddings | `EmbeddingModel` | Vectorize text for search, clustering, and RAG |
 | Images | `ImageGenerator` | Progressive generation + editing pipelines |
 | Audio | `AudioGenerator` / `AudioTranscriber` | TTS + speech recognition |
@@ -61,21 +61,23 @@ aither-openai = "0.1"
 2. Instantiate the provider, then drive everything through the trait:
 
 ```rust
-use aither::{LanguageModel, llm::{Message, Request}};
+use aither::{LanguageModel, llm::{Event, LLMRequest, Message}};
 use aither_openai::OpenAI;
 use futures_lite::StreamExt;
 
-async fn basic_chat(api_key: &str) -> aither::Result<String> {
+async fn basic_chat(api_key: &str) -> anyhow::Result<String> {
     let model = OpenAI::new(api_key);
-    let request = Request::new([
+    let request = LLMRequest::new([
         Message::system("You are a multilingual assistant."),
         Message::user("What is the capital of France?")
     ]);
 
     let mut stream = model.respond(request);
     let mut transcript = String::new();
-    while let Some(chunk) = stream.next().await {
-        transcript.push_str(&chunk?);
+    while let Some(event) = stream.next().await {
+        if let Event::Text(chunk) = event? {
+            transcript.push_str(&chunk);
+        }
     }
     Ok(transcript)
 }
@@ -83,15 +85,15 @@ async fn basic_chat(api_key: &str) -> aither::Result<String> {
 
 ### Streaming Reasoning & Thinking Budgets
 
-Reasoning-focused models (OpenAI O-series, Gemini 2.0 Flash Thinking, etc.) expose chain-of-thought summaries through [`LLMResponse::poll_reasoning_next`]. You can also request a thinking budget or reasoning effort via `Parameters`.
+Reasoning-focused models (OpenAI O-series, Gemini Flash Thinking, etc.) expose chain-of-thought summaries as `Event::Reasoning` items in the same stream. You can request a thinking budget or reasoning effort via `Parameters`.
 
 ```rust
 use aither::llm::{LanguageModel, Message, Request, model::Parameters};
-use futures_lite::{StreamExt, future::poll_fn};
-use core::pin::Pin;
+use aither::{LanguageModel, llm::{Event, LLMRequest, Message, model::Parameters}};
+use futures_lite::StreamExt;
 
-async fn inspect_reasoning(model: impl LanguageModel) -> aither::Result<()> {
-    let request = Request::new([
+async fn inspect_reasoning(model: impl LanguageModel) -> anyhow::Result<()> {
+    let request = LLMRequest::new([
         Message::user("Solve 24 using numbers 4,4,4,4."),
     ])
     .with_parameters(
@@ -100,57 +102,62 @@ async fn inspect_reasoning(model: impl LanguageModel) -> aither::Result<()> {
             .reasoning_budget_tokens(256)
     );
 
-    let mut response = model.respond(request);
-
-    while let Some(thought) = poll_fn(|cx| Pin::new(&mut response).poll_reasoning_next(cx)).await {
-        println!("🤔 {}", thought?);
-    }
-
+    let mut stream = model.respond(request);
     let mut final_text = String::new();
-    while let Some(chunk) = response.next().await {
-        final_text.push_str(&chunk?);
+
+    // Reasoning and visible text arrive interleaved in the same stream.
+    while let Some(event) = stream.next().await {
+        match event? {
+            Event::Reasoning(thought) => println!("🤔 {thought}"),
+            Event::Text(chunk) => final_text.push_str(&chunk),
+            _ => {}
+        }
     }
+
     println!("Answer: {final_text}");
     Ok(())
 }
 ```
 
-*(The helper `reasoning()` is just `StreamExt::next` over `poll_reasoning_next`; see `examples/tool_macro.rs` for a complete version.)*
-
 ### Function Calling
 
 ```rust
-use aither::{LanguageModel, llm::{Message, Request, Tool}};
-use serde::{Deserialize, Serialize};
+use aither::llm::{LLMRequest, Message, Tool, ToolOutput};
 use schemars::JsonSchema;
+use serde::Deserialize;
+use std::borrow::Cow;
 
-#[derive(JsonSchema, Deserialize, Serialize)]
+/// Get current weather for a location.
+#[derive(JsonSchema, Deserialize)]
 struct WeatherQuery {
+    /// City to report on, e.g. "Tokyo".
     location: String,
-    units: Option<String>,
 }
 
 struct WeatherTool;
 
 impl Tool for WeatherTool {
-    const NAME: &str = "get_weather";
-    const DESCRIPTION: &str = "Get current weather for a location";
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed("get_weather")
+    }
+
     type Arguments = WeatherQuery;
-    
-    async fn call(&mut self, args: Self::Arguments) -> aither::Result {
-        Ok(format!("Weather in {}: 22°C, sunny", args.location))
+
+    async fn call(&self, args: Self::Arguments) -> aither::Result<ToolOutput> {
+        Ok(ToolOutput::text(format!("Weather in {}: 22°C, sunny", args.location)))
     }
 }
 
-async fn weather_bot(model: impl LanguageModel) -> aither::Result {
-    let request = Request::new([
-        Message::user("What's the weather like in Tokyo?")
-    ]).with_tool(WeatherTool);
-    
-    let response: String = model.generate(request).await?;
-    Ok(response)
-}
+// Advertise the tool on the request. The model answers with an
+// `Event::ToolCall`; running it and feeding the result back is the caller's
+// job, or `aither-agent`'s.
+let request = LLMRequest::new([Message::user("What is the weather in Tokyo?")])
+    .with_tool(&WeatherTool);
 ```
+
+The tool's description defaults to the rustdoc on its `Arguments` type. Override
+`Tool::description()` to set it explicitly — a tool with neither is rejected at
+registration rather than reaching the model unexplained.
 
 ### Semantic Search & Multimodal
 
@@ -187,7 +194,7 @@ async fn generate_image(generator: impl ImageGenerator) -> aither::Result<Vec<u8
 | Crate | Description |
 |-------|-------------|
 | `aither` | Entry crate re-exporting everything from `aither-core` + derive macros |
-| `aither-core` | No-std traits (`LanguageModel`, `LLMResponse`, `LLMRequest`, embedders, moderation, …) |
+| `aither-core` | No-std traits (`LanguageModel`, `Event`, `LLMRequest`, embedders, moderation, …) |
 | `aither-openai` | Provider bindings for OpenAI-compatible chat, images, audio, and moderation |
 | `aither-gemini` | Google Gemini bindings with tool looping and thinking budgets |
 | `aither-rag` | Retrieval-Augmented Generation helper with a parallel in-memory vector DB |
@@ -219,4 +226,4 @@ GEMINI_API_KEY=... cargo run --example chatbot_gemini -p aither-gemini
 
 MIT License - see [LICENSE](LICENSE) for details.
 
-[`LLMResponse`]: core/src/llm/mod.rs
+[`Event`]: core/src/llm/event.rs

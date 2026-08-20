@@ -92,13 +92,11 @@ pub mod tool;
 use crate::llm::{model::Parameters, tool::Tools};
 use alloc::{
     boxed::Box,
-    format,
     string::{String, ToString},
     sync::Arc,
     vec,
     vec::Vec,
 };
-use anyhow::{Context, anyhow};
 use core::{any::TypeId, future::Future};
 pub use event::{Event, ToolCall, Usage};
 use futures_core::Stream;
@@ -113,7 +111,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 pub use tool::{Tool, ToolOutput};
 
-use crate::llm::{model::Profile, tool::json};
+use crate::llm::model::Profile;
 
 /// Why a structured-output call failed.
 ///

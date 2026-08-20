@@ -26,6 +26,7 @@ impl Tool for Calc {
 
 #[derive(JsonSchema, Deserialize)]
 struct NoDocArgs {
+    #[allow(dead_code)]
     a: u32,
 }
 

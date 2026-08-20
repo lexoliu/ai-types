@@ -32,7 +32,7 @@ futures-core = "0.3"
 futures-lite = "2.6"
 pin-project-lite = "0.2"
 thiserror = "2"
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "fs"] }
 executor-core = { version = "0.7", features = ["tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
