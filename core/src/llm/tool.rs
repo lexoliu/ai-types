@@ -151,7 +151,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::BTreeMap};
 use core::any::Any;
-use core::fmt::Debug;
+use core::fmt::{Debug, Display};
 use core::{future::Future, pin::Pin};
 pub use mime::Mime;
 use schemars::{JsonSchema, Schema, schema_for};
@@ -317,8 +317,21 @@ pub trait Tool: Send + Sync {
     /// Tool name. Must be unique.
     fn name(&self) -> Cow<'static, str>;
 
+    /// What the tool does, as shown to the model.
+    ///
+    /// This is the single most important thing a model uses to decide whether
+    /// to call a tool, so it must not be empty — [`Tools::register`] rejects a
+    /// tool whose description is blank.
+    ///
+    /// The default implementation reads the rustdoc comment on
+    /// [`Self::Arguments`], which `schemars` records in the generated schema.
+    /// Override it to supply the description directly.
+    fn description(&self) -> Cow<'static, str> {
+        description_from_schema::<Self::Arguments>().unwrap_or_default()
+    }
+
     /// Tool arguments type. Must implement [`schemars::JsonSchema`] and [`serde::de::DeserializeOwned`].
-    /// Description is extracted from the rustdoc on this type via `JsonSchema`.
+    /// Its rustdoc becomes the default tool description.
     type Arguments: Send + JsonSchema + DeserializeOwned;
 
     /// Executes the tool with the provided arguments.
@@ -348,21 +361,30 @@ pub trait Tool: Send + Sync {
 /// println!("{}", json_str);
 /// ```
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics when converting the input value into JSON fails.
-#[must_use]
-pub fn json<T: Serialize>(value: &T) -> String {
-    let value = serde_json::to_value(value).expect("Failed to convert value to JSON");
+/// Returns an error if the value cannot be serialized to JSON, which happens
+/// for types such as maps with non-string keys.
+pub fn json<T: Serialize>(value: &T) -> Result<String> {
+    let value = serde_json::to_value(value)?;
 
-    value
+    Ok(value
         .as_str()
-        .map_or_else(|| format!("{value:#}"), ToString::to_string)
+        .map_or_else(|| format!("{value:#}"), ToString::to_string))
 }
 
 trait ToolImpl: Send + Sync + Any {
     fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + '_>>;
     fn definition(&self) -> ToolDefinition;
+
+    /// Upcast to [`Any`] so [`Tools::get`] can recover the concrete tool.
+    ///
+    /// Casting the `Box<dyn ToolImpl>` itself would downcast the box rather
+    /// than the tool inside it, and so never match.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Mutable counterpart of [`Self::as_any`].
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// Dynamic tool implementation for type-erased tools.
@@ -385,12 +407,19 @@ where
     fn definition(&self) -> ToolDefinition {
         self.definition.clone()
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
-fn is_object<T: JsonSchema>() -> bool {
-    let schema = schema_for!(T);
-    let value: Value = schema.to_value();
-
+/// Whether a schema describes a JSON object, and so can be sent to a provider
+/// as tool arguments without being wrapped in [`ToolArgument`].
+fn schema_is_object(value: &Value) -> bool {
     matches!(value.get("type").and_then(Value::as_str), Some("object"))
         || value.get("properties").is_some()
         || value.get("oneOf").is_some()
@@ -398,22 +427,68 @@ fn is_object<T: JsonSchema>() -> bool {
         || value.get("$defs").is_some()
 }
 
-impl<T: Tool + 'static> ToolImpl for T {
-    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + '_>> {
-        let is_object = is_object::<T::Arguments>();
+fn is_object<T: JsonSchema>() -> bool {
+    schema_is_object(&schema_for!(T).to_value())
+}
 
-        let result = if is_object {
+/// Builds the argument schema for a tool, wrapping scalars so the root is
+/// always an object as providers require.
+fn arguments_schema<T: JsonSchema>() -> Schema {
+    if is_object::<T>() {
+        schema_for!(T)
+    } else {
+        schema_for!(ToolArgument<T>)
+    }
+}
+
+/// Reads the `description` a `JsonSchema` derive records from a type's rustdoc.
+fn description_from_schema<T: JsonSchema>() -> Option<Cow<'static, str>> {
+    schema_for!(T)
+        .to_value()
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| Cow::Owned(text.to_string()))
+}
+
+/// A registered tool together with everything derived from its type.
+///
+/// The argument schema and the "are these arguments an object?" decision are
+/// properties of `T::Arguments` alone, so they are computed once here rather
+/// than rebuilt on every invocation.
+struct RegisteredTool<T: Tool> {
+    tool: T,
+    definition: ToolDefinition,
+    args_are_object: bool,
+}
+
+impl<T: Tool> RegisteredTool<T> {
+    fn new(tool: T) -> Self {
+        let definition = ToolDefinition::new(&tool);
+        let args_are_object = is_object::<T::Arguments>();
+        Self {
+            tool,
+            definition,
+            args_are_object,
+        }
+    }
+}
+
+impl<T: Tool + 'static> ToolImpl for RegisteredTool<T> {
+    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + '_>> {
+        let result = if self.args_are_object {
             serde_json::from_str::<T::Arguments>(args)
         } else {
             serde_json::from_str::<ToolArgument<T::Arguments>>(args).map(|wrapper| wrapper.value)
         };
 
         let Ok(arguments) = result else {
-            let name = self.name();
-            let mut schema = schema_for!(T::Arguments).to_value();
-            clean_schema(&mut schema);
+            // Cold path: spelling the schema out for the model is worth the
+            // allocation only when it has actually got the call wrong.
+            let name = self.definition.name().to_string();
             let schema_str =
-                serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".to_string());
+                serde_json::to_string_pretty(&self.definition.arguments_openai_schema())
+                    .unwrap_or_else(|_| "{}".to_string());
             return Box::pin(async move {
                 Err(anyhow::Error::msg(format!(
                     "Invalid arguments for tool '{name}'. Expected schema:\n{schema_str}"
@@ -421,13 +496,53 @@ impl<T: Tool + 'static> ToolImpl for T {
             });
         };
 
-        Box::pin(async move { Tool::call(self, arguments).await })
+        Box::pin(async move { Tool::call(&self.tool, arguments).await })
     }
 
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new(self)
+        self.definition.clone()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.tool
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.tool
     }
 }
+
+/// Why a tool could not be added to a [`Tools`] registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterError {
+    /// A tool with this name is already registered.
+    ///
+    /// Names address tools in a model's tool-call, so they must be unique.
+    DuplicateName(Cow<'static, str>),
+
+    /// The tool's description is empty.
+    ///
+    /// A description is what a model uses to decide whether to call a tool, so
+    /// an empty one makes the tool unusable rather than merely undocumented.
+    EmptyDescription(Cow<'static, str>),
+}
+
+impl Display for RegisterError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::DuplicateName(name) => {
+                write!(f, "a tool named '{name}' is already registered")
+            }
+            Self::EmptyDescription(name) => write!(
+                f,
+                "tool '{name}' has an empty description; add a rustdoc comment to its \
+                 Arguments type or implement Tool::description"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for RegisterError {}
 
 /// Tool registry for managing and calling tools by name.
 ///
@@ -471,30 +586,14 @@ pub struct ToolDefinition {
 impl ToolDefinition {
     /// Creates a tool definition for a given tool type.
     ///
-    /// The description is extracted from the Arguments struct's rustdoc comment
-    /// (via `schemars::JsonSchema`). Falls back to `Tool::description()` if no
-    /// rustdoc is present on the Args struct.
+    /// The description comes from [`Tool::description`], which by default reads
+    /// the rustdoc on the tool's `Arguments` type.
     #[must_use]
     pub fn new<T: Tool>(tool: &T) -> Self {
-        let arguments = if is_object::<T::Arguments>() {
-            schema_for!(T::Arguments)
-        } else {
-            schema_for!(ToolArgument<T::Arguments>)
-        };
-
-        // Extract description from schema (rustdoc on Args struct)
-        let description = arguments
-            .clone()
-            .to_value()
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(|s| Cow::Owned(s.to_string()))
-            .unwrap_or_default();
-
         Self {
             name: tool.name(),
-            description,
-            arguments,
+            description: tool.description(),
+            arguments: arguments_schema::<T::Arguments>(),
         }
     }
 
@@ -807,7 +906,7 @@ impl Tools {
     {
         self.tools
             .values()
-            .find_map(|tool| (tool as &dyn Any).downcast_ref::<T>())
+            .find_map(|tool| tool.as_any().downcast_ref::<T>())
     }
 
     /// Retrieves a mutable reference to a tool by type.
@@ -820,7 +919,7 @@ impl Tools {
     {
         self.tools
             .values_mut()
-            .find_map(|tool| (tool as &mut dyn Any).downcast_mut::<T>())
+            .find_map(|tool| tool.as_any_mut().downcast_mut::<T>())
     }
 
     /// Returns definitions of all registered tools.
@@ -829,52 +928,64 @@ impl Tools {
         self.tools.values().map(|tool| tool.definition()).collect()
     }
 
-    /// Registers a new tool. Replaces existing tool with same name.
+    /// Registers a new tool.
     ///
     /// The tool must implement [`Tool`] and be `'static`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if a tool with the same name is already registered.
-    pub fn register<T: Tool + 'static>(&mut self, tool: T) {
-        let name = tool.name();
-        // Check if conflict exists
-        assert!(
-            !self.tools.contains_key(&name),
-            "Tool with name '{name}' is already registered"
-        );
-
-        self.tools.insert(name, Box::new(tool) as Box<dyn ToolImpl>);
+    /// Returns [`RegisterError::DuplicateName`] if a tool of that name is
+    /// already registered, or [`RegisterError::EmptyDescription`] if the tool
+    /// has no description — a model cannot use a tool it cannot read about, so
+    /// this is rejected rather than silently passed on.
+    pub fn register<T: Tool + 'static>(
+        &mut self,
+        tool: T,
+    ) -> core::result::Result<(), RegisterError> {
+        let registered = RegisteredTool::new(tool);
+        self.insert(registered.definition.clone(), Box::new(registered))
     }
 
     /// Registers a dynamic tool with a pre-made definition and handler.
     ///
-    /// This is useful for type-erased tools (e.g., child bash tools for subagents)
-    /// where the concrete type isn't known at compile time.
+    /// This is useful for tools whose concrete type isn't known at compile time
+    /// (for example those discovered from an MCP server at runtime).
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if a tool with the same name is already registered.
-    pub fn register_dyn<F>(&mut self, definition: ToolDefinition, handler: F)
+    /// Same conditions as [`Self::register`].
+    pub fn register_dyn<F>(
+        &mut self,
+        definition: ToolDefinition,
+        handler: F,
+    ) -> core::result::Result<(), RegisterError>
     where
         F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send>>
             + Send
             + Sync
             + 'static,
     {
-        let name = definition.name.clone();
-        assert!(
-            !self.tools.contains_key(&name),
-            "Tool with name '{name}' is already registered"
-        );
+        let tool = DynToolImpl {
+            definition: definition.clone(),
+            handler,
+        };
+        self.insert(definition, Box::new(tool))
+    }
 
-        self.tools.insert(
-            name,
-            Box::new(DynToolImpl {
-                definition,
-                handler,
-            }),
-        );
+    fn insert(
+        &mut self,
+        definition: ToolDefinition,
+        tool: Box<dyn ToolImpl>,
+    ) -> core::result::Result<(), RegisterError> {
+        let name = definition.name.clone();
+        if self.tools.contains_key(&name) {
+            return Err(RegisterError::DuplicateName(name));
+        }
+        if definition.description().trim().is_empty() {
+            return Err(RegisterError::EmptyDescription(name));
+        }
+        self.tools.insert(name, tool);
+        Ok(())
     }
 
     /// Removes a tool from the registry.
@@ -966,7 +1077,7 @@ mod tests {
             "value": 42
         });
 
-        let json_str = json(&value);
+        let json_str = json(&value).expect("a JSON value always serializes");
         assert!(json_str.contains("\"name\": \"test\""));
         assert!(json_str.contains("\"value\": 42"));
     }

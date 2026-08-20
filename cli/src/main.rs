@@ -552,7 +552,10 @@ async fn build_agent(
         builder.with_default_prompt()
     };
 
-    Ok(builder.hook(DebugHook).build())
+    builder
+        .hook(DebugHook)
+        .build()
+        .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
 /// Run a single prompt and exit (headless mode).

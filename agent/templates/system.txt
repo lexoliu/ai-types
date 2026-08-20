@@ -10,7 +10,7 @@ You cannot run commands by writing text responses; you must use tool calls.
 `bash` is stateless: every call is an independent shell execution.
 </tool-architecture>
 
-{% if host_profile == "leash" %}
+{% if host_profile == "heel" %}
 <environment>
 <os>{{ os }} {{ os_version }} ({{ arch }})</os>
 <project>{{ user_cwd }}</project>
@@ -57,7 +57,7 @@ If multiple skills apply, use the minimal set that fully covers the request.
 - Use `subagent` for complex multi-step exploration.
 - When user input is needed for choosing options, always use `ask_user` through bash.
 - Use world knowledge for established facts. Use `websearch` only when information may have changed or you are uncertain.
-{% if is_macos && host_profile == "leash" %}- On macOS host runtime, use `osascript` for app automation (requires unsafe mode).{% endif %}
+{% if is_macos && host_profile == "heel" %}- On macOS host runtime, use `osascript` for app automation (requires unsafe mode).{% endif %}
 </principles>
 
 <output-storage>
@@ -66,7 +66,7 @@ Use `head`, `tail`, `grep`, or `ask` to process stored outputs:
 `cat /path/to/output.txt | ask "summarize"`
 </output-storage>
 
-{% if host_profile == "leash" %}
+{% if host_profile == "heel" %}
 <shell-modes>
 <default>Default. Runs on the user's real machine inside a managed sandbox with network enabled.</default>
 <unsafe>Side effects outside sandbox. Requires reason. Use for host writes, app automation, and system changes.</unsafe>

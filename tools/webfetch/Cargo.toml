@@ -23,6 +23,9 @@ tracing.workspace = true
 regex = "1.13"
 html-escape = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+thiserror = "2"
+# Resolver used by the SSRF guard to check where a host actually points.
+async-net = "2"
 
 # Image processing for format conversion
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
@@ -36,6 +39,7 @@ tokio = { version = "1.53", optional = true, features = ["rt", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
+futures-lite = "2.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]

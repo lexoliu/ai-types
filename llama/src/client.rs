@@ -741,7 +741,8 @@ mod tests {
 
     #[test]
     fn brace_inside_string_does_not_end_the_object() {
-        let raw = r#"{"tool_calls":[{"id":"a","function":{"name":"f","arguments":"{\"q\":\"}\"}"}}]}"#;
+        let raw =
+            r#"{"tool_calls":[{"id":"a","function":{"name":"f","arguments":"{\"q\":\"}\"}"}}]}"#;
         assert_eq!(extract_tool_call_payload(raw), Some(raw));
     }
 

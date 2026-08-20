@@ -5,7 +5,10 @@
 
 use std::sync::Arc;
 
-use aither_core::{LanguageModel, llm::Tool};
+use aither_core::{
+    LanguageModel,
+    llm::{Tool, tool::RegisterError},
+};
 use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, OutputStore};
 
 use crate::{
@@ -22,6 +25,32 @@ use crate::{
 #[cfg(feature = "mcp")]
 use aither_mcp::McpConnection;
 
+/// The agent could not be built because one or more tools failed to register.
+#[derive(Debug)]
+pub struct BuildError {
+    errors: Vec<RegisterError>,
+}
+
+impl BuildError {
+    /// The individual registration failures, in the order they occurred.
+    #[must_use]
+    pub fn errors(&self) -> &[RegisterError] {
+        &self.errors
+    }
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "agent has {} unusable tool(s):", self.errors.len())?;
+        for err in &self.errors {
+            write!(f, "\n  - {err}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for BuildError {}
+
 /// Builder for constructing agents with custom configuration.
 ///
 /// Supports tiered LLM configuration:
@@ -33,7 +62,7 @@ use aither_mcp::McpConnection;
 ///
 /// ```rust,ignore
 /// // Simple: all tiers use the same model
-/// let agent = Agent::builder(claude).build();
+/// let agent = Agent::builder(claude).build()?;
 ///
 /// // Tiered: different models for different tasks
 /// let agent = Agent::builder(opus)      // Advanced
@@ -41,7 +70,7 @@ use aither_mcp::McpConnection;
 ///     .fast_model(haiku)                // Fast
 ///     .system_prompt("You are a helpful assistant.")
 ///     .tool(FileSystemTool::read_only("."))
-///     .build();
+///     .build()?;
 /// ```
 #[must_use]
 pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
@@ -59,6 +88,12 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     job_registry: Option<JobRegistry>,
     transcript: Option<Transcript>,
     sandbox_dir: Option<std::path::PathBuf>,
+    /// Registration failures collected while building.
+    ///
+    /// The builder is a fluent chain, so a step that fails cannot return an
+    /// error at the point it happens. Collect them and report at
+    /// [`AgentBuilder::build`] rather than dropping them.
+    errors: Vec<RegisterError>,
 }
 
 impl<Advanced, Balanced, Fast, H> std::fmt::Debug for AgentBuilder<Advanced, Balanced, Fast, H> {
@@ -91,6 +126,7 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             job_registry: None,
             transcript: None,
             sandbox_dir: None,
+            errors: Vec::new(),
         }
     }
 }
@@ -125,6 +161,7 @@ where
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
+            errors: self.errors,
         }
     }
 
@@ -151,6 +188,7 @@ where
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
+            errors: self.errors,
         }
     }
 
@@ -180,7 +218,7 @@ where
     ///
     /// Eager tools are included in every LLM request.
     pub fn tool<T: Tool + 'static>(mut self, tool: T) -> Self {
-        self.tools.register(tool);
+        self.record(|tools| tools.register(tool));
         self
     }
 
@@ -189,8 +227,18 @@ where
     /// This is used for child bash tools in subagents where the concrete type
     /// is not known at compile time.
     pub fn dyn_bash(mut self, dyn_tool: aither_sandbox::DynBashTool) -> Self {
-        self.tools.register_dyn_bash(dyn_tool);
+        self.record(|tools| tools.register_dyn_bash(dyn_tool));
         self
+    }
+
+    /// Runs a registration step, keeping any failure for [`Self::build`].
+    fn record<F>(&mut self, register: F)
+    where
+        F: FnOnce(&mut AgentTools) -> Result<(), RegisterError>,
+    {
+        if let Err(err) = register(&mut self.tools) {
+            self.errors.push(err);
+        }
     }
 
     /// Adds a hook to intercept agent operations.
@@ -223,6 +271,7 @@ where
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
+            errors: self.errors,
         }
     }
 
@@ -376,7 +425,7 @@ where
         let background_receiver = bash_tool.background_receiver();
         let job_registry = bash_tool.job_registry();
         self.sandbox_dir = Some(bash_tool.working_dir().clone());
-        self.tools.register(bash_tool);
+        self.record(|tools| tools.register(bash_tool));
         self.output_store = Some(output_store);
         self.background_receiver = Some(background_receiver);
         self.job_registry = Some(job_registry);
@@ -405,7 +454,7 @@ where
     pub fn todo(mut self) -> Self {
         let list = TodoList::new();
         let tool = TodoTool::with_list(list.clone());
-        self.tools.register(tool);
+        self.record(|tools| tools.register(tool));
         self.todo_list = Some(list);
         self
     }
@@ -416,14 +465,25 @@ where
     /// or access the list externally.
     pub fn todo_with_list(mut self, list: TodoList) -> Self {
         let tool = TodoTool::with_list(list.clone());
-        self.tools.register(tool);
+        self.record(|tools| tools.register(tool));
         self.todo_list = Some(list);
         self
     }
 
     /// Builds the agent.
-    pub fn build(self) -> Agent<Advanced, Balanced, Fast, H> {
-        Agent {
+    ///
+    /// # Errors
+    ///
+    /// Returns every tool that failed to register — a duplicate name, or a tool
+    /// with no description for the model to read. These are reported here
+    /// because the fluent chain gives the individual steps nowhere to return.
+    pub fn build(self) -> Result<Agent<Advanced, Balanced, Fast, H>, BuildError> {
+        if !self.errors.is_empty() {
+            return Err(BuildError {
+                errors: self.errors,
+            });
+        }
+        Ok(Agent {
             advanced: self.advanced,
             balanced: self.balanced,
             fast: self.fast,
@@ -441,7 +501,7 @@ where
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
-        }
+        })
     }
 }
 
@@ -495,6 +555,7 @@ mod tests {
     // Mock tool
     struct MockTool;
 
+    /// Arguments for the mock tool used in builder tests.
     #[derive(Debug, JsonSchema, Deserialize)]
     struct MockArgs;
 
@@ -520,13 +581,18 @@ mod tests {
 
     #[test]
     fn test_builder_basic() {
-        let agent = AgentBuilder::new(MockLlm).build();
+        let agent = AgentBuilder::new(MockLlm)
+            .build()
+            .expect("builder should succeed");
         assert!(agent.tools.definitions().is_empty());
     }
 
     #[test]
     fn test_builder_with_tool() {
-        let agent = AgentBuilder::new(MockLlm).tool(MockTool).build();
+        let agent = AgentBuilder::new(MockLlm)
+            .tool(MockTool)
+            .build()
+            .expect("builder should succeed");
         assert_eq!(agent.tools.definitions().len(), 1);
     }
 
@@ -534,7 +600,8 @@ mod tests {
     fn test_builder_with_system_prompt() {
         let agent = AgentBuilder::new(MockLlm)
             .system_prompt("You are helpful.")
-            .build();
+            .build()
+            .expect("builder should succeed");
         assert_eq!(
             agent.config.system_prompt,
             Some("You are helpful.".to_string())
@@ -543,7 +610,10 @@ mod tests {
 
     #[test]
     fn test_builder_with_hook() {
-        let _agent = AgentBuilder::new(MockLlm).hook(MockHook).build();
+        let _agent = AgentBuilder::new(MockLlm)
+            .hook(MockHook)
+            .build()
+            .expect("builder should succeed");
         // Type check: agent has HCons<MockHook, ()> as hook type
     }
 
@@ -552,19 +622,25 @@ mod tests {
         let _agent = AgentBuilder::new(MockLlm)
             .hook(MockHook)
             .hook(MockHook)
-            .build();
+            .build()
+            .expect("builder should succeed");
         // Type check: agent has HCons<MockHook, HCons<MockHook, ()>>
     }
 
     #[test]
     fn test_builder_max_iterations() {
-        let agent = AgentBuilder::new(MockLlm).max_iterations(100).build();
+        let agent = AgentBuilder::new(MockLlm)
+            .max_iterations(100)
+            .build()
+            .expect("builder should succeed");
         assert_eq!(agent.config.max_iterations, 100);
     }
 
     #[test]
     fn test_builder_default_config() {
-        let agent = AgentBuilder::new(MockLlm).build();
+        let agent = AgentBuilder::new(MockLlm)
+            .build()
+            .expect("builder should succeed");
         assert_eq!(
             agent.config.max_iterations,
             AgentConfig::default().max_iterations

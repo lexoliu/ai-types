@@ -2,8 +2,9 @@
 
 use instant_distance::{Builder, HnswMap, Point, Search};
 use ordered_float::OrderedFloat;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockWriteGuard};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::{RagError, Result};
 use crate::types::{Chunk, IndexEntry, SearchResult};
@@ -11,9 +12,14 @@ use crate::types::{Chunk, IndexEntry, SearchResult};
 use super::VectorIndex;
 
 /// A point wrapper for instant-distance that stores an embedding vector.
+///
+/// The vector is shared rather than owned: `instant-distance` builds an
+/// immutable graph, so the index has to be rebuilt whenever entries change, and
+/// rebuilding copies every point. Sharing makes that copy a refcount bump
+/// instead of duplicating the whole corpus of embeddings.
 #[derive(Clone, Debug)]
 struct EmbeddingPoint {
-    embedding: Vec<f32>,
+    embedding: Arc<[f32]>,
 }
 
 impl Point for EmbeddingPoint {
@@ -41,7 +47,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Internal state for the HNSW index.
 struct IndexState {
     /// All stored entries (chunks + embeddings).
-    entries: Vec<IndexEntry>,
+    entries: Vec<StoredEntry>,
     /// Map from chunk ID to index in entries.
     id_to_index: HashMap<String, usize>,
     /// Set of content hashes for deduplication.
@@ -50,6 +56,34 @@ struct IndexState {
     hnsw: Option<HnswMap<EmbeddingPoint, usize>>,
     /// Whether the index needs rebuilding.
     dirty: bool,
+}
+
+/// An entry as held inside the index.
+///
+/// Mirrors the public [`IndexEntry`] but shares the embedding with the HNSW
+/// graph, so rebuilding does not duplicate it.
+#[derive(Clone, Debug)]
+struct StoredEntry {
+    chunk: Chunk,
+    embedding: Arc<[f32]>,
+}
+
+impl From<IndexEntry> for StoredEntry {
+    fn from(entry: IndexEntry) -> Self {
+        Self {
+            chunk: entry.chunk,
+            embedding: Arc::from(entry.embedding),
+        }
+    }
+}
+
+impl From<&StoredEntry> for IndexEntry {
+    fn from(entry: &StoredEntry) -> Self {
+        Self {
+            chunk: entry.chunk.clone(),
+            embedding: entry.embedding.to_vec(),
+        }
+    }
 }
 
 impl IndexState {
@@ -70,11 +104,13 @@ impl IndexState {
             return;
         }
 
+        // Cloning an `Arc<[f32]>` is a refcount bump, so this no longer copies
+        // every embedding in the index on each rebuild.
         let points: Vec<EmbeddingPoint> = self
             .entries
             .iter()
             .map(|e| EmbeddingPoint {
-                embedding: e.embedding.clone(),
+                embedding: Arc::clone(&e.embedding),
             })
             .collect();
 
@@ -82,6 +118,11 @@ impl IndexState {
 
         self.hnsw = Some(Builder::default().build(points, indices));
         self.dirty = false;
+    }
+
+    /// Whether a search can run without first rebuilding the graph.
+    const fn is_queryable(&self) -> bool {
+        !self.dirty && self.hnsw.is_some()
     }
 }
 
@@ -124,6 +165,47 @@ impl HnswIndex {
             state: RwLock::new(IndexState::new()),
         }
     }
+
+    /// Runs a search against a graph that is known to be up to date.
+    fn search_current(
+        state: &IndexState,
+        query: &[f32],
+        top_k: usize,
+        threshold: f32,
+    ) -> Vec<SearchResult> {
+        let Some(hnsw) = state.hnsw.as_ref() else {
+            return Vec::new();
+        };
+
+        let query_point = EmbeddingPoint {
+            embedding: Arc::from(query),
+        };
+
+        let mut search = Search::default();
+        let mut results = Vec::new();
+
+        for candidate in hnsw.search(&query_point, &mut search).take(top_k) {
+            let idx = *candidate.value;
+            let Some(entry) = state.entries.get(idx) else {
+                continue;
+            };
+
+            // Convert distance back to similarity
+            let similarity = 1.0 - candidate.distance;
+
+            if similarity >= threshold {
+                results.push(SearchResult {
+                    chunk: entry.chunk.clone(),
+                    score: similarity,
+                });
+            }
+        }
+
+        // Sort by score descending
+        results.sort_by_key(|r| std::cmp::Reverse(OrderedFloat(r.score)));
+
+        results
+    }
 }
 
 impl VectorIndex for HnswIndex {
@@ -145,7 +227,10 @@ impl VectorIndex for HnswIndex {
             state
                 .content_hashes
                 .insert(chunk.content_hash, chunk.id.clone());
-            state.entries[idx] = IndexEntry::new(chunk, embedding);
+            state.entries[idx] = StoredEntry {
+                chunk,
+                embedding: Arc::from(embedding),
+            };
         } else {
             // Insert new entry
             let idx = state.entries.len();
@@ -153,7 +238,10 @@ impl VectorIndex for HnswIndex {
             state
                 .content_hashes
                 .insert(chunk.content_hash, chunk.id.clone());
-            state.entries.push(IndexEntry::new(chunk, embedding));
+            state.entries.push(StoredEntry {
+                chunk,
+                embedding: Arc::from(embedding),
+            });
         }
 
         state.dirty = true;
@@ -193,45 +281,36 @@ impl VectorIndex for HnswIndex {
             });
         }
 
-        let mut state = self.state.write();
-
-        if state.entries.is_empty() || top_k == 0 {
+        if top_k == 0 {
             return Ok(Vec::new());
         }
 
-        // Rebuild HNSW if dirty
-        if state.dirty || state.hnsw.is_none() {
-            state.rebuild_hnsw();
-        }
-
-        let Some(ref hnsw) = state.hnsw else {
-            return Ok(Vec::new());
-        };
-
-        let query_point = EmbeddingPoint {
-            embedding: query.to_vec(),
-        };
-
-        let mut search = Search::default();
-        let mut results = Vec::new();
-
-        for candidate in hnsw.search(&query_point, &mut search).take(top_k) {
-            let idx = *candidate.value;
-            let entry = &state.entries[idx];
-
-            // Convert distance back to similarity
-            let similarity = 1.0 - candidate.distance;
-
-            if similarity >= threshold {
-                results.push(SearchResult {
-                    chunk: entry.chunk.clone(),
-                    score: similarity,
-                });
+        // Fast path: when the graph is already current, search under a read
+        // lock so queries run concurrently. Taking the write lock here would
+        // serialize every read against every other read.
+        {
+            let state = self.state.read();
+            if state.entries.is_empty() {
+                return Ok(Vec::new());
+            }
+            if state.is_queryable() {
+                return Ok(Self::search_current(&state, query, top_k, threshold));
             }
         }
 
-        // Sort by score descending
-        results.sort_by_key(|r| std::cmp::Reverse(OrderedFloat(r.score)));
+        // Slow path: entries changed since the last query, so the immutable
+        // graph has to be rebuilt before it can answer.
+        let results = {
+            let mut state = self.state.write();
+            if state.entries.is_empty() {
+                return Ok(Vec::new());
+            }
+            if !state.is_queryable() {
+                state.rebuild_hnsw();
+            }
+            let state = RwLockWriteGuard::downgrade(state);
+            Self::search_current(&state, query, top_k, threshold)
+        };
 
         Ok(results)
     }
@@ -254,7 +333,12 @@ impl VectorIndex for HnswIndex {
     }
 
     fn entries(&self) -> Vec<IndexEntry> {
-        self.state.read().entries.clone()
+        self.state
+            .read()
+            .entries
+            .iter()
+            .map(IndexEntry::from)
+            .collect()
     }
 
     fn load(&self, entries: Vec<IndexEntry>) -> Result<()> {
@@ -275,7 +359,7 @@ impl VectorIndex for HnswIndex {
             state
                 .content_hashes
                 .insert(entry.chunk.content_hash, entry.chunk.id.clone());
-            state.entries.push(entry);
+            state.entries.push(StoredEntry::from(entry));
         }
 
         state.dirty = true;

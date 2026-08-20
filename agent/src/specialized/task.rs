@@ -487,7 +487,9 @@ where
             agent_builder
         };
 
-        let mut agent = agent_builder.build();
+        let mut agent = agent_builder
+            .build()
+            .map_err(|err| anyhow::anyhow!("subagent '{subagent_id}' is misconfigured: {err}"))?;
 
         // Run the subagent with the prompt
         let result = agent

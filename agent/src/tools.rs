@@ -2,7 +2,7 @@
 //!
 //! All registered tools are always loaded into the LLM context.
 
-use aither_core::llm::tool::{Tool, ToolDefinition, ToolOutput, Tools as CoreTools};
+use aither_core::llm::tool::{RegisterError, Tool, ToolDefinition, ToolOutput, Tools as CoreTools};
 #[cfg(feature = "mcp")]
 use aither_mcp::{McpConnection, McpToolService};
 
@@ -46,15 +46,28 @@ impl AgentTools {
     }
 
     /// Registers an eager (always-loaded) tool.
-    pub fn register<T: Tool + 'static>(&mut self, tool: T) {
-        self.eager.register(tool);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegisterError`] if the name collides with a tool that is
+    /// already registered, or the tool has no description for the model to
+    /// read.
+    pub fn register<T: Tool + 'static>(&mut self, tool: T) -> Result<(), RegisterError> {
+        self.eager.register(tool)
     }
 
     /// Registers a dynamic bash tool (type-erased).
     ///
     /// This is used for child bash tools in subagents where the concrete type
     /// is not known at compile time.
-    pub fn register_dyn_bash(&mut self, dyn_tool: aither_sandbox::DynBashTool) {
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Self::register`].
+    pub fn register_dyn_bash(
+        &mut self,
+        dyn_tool: aither_sandbox::DynBashTool,
+    ) -> Result<(), RegisterError> {
         use futures_core::Future;
         use std::pin::Pin;
 
@@ -67,7 +80,7 @@ impl AgentTools {
                     let result = handler(&args).await;
                     Ok(ToolOutput::text(result))
                 })
-            });
+            })
     }
 
     /// Returns definitions of all registered tools.
@@ -193,6 +206,7 @@ mod tests {
         name: String,
     }
 
+    /// Arguments for the dummy test tool.
     #[derive(Debug, JsonSchema, Deserialize)]
     struct DummyArgs {}
 
@@ -211,9 +225,11 @@ mod tests {
     #[test]
     fn test_register_eager() {
         let mut tools = AgentTools::new();
-        tools.register(DummyTool {
-            name: "test".to_string(),
-        });
+        tools
+            .register(DummyTool {
+                name: "test".to_string(),
+            })
+            .expect("dummy tool should register");
 
         assert_eq!(tools.definitions().len(), 1);
     }

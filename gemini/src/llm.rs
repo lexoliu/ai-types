@@ -1,7 +1,7 @@
 use aither_core::{
     Error, LanguageModel,
     llm::{
-        Event, LLMRequest, Message, Role, Usage,
+        Event, GenerateError, LLMRequest, Message, Role, Usage,
         model::{Ability, Parameters, Profile, ReasoningEffort, ToolChoice},
         tool::ToolDefinition,
     },
@@ -39,7 +39,7 @@ impl LanguageModel for Gemini {
     fn generate<T: JsonSchema + DeserializeOwned + 'static>(
         &self,
         mut request: LLMRequest,
-    ) -> impl core::future::Future<Output = aither_core::Result<T>> + Send {
+    ) -> impl core::future::Future<Output = Result<T, GenerateError<Self::Error>>> + Send {
         let schema = schema_for!(T);
         let mut params = request.parameters().clone();
         params.structured_outputs = true;
@@ -48,9 +48,13 @@ impl LanguageModel for Gemini {
 
         let stream = self.respond(request);
         async move {
-            let text = aither_core::llm::collect_text(stream).await?;
-            serde_json::from_str::<T>(&text)
-                .map_err(|err| Error::new(err).context("failed to parse structured output"))
+            let text = aither_core::llm::collect_text(stream)
+                .await
+                .map_err(GenerateError::Provider)?;
+            serde_json::from_str::<T>(&text).map_err(|source| GenerateError::Parse {
+                source,
+                response: text.chars().take(500).collect(),
+            })
         }
     }
 

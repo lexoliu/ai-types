@@ -193,6 +193,7 @@ struct FoldedCode {
 }
 
 /// Mapping from magika `ContentType` label to tree-sitter language module.
+#[cfg(feature = "code-folding")]
 fn magika_label_to_ts_language(label: &str) -> Option<tree_sitter::Language> {
     match label {
         "bash" | "shell" => Some(rs_tree_sitter_languages::bash::language()),
@@ -256,6 +257,16 @@ fn is_foldable_node(kind: &str) -> bool {
 const MIN_FOLD_LINES: usize = 4;
 
 /// Try to detect source code via magika and fold it with tree-sitter.
+///
+/// Without the `code-folding` feature there is no content detector, so output
+/// is passed through uncompressed rather than mis-folded.
+#[cfg(not(feature = "code-folding"))]
+const fn try_fold_source_code(_text: &str) -> Option<FoldedCode> {
+    None
+}
+
+/// Try to detect source code via magika and fold it with tree-sitter.
+#[cfg(feature = "code-folding")]
 fn try_fold_source_code(text: &str) -> Option<FoldedCode> {
     // Use magika to identify content type
     let mut session = magika::Session::new().ok()?;

@@ -144,7 +144,7 @@ where
         for attempt in 0..MAX_RETRIES {
             match self.provider.search(&arguments.query, limit).await {
                 Ok(results) if !results.is_empty() => {
-                    return Ok(ToolOutput::text(json(&results)));
+                    return Ok(ToolOutput::text(json(&results)?));
                 }
                 Ok(_empty) if attempt < MAX_RETRIES - 1 => {
                     // Empty results, retry after delay
@@ -152,7 +152,7 @@ where
                 }
                 Ok(empty) => {
                     // Final attempt still empty, return empty results
-                    return Ok(ToolOutput::text(json(&empty)));
+                    return Ok(ToolOutput::text(json(&empty)?));
                 }
                 Err(e) if is_non_retryable(&e) => {
                     // Non-retryable error (e.g., CAPTCHA), fail immediately

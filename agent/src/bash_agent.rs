@@ -44,7 +44,7 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::hook::Hook;
-use crate::{Agent, AgentBuilder, config::AgentKind};
+use crate::{Agent, AgentBuilder, builder::BuildError, config::AgentKind};
 use aither_sandbox::builtin::{InputTerminalTool, KillTerminalTool};
 use aither_sandbox::{
     BashTool, BashToolFactory, BashToolFactoryReceiver, ContainerExec, ListSshTool, OpenSshTool,
@@ -703,7 +703,11 @@ where
     ///
     /// The returned agent only has the `bash` tool.
     /// All registered IPC tools are accessible as bash commands.
-    pub fn build(self) -> Agent<LLM, LLM, LLM, H> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BuildError`] if the bash tool could not be registered.
+    pub fn build(self) -> Result<Agent<LLM, LLM, LLM, H>, BuildError> {
         // Build registry
         let registry =
             std::sync::Arc::new(self.registry_builder.build(self.bash_tool.outputs_dir()));

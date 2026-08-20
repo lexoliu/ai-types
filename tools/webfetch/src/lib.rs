@@ -47,6 +47,8 @@
 //! # }
 //! ```
 
+pub mod guard;
+
 use std::borrow::Cow;
 use std::io::Cursor;
 use std::time::{Duration, Instant};
@@ -460,6 +462,7 @@ pub async fn fetch(url: &str) -> Result<FetchResult> {
 /// Fetch using an explicit request object.
 pub async fn fetch_with_request(request: FetchRequest) -> Result<FetchResult> {
     ensure_rustls_provider();
+    guard::guard_url(&request.url).await?;
     let mut ctx = FetchContext::new(request.deadline);
 
     let pipeline = default_fetcher();
@@ -479,6 +482,7 @@ pub async fn fetch_with_request(request: FetchRequest) -> Result<FetchResult> {
 #[cfg(feature = "headless")]
 pub async fn fetch_with_browser(url: &str) -> Result<FetchResult> {
     ensure_rustls_provider();
+    guard::guard_url(url).await?;
     let mut ctx = FetchContext::new(DEFAULT_TOTAL_BUDGET);
     HeadlessFetcher
         .fetch(&FetchRequest::new(url), &mut ctx)
@@ -489,6 +493,7 @@ pub async fn fetch_with_browser(url: &str) -> Result<FetchResult> {
 /// Fetches raw HTML using a headless browser (for debugging).
 #[cfg(feature = "headless")]
 pub async fn fetch_html_raw(url: &str) -> Result<String> {
+    guard::guard_url(url).await?;
     fetch_html_headless(url).await
 }
 
@@ -649,6 +654,7 @@ fn get_user_agent(url: &str) -> &'static str {
 
 /// Fetches raw bytes from a URL with browser-like headers.
 async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
+    guard::guard_url(url).await?;
     let user_agent = get_user_agent(url);
 
     let mut backend = client();

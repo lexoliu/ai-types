@@ -470,6 +470,7 @@ version = "0.2.0"
 dependencies = [
  "aither-core",
  "anyhow",
+ "async-net",
  "chromiumoxide",
  "futures-lite",
  "htmd",
@@ -480,6 +481,7 @@ dependencies = [
  "rustls",
  "schemars 1.2.2",
  "serde",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-subscriber",
