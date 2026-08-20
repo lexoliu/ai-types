@@ -50,6 +50,7 @@
 pub mod guard;
 
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::io::Cursor;
 use std::time::{Duration, Instant};
 
@@ -1394,26 +1395,26 @@ impl Tool for WebFetchTool {
 
         let mut output = String::new();
         if let Some(title) = &result.title {
-            output.push_str(&format!("# {title}\n\n"));
+            let _ = writeln!(output, "# {title}\n");
         }
-        output.push_str(&format!("Source: {}\n\n", result.url));
+        let _ = writeln!(output, "Source: {}\n", result.url);
         if let Some(content_type) = &result.content_type {
-            output.push_str(&format!("Content-Type: {content_type}\n"));
+            let _ = writeln!(output, "Content-Type: {content_type}");
         }
         if let Some(markdown_tokens) = result.markdown_tokens {
-            output.push_str(&format!("X-Markdown-Tokens: {markdown_tokens}\n"));
+            let _ = writeln!(output, "X-Markdown-Tokens: {markdown_tokens}");
         }
         if let Some(content_signal) = &result.content_signal {
-            output.push_str(&format!("Content-Signal: {content_signal}\n"));
+            let _ = writeln!(output, "Content-Signal: {content_signal}");
         }
         if let Some(extractor) = &result.extractor {
-            output.push_str(&format!("Extractor: {extractor}\n"));
+            let _ = writeln!(output, "Extractor: {extractor}");
         }
         if let Some(quality_score) = result.quality_score {
-            output.push_str(&format!("Quality-Score: {quality_score:.2}\n"));
+            let _ = writeln!(output, "Quality-Score: {quality_score:.2}");
         }
         if !result.warnings.is_empty() {
-            output.push_str(&format!("Warnings: {}\n", result.warnings.join(" | ")));
+            let _ = writeln!(output, "Warnings: {}", result.warnings.join(" | "));
         }
         if result.content_type.is_some()
             || result.markdown_tokens.is_some()
@@ -1654,6 +1655,7 @@ mod headless_tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "Requires a Chromium install and network access."]
     async fn fetch_with_browser_works() {
         let result = fetch_with_browser("https://example.com").await;
         assert!(result.is_ok(), "Headless fetch failed: {:?}", result.err());
@@ -1663,6 +1665,7 @@ mod headless_tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires network access."]
     async fn smart_fetch_works() {
         let result = fetch_smart("https://example.com").await;
         assert!(result.is_ok(), "Smart fetch failed: {:?}", result.err());

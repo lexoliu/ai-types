@@ -4,6 +4,7 @@
 //! Designed to work like Claude Code's `TodoWrite` for tracking multi-step work.
 
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::sync::{Arc, RwLock};
 
 #[cfg(test)]
@@ -98,22 +99,38 @@ impl TodoList {
     }
 
     /// Returns all items in the list.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn items(&self) -> Vec<TodoItem> {
         self.items.read().unwrap().clone()
     }
 
     /// Replaces the entire todo list with new items.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     pub fn write(&self, items: Vec<TodoItem>) {
         *self.items.write().unwrap() = items;
     }
 
     /// Clears all tasks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     pub fn clear(&self) {
         self.items.write().unwrap().clear();
     }
 
     /// Returns the currently in-progress task, if any.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn current_task(&self) -> Option<TodoItem> {
         self.items
@@ -125,6 +142,10 @@ impl TodoList {
     }
 
     /// Returns a formatted summary of progress.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn progress_summary(&self) -> String {
         let items = self.items.read().unwrap();
@@ -149,11 +170,11 @@ impl TodoList {
         let mut summary = format!("Progress: {completed}/{total} completed");
         if in_progress > 0 {
             if let Some(current) = items.iter().find(|i| i.status == TodoStatus::InProgress) {
-                summary.push_str(&format!(" | Current: {}", current.active_form));
+                let _ = write!(summary, " | Current: {}", current.active_form);
             }
         }
         if pending > 0 {
-            summary.push_str(&format!(" | {pending} pending"));
+            let _ = write!(summary, " | {pending} pending");
         }
         summary
     }

@@ -74,8 +74,11 @@ impl<M> BudgetedModel<M> {
                 .fetch_add(u64::from(tokens), Ordering::Relaxed);
         }
         if let Some(cost) = usage.cost_usd {
-            // Convert to microdollars
-            let micro = (cost * 1_000_000.0) as u64;
+            // Convert to microdollars. Costs are small and non-negative, so
+            // saturating at zero and truncating the sub-microdollar remainder
+            // is the behaviour we want.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let micro = (cost * 1_000_000.0).max(0.0) as u64;
             self.cost_used_micro.fetch_add(micro, Ordering::Relaxed);
         }
     }
@@ -96,7 +99,8 @@ impl<M> BudgetedModel<M> {
             Budget::Unlimited => false,
             Budget::Tokens(limit) => self.tokens_used.load(Ordering::Relaxed) >= *limit,
             Budget::Cost(limit) => {
-                let micro_limit = (*limit * 1_000_000.0) as u64;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let micro_limit = (*limit * 1_000_000.0).max(0.0) as u64;
                 self.cost_used_micro.load(Ordering::Relaxed) >= micro_limit
             }
         }
@@ -111,7 +115,12 @@ impl<M> BudgetedModel<M> {
     /// Returns the current cost usage in USD.
     #[must_use]
     pub fn cost_used(&self) -> f64 {
-        self.cost_used_micro.load(Ordering::Relaxed) as f64 / 1_000_000.0
+        // Costs never approach 2^53 microdollars, so the conversion is exact
+        // in practice.
+        #[allow(clippy::cast_precision_loss)]
+        {
+            self.cost_used_micro.load(Ordering::Relaxed) as f64 / 1_000_000.0
+        }
     }
 
     /// Resets the usage counters (but not the exhausted flag).
@@ -162,6 +171,7 @@ impl<M> ModelGroup<M> {
     }
 
     /// Adds a fallback model to the group.
+    #[must_use]
     pub fn with_fallback(mut self, model: BudgetedModel<M>) -> Self {
         self.models.push(model);
         self

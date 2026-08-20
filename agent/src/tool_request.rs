@@ -25,6 +25,10 @@ impl<Args, Response> ToolRequest<Args, Response> {
     }
 
     /// Respond to the request without blocking the UI thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns the response back if the requester has already given up waiting.
     pub fn respond(self, response: Response) -> Result<(), async_channel::TrySendError<Response>> {
         self.response_tx.try_send(response)
     }
@@ -38,6 +42,11 @@ pub struct ToolRequestBroker<Args, Response> {
 
 impl<Args, Response> ToolRequestBroker<Args, Response> {
     /// Send a request and await the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the queue has been dropped, which means no UI is
+    /// listening for tool requests any more.
     pub async fn request(&self, args: Args) -> anyhow::Result<Response> {
         let (response_tx, response_rx) = async_channel::bounded(1);
         self.tx
@@ -82,6 +91,10 @@ pub fn channel<Args, Response>() -> (
 }
 
 /// Create a bounded request broker/queue pair with explicit backpressure.
+///
+/// # Panics
+///
+/// Panics if `capacity` is zero, which would deadlock every request.
 #[must_use]
 pub fn bounded_channel<Args, Response>(
     capacity: usize,
@@ -165,6 +178,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     ///
     /// The returned [`Receiver`] yields the response once [`respond`](Self::respond)
     /// is called with the matching ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request lock was poisoned by a panic in another thread.
     pub fn enqueue(&self, payload: P) -> (String, Receiver<R>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let (tx, rx) = async_channel::bounded(1);
@@ -182,6 +199,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     /// Respond to a pending request by ID.
     ///
     /// Returns `true` if the request was found and the response was sent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request lock was poisoned by a panic in another thread.
     pub fn respond(&self, id: &str, response: R) -> bool {
         let entry = {
             let mut inner = self.inner.lock().expect("RequestApprover lock poisoned");
@@ -200,6 +221,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     }
 
     /// Return the oldest pending request (ID + cloned payload) without removing it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn peek(&self) -> Option<(String, P)> {
         let inner = self.inner.lock().expect("RequestApprover lock poisoned");
@@ -209,6 +234,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     }
 
     /// Return the oldest pending request matching a predicate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn peek_filtered(&self, predicate: impl Fn(&P) -> bool) -> Option<(String, P)> {
         let inner = self.inner.lock().expect("RequestApprover lock poisoned");
@@ -223,6 +252,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     }
 
     /// Get a cloned payload by request ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn get_payload(&self, id: &str) -> Option<P> {
         let inner = self.inner.lock().expect("RequestApprover lock poisoned");
@@ -230,6 +263,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     }
 
     /// Returns `true` if there are no pending requests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         let inner = self.inner.lock().expect("RequestApprover lock poisoned");

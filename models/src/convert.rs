@@ -9,51 +9,74 @@ use serde::Deserialize;
 /// Raw `LiteLLM` entry as it appears in the JSON.
 #[derive(Debug, Deserialize)]
 pub struct RawLiteLLMEntry {
+    /// Provider slug as `LiteLLM` reports it.
     #[serde(default)]
     pub litellm_provider: Option<String>,
+    /// What the model does: `chat`, `embedding`, `image_generation`, and so on.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Largest prompt the model accepts, in tokens.
     #[serde(default)]
     pub max_input_tokens: Option<u32>,
+    /// Largest completion the model will produce, in tokens.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// Combined limit, used when the input/output split is unknown.
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// USD charged per input token.
     #[serde(default)]
     pub input_cost_per_token: Option<f64>,
+    /// USD charged per output token.
     #[serde(default)]
     pub output_cost_per_token: Option<f64>,
+    /// USD per input token served from the prompt cache.
     #[serde(default)]
     pub cache_read_input_token_cost: Option<f64>,
+    /// USD per input token written to the prompt cache.
     #[serde(default)]
     pub cache_creation_input_token_cost: Option<f64>,
+    /// USD per reasoning token, where billed separately.
     #[serde(default)]
     pub output_cost_per_reasoning_token: Option<f64>,
+    /// USD per audio input token.
     #[serde(default)]
     pub input_cost_per_audio_token: Option<f64>,
+    /// Date the provider retires the model, as `YYYY-MM-DD`.
     #[serde(default)]
     pub deprecation_date: Option<String>,
     // supports_* flags
+    /// Whether the model can call tools.
     #[serde(default)]
     pub supports_function_calling: Option<bool>,
+    /// Whether the model accepts images.
     #[serde(default)]
     pub supports_vision: Option<bool>,
+    /// Whether the model accepts audio.
     #[serde(default)]
     pub supports_audio_input: Option<bool>,
+    /// Whether the model can emit audio.
     #[serde(default)]
     pub supports_audio_output: Option<bool>,
+    /// Whether the model accepts video.
     #[serde(default)]
     pub supports_video_input: Option<bool>,
+    /// Whether the provider offers built-in web search.
     #[serde(default)]
     pub supports_web_search: Option<bool>,
+    /// Whether the model accepts PDFs directly.
     #[serde(default)]
     pub supports_pdf_input: Option<bool>,
+    /// Whether the model exposes reasoning or thinking output.
     #[serde(default)]
     pub supports_reasoning: Option<bool>,
+    /// Whether the model supports computer-use tooling.
     #[serde(default)]
     pub supports_computer_use: Option<bool>,
+    /// Whether the provider caches prompt prefixes.
     #[serde(default)]
     pub supports_prompt_caching: Option<bool>,
+    /// Whether an assistant turn may be prefilled.
     #[serde(default)]
     pub supports_assistant_prefill: Option<bool>,
 }
@@ -146,19 +169,33 @@ pub fn parse_mode(mode_str: &str) -> Option<&'static str> {
 /// Intermediate representation used by both build.rs and runtime.
 #[derive(Debug, Clone)]
 pub struct ConvertedEntry {
+    /// Model id exactly as `LiteLLM` keys it, provider prefix included.
     pub litellm_id: String,
+    /// Model id with the provider prefix stripped.
     pub canonical_id: String,
+    /// Canonical provider slug.
     pub provider: String,
+    /// What the model does, as a canonical mode string.
     pub mode: String,
+    /// Largest prompt the model accepts, in tokens.
     pub max_input_tokens: Option<u32>,
+    /// Largest completion the model produces, in tokens.
     pub max_output_tokens: Option<u32>,
+    /// USD per input token.
     pub input_cost_per_token: f64,
+    /// USD per output token.
     pub output_cost_per_token: f64,
+    /// USD per cached input token read.
     pub cache_read_per_token: Option<f64>,
+    /// USD per input token written to the cache.
     pub cache_write_per_token: Option<f64>,
+    /// USD per reasoning token, where billed separately.
     pub reasoning_per_token: Option<f64>,
+    /// USD per image token.
     pub image_per_token: Option<f64>,
+    /// Capability names this model advertises.
     pub abilities: Vec<&'static str>,
+    /// Retirement date, as `YYYY-MM-DD`.
     pub deprecation_date: Option<String>,
 }
 
@@ -231,6 +268,11 @@ pub fn convert_litellm_entry(key: &str, raw: &RawLiteLLMEntry) -> Option<Convert
 }
 
 /// Parse the full `LiteLLM` JSON blob and return converted entries.
+///
+/// # Panics
+///
+/// Panics if `json_bytes` is not a JSON object. The only caller supplies either
+/// the committed snapshot or a payload already validated by the caller.
 #[must_use]
 pub fn parse_litellm_json(json_bytes: &[u8]) -> Vec<ConvertedEntry> {
     let map: serde_json::Map<String, serde_json::Value> =

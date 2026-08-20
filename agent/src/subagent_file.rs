@@ -85,12 +85,20 @@ impl SubagentDefinition {
     }
 
     /// Load a subagent definition from a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read.
     pub fn from_file(path: impl AsRef<Path>) -> std::io::Result<Option<Self>> {
         let content = std::fs::read_to_string(path)?;
         Ok(Self::parse(&content))
     }
 
     /// Load a subagent definition from a file asynchronously.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read.
     pub async fn from_file_async(path: impl AsRef<Path>) -> std::io::Result<Option<Self>> {
         let content = fs::read_to_string(path).await?;
         Ok(Self::parse(&content))
@@ -98,7 +106,12 @@ impl SubagentDefinition {
 
     /// Load all subagent definitions from a directory.
     ///
-    /// Looks for `.md` files in the directory.
+    /// Looks for `.md` files in the directory. A missing directory yields an
+    /// empty list rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory exists but cannot be read.
     pub fn load_from_dir(dir: impl AsRef<Path>) -> std::io::Result<Vec<Self>> {
         let mut definitions = Vec::new();
 
@@ -121,6 +134,12 @@ impl SubagentDefinition {
     }
 
     /// Load all subagent definitions from a directory asynchronously.
+    ///
+    /// A missing directory yields an empty list rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory exists but cannot be read.
     pub async fn load_from_dir_async(dir: impl AsRef<Path>) -> std::io::Result<Vec<Self>> {
         let mut definitions = Vec::new();
         let dir = dir.as_ref();

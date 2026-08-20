@@ -1,6 +1,7 @@
 //! Smart context compression for managing conversation history.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 use aither_core::{LanguageModel, llm::Message};
 
@@ -52,6 +53,9 @@ impl Default for SmartCompressionConfig {
 }
 
 /// Configuration for what content to preserve during compression.
+// Each flag is an independent, orthogonal preservation choice; grouping them
+// into an enum would not describe the domain any better.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct PreserveConfig {
     /// Keep file paths verbatim.
@@ -114,7 +118,12 @@ pub const fn estimate_tokens(content: &str) -> usize {
 #[must_use]
 pub fn estimate_context_usage(messages: &[Message], context_window: usize) -> f32 {
     let message_tokens: usize = messages.iter().map(|m| estimate_tokens(m.content())).sum();
-    message_tokens as f32 / context_window as f32
+    // Token counts are far below f32's exact-integer range, and this is a
+    // rough usage fraction rather than an accounting figure.
+    #[allow(clippy::cast_precision_loss)]
+    {
+        message_tokens as f32 / context_window as f32
+    }
 }
 
 // Prompt templates loaded from files
@@ -239,6 +248,9 @@ impl SmartCompressionConfig {
                 format!("- Running background jobs:\n{jobs}")
             });
 
+        // The braces below are template placeholders for `str::replace`, not
+        // format arguments.
+        #[allow(clippy::literal_string_with_formatting_args)]
         let prompt = COMPRESSION_USER_TEMPLATE
             .replace("{file_paths}", &preserved.file_paths.join(", "))
             .replace("{errors}", &preserved.errors.join("\n"))
@@ -288,6 +300,9 @@ impl SmartCompressionConfig {
                 format!("- Running background jobs:\n{jobs}")
             });
 
+        // The braces below are template placeholders for `str::replace`, not
+        // format arguments.
+        #[allow(clippy::literal_string_with_formatting_args)]
         let prompt = COMPRESSION_URLS_TEMPLATE
             .replace("{content_with_urls}", &content_with_urls)
             .replace("{file_paths}", &preserved.file_paths.join(", "))
@@ -429,10 +444,10 @@ fn format_content_with_urls(messages: &[Message], pending_urls: &[ContentWithUrl
 
         if let Some(url_info) = url {
             // Format with URL header
-            output.push_str(&format!("### [URL: {}]\n{}\n\n", url_info.url, content));
+            let _ = writeln!(output, "### [URL: {}]\n{}\n", url_info.url, content);
         } else {
             // Format without URL (inline content)
-            output.push_str(&format!("### [Inline - {:?}]\n{}\n\n", msg.role(), content));
+            let _ = writeln!(output, "### [Inline - {:?}]\n{}\n", msg.role(), content);
         }
     }
 

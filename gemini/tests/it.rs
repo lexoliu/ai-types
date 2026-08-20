@@ -21,6 +21,7 @@ fn api_key() -> String {
 }
 
 #[tokio::test]
+#[ignore = "Requires external Gemini API quota and network access."]
 async fn test_provider_list_models() {
     let provider = GeminiProvider::new(api_key());
     let models = provider.list_models().await.expect("Failed to list models");

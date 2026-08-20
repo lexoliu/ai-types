@@ -1,14 +1,12 @@
 //! Build script that fetches `LiteLLM` model data and generates a static registry.
 
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
 #[path = "src/convert.rs"]
 mod convert;
-
-const LITELLM_URL: &str =
-    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 
 fn main() {
     println!("cargo::rerun-if-changed=data/litellm_snapshot.json");
@@ -17,18 +15,16 @@ fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let snapshot_path = Path::new(&manifest_dir).join("data/litellm_snapshot.json");
 
-    // Try network fetch, fall back to snapshot
-    let json_bytes = if let Some(bytes) = try_fetch_litellm() {
-        bytes
-    } else {
-        eprintln!("cargo:warning=Using offline LiteLLM snapshot");
-        fs::read(&snapshot_path).unwrap_or_else(|e| {
-            panic!(
-                "Failed to read LiteLLM snapshot at {}: {e}",
-                snapshot_path.display()
-            )
-        })
-    };
+    // Read the committed snapshot only. Fetching at build time would make the
+    // generated registry depend on when the build ran rather than on the
+    // commit, and would fail in sandboxed or offline builds. The snapshot is
+    // refreshed by the `update-models` workflow, which opens a pull request.
+    let json_bytes = fs::read(&snapshot_path).unwrap_or_else(|e| {
+        panic!(
+            "Failed to read LiteLLM snapshot at {}: {e}",
+            snapshot_path.display()
+        )
+    });
 
     let entries = convert::parse_litellm_json(&json_bytes);
 
@@ -37,18 +33,6 @@ fn main() {
 
     let code = generate_registry_code(&entries);
     fs::write(&out_path, code).expect("Failed to write generated.rs");
-}
-
-fn try_fetch_litellm() -> Option<Vec<u8>> {
-    // Only attempt network fetch if not in offline mode
-    if env::var("CARGO_NET_OFFLINE").as_deref() == Ok("true") {
-        return None;
-    }
-
-    let agent = ureq::Agent::new_with_defaults();
-    let response = agent.get(LITELLM_URL).call().ok()?;
-    let body = response.into_body().read_to_vec().ok()?;
-    Some(body)
 }
 
 fn generate_registry_code(entries: &[convert::ConvertedEntry]) -> String {
@@ -71,29 +55,30 @@ fn generate_registry_code(entries: &[convert::ConvertedEntry]) -> String {
         let mode_expr = mode_to_expr(&entry.mode);
 
         code.push_str("    ModelEntry::new_static(\n");
-        code.push_str(&format!("        {:?},\n", entry.litellm_id));
-        code.push_str(&format!("        {:?},\n", entry.canonical_id));
-        code.push_str(&format!("        {provider_expr},\n"));
-        code.push_str(&format!("        {mode_expr},\n"));
-        code.push_str(&format!("        {:?},\n", entry.max_input_tokens));
-        code.push_str(&format!("        {:?},\n", entry.max_output_tokens));
+        let _ = writeln!(code, "        {:?},", entry.litellm_id);
+        let _ = writeln!(code, "        {:?},", entry.canonical_id);
+        let _ = writeln!(code, "        {provider_expr},");
+        let _ = writeln!(code, "        {mode_expr},");
+        let _ = writeln!(code, "        {:?},", entry.max_input_tokens);
+        let _ = writeln!(code, "        {:?},", entry.max_output_tokens);
 
         // Pricing
-        code.push_str(&format!(
+        let _ = write!(
+            code,
             "        Pricing::new({:?}, {:?})",
             entry.input_cost_per_token, entry.output_cost_per_token
-        ));
+        );
         if let Some(cr) = entry.cache_read_per_token {
-            code.push_str(&format!(".with_cache_read({cr:?})"));
+            let _ = write!(code, ".with_cache_read({cr:?})");
         }
         if let Some(cw) = entry.cache_write_per_token {
-            code.push_str(&format!(".with_cache_write({cw:?})"));
+            let _ = write!(code, ".with_cache_write({cw:?})");
         }
         if let Some(r) = entry.reasoning_per_token {
-            code.push_str(&format!(".with_reasoning({r:?})"));
+            let _ = write!(code, ".with_reasoning({r:?})");
         }
         if let Some(i) = entry.image_per_token {
-            code.push_str(&format!(".with_image({i:?})"));
+            let _ = write!(code, ".with_image({i:?})");
         }
         code.push_str(",\n");
 
@@ -103,11 +88,13 @@ fn generate_registry_code(entries: &[convert::ConvertedEntry]) -> String {
             .iter()
             .map(|a| format!("Ability::{a}"))
             .collect();
-        code.push_str(&format!("        &[{}],\n", abilities_str.join(", ")));
+        let _ = writeln!(code, "        &[{}],", abilities_str.join(", "));
 
         // Deprecation date
         match &entry.deprecation_date {
-            Some(d) => code.push_str(&format!("        Some({d:?}),\n")),
+            Some(d) => {
+                let _ = writeln!(code, "        Some({d:?}),");
+            }
             None => code.push_str("        None,\n"),
         }
 
@@ -144,7 +131,6 @@ fn provider_to_expr(provider: &str) -> String {
 
 fn mode_to_expr(mode: &str) -> &'static str {
     match mode {
-        "chat" => "ModelMode::Chat",
         "embedding" => "ModelMode::Embedding",
         "image_generation" => "ModelMode::ImageGeneration",
         "audio_transcription" => "ModelMode::AudioTranscription",
@@ -155,6 +141,7 @@ fn mode_to_expr(mode: &str) -> &'static str {
         "video_generation" => "ModelMode::VideoGeneration",
         "search" => "ModelMode::Search",
         "ocr" => "ModelMode::Ocr",
+        // "chat" and anything unrecognised both map to the chat mode.
         _ => "ModelMode::Chat",
     }
 }

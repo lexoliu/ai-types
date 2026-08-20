@@ -22,6 +22,7 @@
 use crate::{SearchProvider, SearchResult};
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
+use std::fmt::Write as _;
 use zenwave::{Client, client, header};
 
 fn ensure_rustls_provider() {
@@ -88,7 +89,7 @@ impl SearchProvider for SearXNG {
         );
 
         if let Some(ref engines) = self.engines {
-            url.push_str(&format!("&engines={engines}"));
+            let _ = write!(url, "&engines={engines}");
         }
 
         let mut backend = client();
@@ -156,6 +157,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "Queries a live SearXNG instance; requires network access."]
     async fn search_returns_results() {
         let provider = SearXNG::default();
         let results = provider.search("rust programming language", 5).await;
@@ -170,6 +172,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Queries a live SearXNG instance; requires network access."]
     async fn search_unicode_query() {
         let provider = SearXNG::default();
         // Test with unicode characters (Japanese: "weather forecast")

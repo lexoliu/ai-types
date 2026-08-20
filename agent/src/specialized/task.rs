@@ -63,7 +63,7 @@ impl<LLM> std::fmt::Debug for SubagentType<LLM> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubagentType")
             .field("description", &self.description)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -156,7 +156,7 @@ impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
         f.debug_struct("SubagentTool")
             .field("type_names", &type_names)
             .field("base_dir", &self.base_dir)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

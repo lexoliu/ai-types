@@ -102,7 +102,7 @@ impl<Advanced, Balanced, Fast, H> std::fmt::Debug for AgentBuilder<Advanced, Bal
             .field("tier", &self.tier)
             .field("config", &self.config)
             .field("todo_enabled", &self.todo_list.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -496,7 +496,7 @@ where
             fast_profile: None,
             initialized: false,
             todo_list: self.todo_list,
-            output_store: self.output_store,
+            _output_store: self.output_store,
             background_receiver: self.background_receiver,
             job_registry: self.job_registry,
             transcript: self.transcript,

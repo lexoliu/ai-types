@@ -4,6 +4,7 @@
 //! It manages conversation memory, applies context compression, and
 //! handles tool execution in an agent-controlled loop.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -161,7 +162,10 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     pub(crate) todo_list: Option<TodoList>,
 
     /// Output store for lazy URL allocation during compression.
-    pub(crate) output_store: Option<Arc<OutputStore>>,
+    ///
+    /// Held so the store outlives the bash tool that writes into it; the agent
+    /// itself only needs to keep it alive.
+    pub(crate) _output_store: Option<Arc<OutputStore>>,
 
     /// Receiver for completed background bash tasks.
     pub(crate) background_receiver: Option<BackgroundTaskReceiver>,
@@ -174,6 +178,15 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Optional sandbox directory for working-doc supervision (TODO.md/PLAN.md).
     pub(crate) sandbox_dir: Option<PathBuf>,
 }
+
+/// A finished tool call: its id, the tool's name, and either its output or the
+/// error text it failed with.
+type ToolOutcome = (String, String, Result<String, String>);
+
+/// How long to wait for outstanding background bash tasks before giving up.
+const MAX_WAIT: Duration = Duration::from_secs(300);
+/// How often to check whether a background task has finished.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
     /// Creates a new agent with default configuration.
@@ -202,7 +215,7 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             fast_profile: None,
             initialized: false,
             todo_list: None,
-            output_store: None,
+            _output_store: None,
             background_receiver: None,
             job_registry: None,
             transcript: None,
@@ -213,7 +226,6 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
 
 impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
     /// Returns a builder for more complex agent construction.
-    #[must_use]
     pub fn builder(llm: LLM) -> crate::builder::AgentBuilder<LLM, LLM, LLM, ()> {
         crate::builder::AgentBuilder::new(llm)
     }
@@ -278,7 +290,6 @@ where
     ///     }
     /// }
     /// ```
-    #[must_use]
     pub fn run(
         &mut self,
         prompt: &str,
@@ -302,7 +313,6 @@ where
 
             // Run the tool loop
             let mut iteration = 0;
-            let mut all_text_chunks: Vec<String> = Vec::new();
 
             let final_text = loop {
                 iteration += 1;
@@ -448,7 +458,6 @@ where
                 }
 
                 let response_text = text_chunks.join("");
-                all_text_chunks.extend(text_chunks);
 
                 // If no tool calls, we're done unless working-doc supervision requires continuation.
                 if tool_calls.is_empty() {
@@ -560,7 +569,7 @@ where
                 });
 
                 // Wait for all tool calls to complete
-                let results: Vec<Result<(String, String, Result<String, String>), AgentError>> =
+                let results: Vec<Result<ToolOutcome, AgentError>> =
                     futures::future::join_all(tool_futures).await;
 
                 // Check if todo tool was called
@@ -596,11 +605,11 @@ where
                     {
                         has_tool_error = true;
                     }
-                    let processed_content = self.process_reload_marker(content);
+                    let processed_content = Self::process_reload_marker(content);
                     self.context.push(Message::tool(&call_id, processed_content));
                     if is_bash_call
                         && tool_result.is_ok()
-                        && let Some(reminder) = self.format_background_started_reminder(content)
+                        && let Some(reminder) = Self::format_background_started_reminder(content)
                     {
                         self.context.push(Message::system(reminder));
                     }
@@ -644,7 +653,7 @@ where
                     let completed_tasks = receiver.take_completed();
                     for task in completed_tasks {
                         tracing::info!(task_id = %task.task_id, "background task completed");
-                        let result_msg = self.format_background_task_result(&task);
+                        let result_msg = Self::format_background_task_result(&task);
                         self.context.push(Message::system(&result_msg));
                     }
                 }
@@ -656,18 +665,16 @@ where
                 let mut had_completed = !completed_tasks.is_empty();
                 for task in completed_tasks {
                     tracing::info!(task_id = %task.task_id, "background task completed (final check)");
-                    let result_msg = self.format_background_task_result(&task);
+                    let result_msg = Self::format_background_task_result(&task);
                     self.context.push(Message::system(&result_msg));
                 }
 
-                const MAX_WAIT: Duration = Duration::from_secs(300);
-                const POLL_INTERVAL: Duration = Duration::from_millis(100);
                 let start = Instant::now();
 
                 while start.elapsed() < MAX_WAIT {
                     if let Some(task) = receiver.recv_timeout(POLL_INTERVAL).await {
                         tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
-                        let result_msg = self.format_background_task_result(&task);
+                        let result_msg = Self::format_background_task_result(&task);
                         self.context.push(Message::system(&result_msg));
                         had_completed = true;
                     } else {
@@ -714,8 +721,16 @@ where
     }
 
     /// Registers a tool for the agent to use.
-    pub fn register_tool<T: aither_core::llm::Tool + 'static>(&mut self, tool: T) {
-        self.tools.register(tool);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegisterError`](aither_core::llm::tool::RegisterError) if the
+    /// name collides with a registered tool, or the tool has no description.
+    pub fn register_tool<T: aither_core::llm::Tool + 'static>(
+        &mut self,
+        tool: T,
+    ) -> Result<(), aither_core::llm::tool::RegisterError> {
+        self.tools.register(tool)
     }
 
     /// Returns a reference to the unified context manager.
@@ -777,10 +792,10 @@ where
 
     /// Generates a structured handoff summary using the current tier model.
     async fn generate_handoff_summary(&self, focus: Option<&str>) -> Result<String, AgentError> {
-        let focus_instruction = match focus.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(f) => format!("Focus the handoff on: {f}"),
-            None => "No additional focus hint was provided.".to_string(),
-        };
+        let focus_instruction = focus.map(str::trim).filter(|s| !s.is_empty()).map_or_else(
+            || "No additional focus hint was provided.".to_string(),
+            |f| format!("Focus the handoff on: {f}"),
+        );
 
         let transcript_path = self
             .transcript
@@ -789,6 +804,9 @@ where
             .or_else(|| self.config.transcript_path.clone())
             .unwrap_or_else(|| "transcript.md".to_string());
 
+        // The braces below are template placeholders for `str::replace`, not
+        // format arguments.
+        #[allow(clippy::literal_string_with_formatting_args)]
         let handoff_prompt = include_str!("prompts/compact_handoff.txt")
             .replace("{focus_instruction}", &focus_instruction)
             .replace("{transcript_path}", &transcript_path);
@@ -1038,7 +1056,7 @@ where
         let mut note = String::new();
         note.push_str(&self.config.context_assembler.handoff_instruction);
         if let Some(path) = &self.config.transcript_path {
-            note.push_str(&format!(" Transcript source: {path}."));
+            let _ = write!(note, " Transcript source: {path}.");
         }
         Some(note)
     }
@@ -1210,12 +1228,12 @@ where
                     Ok(content) => content,
                     Err(error) => error,
                 };
-                let processed_content = self.process_reload_marker(content);
+                let processed_content = Self::process_reload_marker(content);
                 self.context
                     .push(Message::tool(&call_id, processed_content));
                 if is_bash_call
                     && tool_result.is_ok()
-                    && let Some(reminder) = self.format_background_started_reminder(content)
+                    && let Some(reminder) = Self::format_background_started_reminder(content)
                 {
                     self.context.push(Message::system(reminder));
                 }
@@ -1224,7 +1242,7 @@ where
             if let Some(ref receiver) = self.background_receiver {
                 let completed_tasks = receiver.take_completed();
                 for task in completed_tasks {
-                    let result_msg = self.format_background_task_result(&task);
+                    let result_msg = Self::format_background_task_result(&task);
                     self.context.push(Message::system(&result_msg));
                 }
             }
@@ -1281,7 +1299,7 @@ where
     /// Processes a tool result (currently passthrough).
     ///
     /// Previously handled reload markers, now just returns the content as-is.
-    fn process_reload_marker(&self, result: &str) -> String {
+    fn process_reload_marker(result: &str) -> String {
         result.to_string()
     }
 
@@ -1315,7 +1333,7 @@ where
     }
 
     /// Formats a reminder when `bash` has been auto-promoted to background.
-    fn format_background_started_reminder(&self, tool_content: &str) -> Option<String> {
+    fn format_background_started_reminder(tool_content: &str) -> Option<String> {
         let payload: serde_json::Value = serde_json::from_str(tool_content).ok()?;
         let status = payload.get("status")?.as_str()?;
         if status != "running" {
@@ -1348,7 +1366,7 @@ where
     }
 
     /// Formats a completed background task result as a system message.
-    fn format_background_task_result(&self, task: &aither_sandbox::CompletedTask) -> String {
+    fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String {
         let mut msg = format!(
             "<background-bash-result task_id=\"{}\">\nScript: {}\n",
             task.task_id,
@@ -1357,7 +1375,7 @@ where
 
         match &task.result {
             Ok(result) => {
-                msg.push_str(&format!("Exit code: {}\n", result.exit_code));
+                let _ = writeln!(msg, "Exit code: {}", result.exit_code);
                 // Format stdout
                 let stdout_str = result.stdout.to_string();
                 if !stdout_str.is_empty() {
@@ -1380,7 +1398,7 @@ where
                 }
             }
             Err(e) => {
-                msg.push_str(&format!("Error: {e}\n"));
+                let _ = writeln!(msg, "Error: {e}");
             }
         }
 

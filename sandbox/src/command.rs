@@ -29,6 +29,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -1445,9 +1446,9 @@ pub fn schema_to_help(schema: &Value) -> String {
 
             for variant in variants {
                 if let Some(name) = get_variant_name(variant, &tag) {
-                    help.push_str(&format!("  {name}"));
+                    let _ = write!(help, "  {name}");
                     if let Some(desc) = variant.get("description").and_then(Value::as_str) {
-                        help.push_str(&format!(" - {desc}"));
+                        let _ = write!(help, " - {desc}");
                     }
                     help.push('\n');
                 }
@@ -1494,7 +1495,7 @@ pub fn schema_to_help(schema: &Value) -> String {
             usage_parts.push(r.clone());
         }
         usage_parts.push("[options]".to_string());
-        help.push_str(&format!("  {}\n", usage_parts.join(" ")));
+        let _ = writeln!(help, "  {}", usage_parts.join(" "));
 
         help.push_str("\nOptions:\n  -h, --help  Show help\n");
         help.push_str("\nArguments:\n");
@@ -1507,9 +1508,9 @@ pub fn schema_to_help(schema: &Value) -> String {
             let flag = name.replace('_', "-");
 
             if let Some(short) = field_to_short.get(name) {
-                help.push_str(&format!("  -{short}, --{flag}"));
+                let _ = write!(help, "  -{short}, --{flag}");
             } else {
-                help.push_str(&format!("  --{flag}"));
+                let _ = write!(help, "  --{flag}");
             }
             if is_array {
                 help.push_str(" <value>  (repeatable");
@@ -1522,7 +1523,7 @@ pub fn schema_to_help(schema: &Value) -> String {
             }
 
             if let Some(desc) = prop.get("description").and_then(Value::as_str) {
-                help.push_str(&format!("\n      {desc}"));
+                let _ = write!(help, "\n      {desc}");
             }
             help.push('\n');
         }

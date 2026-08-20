@@ -5,6 +5,7 @@
 //!
 //! See: <https://ai.google.dev/api/files>
 
+use std::fmt::Write as _;
 use std::time::{Duration, SystemTime};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -252,10 +253,10 @@ pub async fn list_files(
     let mut url = cfg.endpoint("files");
 
     if let Some(size) = page_size {
-        url.push_str(&format!("&pageSize={size}"));
+        let _ = write!(url, "&pageSize={size}");
     }
     if let Some(token) = page_token {
-        url.push_str(&format!("&pageToken={token}"));
+        let _ = write!(url, "&pageToken={token}");
     }
 
     let mut backend = client();

@@ -111,6 +111,9 @@ impl core::fmt::Display for Provider {
 }
 
 /// Per-token pricing information (USD).
+// Every field is a per-token rate, so the shared suffix is the point rather
+// than redundant.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Pricing {
     input_per_token: f64,
