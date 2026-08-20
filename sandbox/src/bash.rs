@@ -169,12 +169,16 @@ pub struct BashArgs {
     pub raw: bool,
 }
 
+/// Where and under what restrictions a bash script runs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BashExecutionMode {
+    /// Inside the sandbox, escalating to network mode only when needed.
     #[default]
     Default,
+    /// Outside the sandbox, on the host. Requires explicit approval.
     Unsafe,
+    /// On a remote host over SSH.
     Ssh,
 }
 
@@ -290,12 +294,13 @@ impl std::fmt::Debug for BackgroundTaskReceiver {
 }
 
 /// Factory for creating child bash tools asynchronously.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BashToolFactory {
     tx: Sender<Sender<crate::command::DynBashTool>>,
 }
 
 /// Receiver that serves bash tool creation requests.
+#[derive(Debug)]
 pub struct BashToolFactoryReceiver {
     rx: Receiver<Sender<crate::command::DynBashTool>>,
 }
@@ -361,7 +366,7 @@ impl BashToolFactoryReceiver {
 pub struct Unconfigured;
 
 /// Marker type for a bash tool with a configured registry.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Configured {
     registry: Arc<ToolRegistry>,
 }
@@ -465,7 +470,9 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
 
         Ok(Self {
             working_dir: working_dir_path,
-            shell_sessions: ShellSessionRegistry::new(Default::default()),
+            shell_sessions: ShellSessionRegistry::new(
+                crate::shell_session::ShellRuntimeAvailability::default(),
+            ),
             permission_handler: Arc::new(permission_handler),
             executor,
             output_store,
@@ -512,7 +519,9 @@ impl<P, E: Executor + Clone + 'static> BashTool<P, E, Unconfigured> {
 
         Ok(Self {
             working_dir: working_dir_path,
-            shell_sessions: ShellSessionRegistry::new(Default::default()),
+            shell_sessions: ShellSessionRegistry::new(
+                crate::shell_session::ShellRuntimeAvailability::default(),
+            ),
             permission_handler: Arc::new(permission_handler),
             executor,
             output_store,
@@ -552,6 +561,7 @@ where
     /// Adds additional writable paths to the sandbox configuration.
     ///
     /// These paths will be writable in sandboxed and network modes.
+    #[must_use]
     pub fn with_writable_paths(
         mut self,
         paths: impl IntoIterator<Item = impl Into<PathBuf>>,
@@ -565,6 +575,7 @@ where
     ///
     /// These paths will be readable in all sandbox modes, even in strict
     /// filesystem mode where reads outside the sandbox are normally denied.
+    #[must_use]
     pub fn with_readable_paths(
         mut self,
         paths: impl IntoIterator<Item = impl Into<PathBuf>>,
@@ -581,6 +592,7 @@ where
     /// - Share the same working directory and output store
     /// - Share the same permission handler (security policies enforced consistently)
     /// - Have independent completion channels (no message mixup)
+    #[must_use]
     pub fn child(&self) -> Self {
         let (completed_tx, completed_rx) = async_channel::unbounded();
         Self {
@@ -1584,7 +1596,7 @@ struct ContainerIpcBridge {
 }
 
 impl ContainerIpcBridge {
-    fn port(&self) -> u16 {
+    const fn port(&self) -> u16 {
         self.port
     }
 
@@ -1739,7 +1751,7 @@ async fn handle_container_ipc_connection(
             continue;
         }
 
-        let method = std::str::from_utf8(&body[1..1 + method_length])
+        let method = std::str::from_utf8(&body[1..=method_length])
             .map_err(|e| format!("invalid IPC method name utf8: {e}"))?;
         let params = &body[1 + method_length..];
         let cli_args = decode_container_ipc_args(params)?;
@@ -1810,7 +1822,7 @@ async fn write_container_ipc_response(
         .await
         .map_err(|e| format!("failed to write IPC response length: {e}"))?;
     stream
-        .write_all(&[if success { 1 } else { 0 }])
+        .write_all(&[u8::from(success)])
         .await
         .map_err(|e| format!("failed to write IPC success flag: {e}"))?;
     stream

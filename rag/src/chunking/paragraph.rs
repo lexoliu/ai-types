@@ -159,9 +159,9 @@ mod tests {
         let chunks = chunker.chunk(&doc).unwrap();
 
         assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].text.contains("a"));
-        assert!(chunks[0].text.contains("b"));
-        assert!(chunks[0].text.contains("c"));
+        assert!(chunks[0].text.contains('a'));
+        assert!(chunks[0].text.contains('b'));
+        assert!(chunks[0].text.contains('c'));
     }
 
     #[test]

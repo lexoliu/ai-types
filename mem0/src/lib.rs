@@ -270,12 +270,14 @@ where
             .await
     }
 
+    #[must_use]
     pub fn add_fact_tool(&self) -> AddFactTool<L, E, S> {
         AddFactTool {
             inner: self.clone(),
         }
     }
 
+    #[must_use]
     pub fn search_tool(&self) -> SearchTool<L, E, S> {
         SearchTool {
             inner: self.clone(),
@@ -300,7 +302,7 @@ where
             .collect::<Vec<_>>()
             .join("\n");
 
-        Ok(format!("Relevant Memories:\n{}", formatted))
+        Ok(format!("Relevant Memories:\n{formatted}"))
     }
 
     async fn extract_facts(&self, messages: &[Message]) -> Result<Vec<String>> {
@@ -316,8 +318,7 @@ where
         let request = LLMRequest::new(vec![
             Message::system(system_prompt),
             Message::user(format!(
-                "Extract facts from the following conversation:\n\n{}",
-                context
+                "Extract facts from the following conversation:\n\n{context}"
             )),
         ]);
 
@@ -344,8 +345,7 @@ where
         let system_prompt = include_str!("../prompts/manager.txt");
 
         let user_prompt = format!(
-            "New Fact: {}\n\nExisting Memories:\n{}\n\nDecide the operation.",
-            fact, memories_context
+            "New Fact: {fact}\n\nExisting Memories:\n{memories_context}\n\nDecide the operation."
         );
 
         let request = LLMRequest::new(vec![

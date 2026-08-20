@@ -89,10 +89,10 @@ async fn detect_stdin_blocked_inside_container(
         bollard::exec::StartExecResults::Attached { mut output, .. } => {
             while let Some(chunk) = output.next().await {
                 match chunk {
-                    Ok(LogOutput::StdOut { message }) | Ok(LogOutput::Console { message }) => {
+                    Ok(LogOutput::StdOut { message } | LogOutput::Console { message }) => {
                         stdout.push_str(&String::from_utf8_lossy(&message));
                     }
-                    Ok(LogOutput::StdErr { .. }) | Ok(LogOutput::StdIn { .. }) => {}
+                    Ok(LogOutput::StdErr { .. } | LogOutput::StdIn { .. }) => {}
                     Err(e) => return Err(format!("syscall probe stream error: {e}")),
                 }
             }

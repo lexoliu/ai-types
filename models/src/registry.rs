@@ -8,6 +8,10 @@ use aither_core::llm::model::Ability;
 use crate::convert;
 use crate::types::{ModelEntry, ModelMode, Pricing, Provider};
 
+// The registry table below is emitted by `build.rs` from the LiteLLM snapshot.
+// It is machine-written and never edited by hand; the generator applies its own
+// `#[allow]` attributes because style lints on generated text can only be
+// "fixed" by changing the generator's formatting.
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 
 /// A searchable collection of model entries.
@@ -28,7 +32,7 @@ impl ModelRegistry {
         })
     }
 
-    /// Build a registry from parsed LiteLLM JSON bytes.
+    /// Build a registry from parsed `LiteLLM` JSON bytes.
     #[must_use]
     pub fn from_litellm_json(json: &[u8]) -> Self {
         let converted = convert::parse_litellm_json(json);
@@ -47,7 +51,7 @@ impl ModelRegistry {
         Self { entries, index }
     }
 
-    /// Exact match by canonical ID or LiteLLM ID, then prefix match.
+    /// Exact match by canonical ID or `LiteLLM` ID, then prefix match.
     #[must_use]
     pub fn lookup(&self, model_id: &str) -> Option<&ModelEntry> {
         let lower = model_id.to_lowercase();
@@ -89,13 +93,13 @@ impl ModelRegistry {
 
     /// Total number of entries.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether the registry is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 }

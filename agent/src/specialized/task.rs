@@ -333,14 +333,12 @@ impl<LLM: Clone> SubagentTool<LLM> {
             let display_path = if display_prefix.as_os_str().is_empty() {
                 candidate
                     .strip_prefix(&mount.host_root)
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|_| requested_display.to_path_buf())
+                    .map_or_else(|_| requested_display.to_path_buf(), Path::to_path_buf)
             } else {
                 display_prefix.join(
                     candidate
                         .strip_prefix(&mount.host_root)
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|_| requested_display.to_path_buf()),
+                        .map_or_else(|_| requested_display.to_path_buf(), Path::to_path_buf),
                 )
             };
             attempted.push(display_path.display().to_string());

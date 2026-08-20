@@ -1,4 +1,4 @@
-//! Feature-gated async fetch for LiteLLM model data.
+//! Feature-gated async fetch for `LiteLLM` model data.
 //!
 //! Enable with `features = ["remote"]`.
 
@@ -11,7 +11,7 @@ const LITELLM_URL: &str =
 
 const CACHE_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 
-/// Fetch the latest LiteLLM model data and build a registry.
+/// Fetch the latest `LiteLLM` model data and build a registry.
 ///
 /// If `cache_path` is provided and the file is less than 24 hours old,
 /// the cached version is used instead of fetching.

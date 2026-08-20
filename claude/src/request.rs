@@ -566,7 +566,7 @@ fn find_last_cacheable_block(
     }
 
     if let Some(tools) = tools {
-        if let Some((tool_index, tool)) = tools.iter().enumerate().last() {
+        if let Some((tool_index, tool)) = tools.iter().enumerate().next_back() {
             return Some((PromptPosition::tool(tool_index), tool.cache_control.clone()));
         }
     }
@@ -574,7 +574,7 @@ fn find_last_cacheable_block(
     None
 }
 
-fn cache_control_payload_for_ttl(ttl: ClaudePromptCacheTtl) -> CacheControlPayload {
+const fn cache_control_payload_for_ttl(ttl: ClaudePromptCacheTtl) -> CacheControlPayload {
     CacheControlPayload {
         kind: "ephemeral",
         ttl: match ttl {
@@ -838,7 +838,7 @@ fn last_cacheable_block_index(blocks: &[ContentBlock]) -> Option<usize> {
     })
 }
 
-fn is_cacheable_block(block: &ContentBlock) -> bool {
+const fn is_cacheable_block(block: &ContentBlock) -> bool {
     match block {
         ContentBlock::Text { text, .. } => !text.is_empty(),
         ContentBlock::Image { .. }
@@ -847,7 +847,7 @@ fn is_cacheable_block(block: &ContentBlock) -> bool {
     }
 }
 
-fn block_cache_control_mut(block: &mut ContentBlock) -> &mut Option<CacheControlPayload> {
+const fn block_cache_control_mut(block: &mut ContentBlock) -> &mut Option<CacheControlPayload> {
     match block {
         ContentBlock::Text { cache_control, .. }
         | ContentBlock::Image { cache_control, .. }
@@ -856,7 +856,7 @@ fn block_cache_control_mut(block: &mut ContentBlock) -> &mut Option<CacheControl
     }
 }
 
-fn block_cache_control(block: &ContentBlock) -> &Option<CacheControlPayload> {
+const fn block_cache_control(block: &ContentBlock) -> &Option<CacheControlPayload> {
     match block {
         ContentBlock::Text { cache_control, .. }
         | ContentBlock::Image { cache_control, .. }

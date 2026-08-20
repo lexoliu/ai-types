@@ -198,6 +198,7 @@ impl std::error::Error for GeminiError {}
 
 impl GeminiError {
     /// Check if this error is retryable.
+    #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
             Self::Http(err) => {
@@ -215,6 +216,7 @@ impl GeminiError {
     }
 
     /// Get suggested retry delay in seconds.
+    #[must_use]
     pub fn retry_delay_secs(&self) -> Option<u64> {
         match self {
             Self::RateLimit {

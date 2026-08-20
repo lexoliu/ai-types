@@ -579,7 +579,7 @@ async fn chat_completions_request(
     .await
     {
         Ok(stream) => Ok(stream),
-        Err(error) => return Err(error),
+        Err(error) => Err(error),
     }
 }
 
@@ -855,7 +855,7 @@ async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStrea
     .await
     {
         Ok(stream) => Ok(stream),
-        Err(error) => return Err(error),
+        Err(error) => Err(error),
     }
 }
 

@@ -69,7 +69,7 @@ pub trait MemoryStore: Send + Sync {
 
     /// Search for memories similar to the query vector.
     ///
-    /// `filters` can be used to filter by user_id or agent_id.
+    /// `filters` can be used to filter by `user_id` or `agent_id`.
     /// `limit` is the maximum number of results to return.
     fn search(
         &self,
@@ -93,6 +93,7 @@ pub struct InMemoryStore {
 }
 
 impl InMemoryStore {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

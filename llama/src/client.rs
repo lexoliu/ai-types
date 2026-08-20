@@ -702,11 +702,13 @@ fn parse_openai_message(json_text: &str) -> Result<Vec<ToolCall>, LlamaError> {
         let arguments = function
             .get("arguments")
             .and_then(Value::as_str)
-            .map(|raw| {
-                serde_json::from_str::<Value>(raw)
-                    .unwrap_or_else(|_| Value::String(raw.to_string()))
-            })
-            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            .map_or_else(
+                || Value::Object(serde_json::Map::new()),
+                |raw| {
+                    serde_json::from_str::<Value>(raw)
+                        .unwrap_or_else(|_| Value::String(raw.to_string()))
+                },
+            );
 
         calls.push(ToolCall::new(id, name, arguments));
     }

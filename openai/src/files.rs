@@ -164,7 +164,7 @@ impl FilesConfig {
 ///
 /// # Arguments
 /// * `cfg` - Files configuration
-/// * `file_name` - File name reported to OpenAI
+/// * `file_name` - File name reported to `OpenAI`
 /// * `mime_type` - MIME type for multipart metadata
 /// * `data` - File content bytes
 /// * `purpose` - Purpose of the file

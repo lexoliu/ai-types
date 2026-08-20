@@ -796,6 +796,6 @@ mod tests {
     fn test_generate_word_filename() {
         let name = generate_word_filename();
         let parts: Vec<&str> = name.split('-').collect();
-        assert_eq!(parts.len(), 4, "Should have 4 words: {}", name);
+        assert_eq!(parts.len(), 4, "Should have 4 words: {name}");
     }
 }

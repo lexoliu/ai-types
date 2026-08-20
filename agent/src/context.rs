@@ -12,7 +12,7 @@ use aither_core::llm::Message;
 /// The entire context window state. Fully serializable for persistence.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Context {
-    /// Persistent system blocks keyed by snake_case type name.
+    /// Persistent system blocks keyed by `snake_case` type name.
     ///
     /// These survive compaction and are rendered as a single cacheable system
     /// prefix message.
@@ -42,7 +42,7 @@ impl Context {
 
     /// Inserts or replaces a persistent system block.
     ///
-    /// Identity is derived from the snake_case type name of `T`.
+    /// Identity is derived from the `snake_case` type name of `T`.
     pub fn insert_system<T: Serialize>(&mut self, value: &T) {
         let tag = snake_case_type_name::<T>();
         let xml = serialize_xml(&tag, value);
@@ -82,13 +82,13 @@ impl Context {
 
     /// Returns an immutable view of persistent system blocks.
     #[must_use]
-    pub fn system_blocks(&self) -> &IndexMap<String, String> {
+    pub const fn system_blocks(&self) -> &IndexMap<String, String> {
         &self.system_blocks
     }
 
     /// Returns a mutable view of persistent system blocks.
     #[must_use]
-    pub fn system_blocks_mut(&mut self) -> &mut IndexMap<String, String> {
+    pub const fn system_blocks_mut(&mut self) -> &mut IndexMap<String, String> {
         &mut self.system_blocks
     }
 
@@ -144,7 +144,7 @@ impl Context {
 
     /// Returns number of recent conversation messages.
     #[must_use]
-    pub fn len_recent(&self) -> usize {
+    pub const fn len_recent(&self) -> usize {
         self.recent.len()
     }
 
@@ -156,7 +156,7 @@ impl Context {
 
     /// Returns mutable recent conversation messages.
     #[must_use]
-    pub fn recent_mut(&mut self) -> &mut Vec<Message> {
+    pub const fn recent_mut(&mut self) -> &mut Vec<Message> {
         &mut self.recent
     }
 
@@ -168,7 +168,7 @@ impl Context {
 
     /// Returns whether recent conversation is empty.
     #[must_use]
-    pub fn is_conversation_empty(&self) -> bool {
+    pub const fn is_conversation_empty(&self) -> bool {
         self.recent.is_empty()
     }
 
@@ -276,13 +276,13 @@ pub struct ContextCheckpoint {
 impl ContextCheckpoint {
     /// Returns the number of recent messages in this checkpoint.
     #[must_use]
-    pub fn len_recent(&self) -> usize {
+    pub const fn len_recent(&self) -> usize {
         self.recent.len()
     }
 
     /// Returns whether this checkpoint has no reminders, no handoff, and no recent messages.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.reminders.is_empty() && self.handoff.is_none() && self.recent.is_empty()
     }
 }

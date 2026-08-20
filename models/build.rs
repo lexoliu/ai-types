@@ -1,4 +1,4 @@
-//! Build script that fetches LiteLLM model data and generates a static registry.
+//! Build script that fetches `LiteLLM` model data and generates a static registry.
 
 use std::env;
 use std::fs;
@@ -18,17 +18,16 @@ fn main() {
     let snapshot_path = Path::new(&manifest_dir).join("data/litellm_snapshot.json");
 
     // Try network fetch, fall back to snapshot
-    let json_bytes = match try_fetch_litellm() {
-        Some(bytes) => bytes,
-        None => {
-            eprintln!("cargo:warning=Using offline LiteLLM snapshot");
-            fs::read(&snapshot_path).unwrap_or_else(|e| {
-                panic!(
-                    "Failed to read LiteLLM snapshot at {}: {e}",
-                    snapshot_path.display()
-                )
-            })
-        }
+    let json_bytes = if let Some(bytes) = try_fetch_litellm() {
+        bytes
+    } else {
+        eprintln!("cargo:warning=Using offline LiteLLM snapshot");
+        fs::read(&snapshot_path).unwrap_or_else(|e| {
+            panic!(
+                "Failed to read LiteLLM snapshot at {}: {e}",
+                snapshot_path.display()
+            )
+        })
     };
 
     let entries = convert::parse_litellm_json(&json_bytes);
@@ -57,8 +56,15 @@ fn generate_registry_code(entries: &[convert::ConvertedEntry]) -> String {
 
     // No `use` statements — this file is include!'d into registry.rs
     // which already imports the needed types.
+    //
+    // Generated text cannot satisfy style lints without changing the generator
+    // itself, so silence them here rather than in the crate that includes it.
+    code.push_str(
+        "#[allow(clippy::all, clippy::pedantic, clippy::nursery, missing_docs)]\n         const _GENERATED: () = ();\n",
+    );
 
     // Generate the static entries array
+    code.push_str("#[allow(clippy::unreadable_literal, clippy::too_many_lines)]\n");
     code.push_str("static ENTRIES: &[ModelEntry] = &[\n");
     for entry in entries {
         let provider_expr = provider_to_expr(&entry.provider);

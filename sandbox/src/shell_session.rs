@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 /// Outcome of a container execution request.
 #[derive(Debug)]
 pub enum ContainerExecOutcome {
+    /// The command ran to completion; carries its exit status and output.
     Completed(std::process::Output),
+    /// The command was terminated before it finished.
     Killed,
 }
 
@@ -40,7 +42,7 @@ pub trait ContainerExec: Send + Sync {
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
 }
 
-pub(crate) trait ContainerExecObject: Send + Sync {
+pub trait ContainerExecObject: Send + Sync {
     fn exec_boxed<'a>(
         &'a self,
         container_id: &'a str,
@@ -126,36 +128,55 @@ impl<T: ContainerExec> ContainerExecObject for T {
     }
 }
 
+/// Where a shell command is executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellBackend {
+    /// On this machine, inside the local sandbox.
     Local,
+    /// Inside a container.
     Container,
+    /// On a remote host over SSH.
     Ssh,
 }
 
+/// A named SSH destination the agent may run commands on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SshServer {
+    /// Short name the agent uses to select this server.
     pub name: String,
+    /// SSH target, as passed to `ssh` (for example `user@host`).
     pub target: String,
 }
 
 impl SshServer {
+    /// The name used to address this server.
     #[must_use]
     pub fn id(&self) -> &str {
         &self.name
     }
 }
 
+/// How the sandbox runtime is available on a remote host.
 #[derive(Debug, Clone)]
 pub enum SshRuntimeProfile {
-    Heel { binary: String },
+    /// The `heel` sandbox binary is installed at the given path.
+    Heel {
+        /// Absolute path to the `heel` binary on the remote host.
+        binary: String,
+    },
 }
 
+/// Which shell backends are usable in the current deployment.
+///
+/// Reported to the model so it does not offer a backend that is not configured.
 #[derive(Debug, Clone, Serialize)]
 pub struct ShellRuntimeAvailability {
+    /// Whether local execution is available. Always true in practice.
     pub local: bool,
+    /// Whether a container runtime has been wired up.
     pub container: bool,
+    /// Whether any SSH servers are registered.
     pub ssh: bool,
 }
 
@@ -169,12 +190,20 @@ impl Default for ShellRuntimeAvailability {
     }
 }
 
+/// Approves remote actions before the sandbox performs them.
+///
+/// Connecting to a host and installing software on it are both decisions a user
+/// should make, so they are routed through this trait rather than assumed.
 pub trait SshSessionAuthorizer: Send + Sync {
+    /// Asks whether the agent may open an SSH connection to `target`.
     fn authorize_connect(
         &self,
         target: &str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
 
+    /// Asks whether the agent may install the `heel` runtime on `target`.
+    ///
+    /// `details` describes the remote host so the user can judge the request.
     fn authorize_heel_install(
         &self,
         target: &str,
@@ -182,6 +211,10 @@ pub trait SshSessionAuthorizer: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
 }
 
+/// Tracks which shell backends are configured and how to reach them.
+///
+/// Cloning shares the same underlying state, so registering a container or SSH
+/// server is visible to every holder.
 #[derive(Clone)]
 pub struct ShellSessionRegistry {
     availability: Arc<RwLock<ShellRuntimeAvailability>>,
@@ -201,6 +234,7 @@ impl std::fmt::Debug for ShellSessionRegistry {
 }
 
 impl ShellSessionRegistry {
+    /// Creates a registry advertising the given backends.
     #[must_use]
     pub fn new(availability: ShellRuntimeAvailability) -> Self {
         Self {
@@ -226,6 +260,12 @@ impl ShellSessionRegistry {
         let _ = self.container_id.set(id);
     }
 
+    /// Replaces the set of advertised backends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the availability lock was poisoned by a panic in
+    /// another thread.
     pub fn set_availability(&self, availability: ShellRuntimeAvailability) -> Result<(), String> {
         *self
             .availability
@@ -234,6 +274,11 @@ impl ShellSessionRegistry {
         Ok(())
     }
 
+    /// Installs the authorizer consulted before any remote action.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the authorizer lock was poisoned.
     pub fn set_ssh_authorizer(
         &self,
         authorizer: Arc<dyn SshSessionAuthorizer>,
@@ -245,6 +290,7 @@ impl ShellSessionRegistry {
         Ok(())
     }
 
+    /// The currently advertised backends.
     #[must_use]
     pub fn availability(&self) -> ShellRuntimeAvailability {
         self.availability
@@ -264,6 +310,12 @@ impl ShellSessionRegistry {
         self.container_id.get().cloned()
     }
 
+    /// Replaces the registered SSH servers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any entry has an empty name or target, if two
+    /// entries share a name, or if the server lock was poisoned.
     pub fn set_ssh_servers(&self, servers: Vec<SshServer>) -> Result<(), String> {
         let mut seen = HashSet::new();
         let mut deduped = Vec::new();
@@ -286,6 +338,7 @@ impl ShellSessionRegistry {
         Ok(())
     }
 
+    /// Every registered SSH server.
     #[must_use]
     pub fn list_ssh_servers(&self) -> Vec<SshServer> {
         self.ssh_servers
@@ -294,6 +347,12 @@ impl ShellSessionRegistry {
             .unwrap_or_default()
     }
 
+    /// Looks up a registered server by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `server_id` is blank, names no registered server, or
+    /// the server lock was poisoned.
     pub fn resolve_ssh_server(&self, server_id: &str) -> Result<SshServer, String> {
         let wanted = server_id.trim();
         if wanted.is_empty() {
@@ -308,6 +367,14 @@ impl ShellSessionRegistry {
             .ok_or_else(|| format!("unknown ssh_server_id: {wanted}"))
     }
 
+    /// Picks the backend to use for a command that did not name one.
+    ///
+    /// Prefers a container when one is configured, since it isolates better
+    /// than running on the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither a container nor local execution is available.
     pub fn resolve_local_backend(&self) -> Result<ShellBackend, String> {
         let availability = self.availability();
         if availability.container {
@@ -319,6 +386,11 @@ impl ShellSessionRegistry {
         Err("no local backend available".to_string())
     }
 
+    /// Confirms the SSH backend is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no SSH servers are registered.
     pub fn ensure_ssh_available(&self) -> Result<(), String> {
         if self.availability().ssh {
             Ok(())
@@ -327,17 +399,21 @@ impl ShellSessionRegistry {
         }
     }
 
+    /// The installed authorizer, if any.
+    #[must_use]
     pub fn ssh_authorizer(&self) -> Option<Arc<dyn SshSessionAuthorizer>> {
         self.ssh_authorizer.read().ok()?.clone()
     }
 }
 
+/// Lists the SSH servers the agent may connect to.
 #[derive(Debug, Clone)]
 pub struct ListSshTool {
     registry: ShellSessionRegistry,
 }
 
 impl ListSshTool {
+    /// Creates the tool over the given registry.
     #[must_use]
     pub const fn new(registry: ShellSessionRegistry) -> Self {
         Self { registry }
@@ -347,6 +423,12 @@ impl ListSshTool {
 impl Tool for ListSshTool {
     fn name(&self) -> Cow<'static, str> {
         "list_ssh".into()
+    }
+
+    fn description(&self) -> Cow<'static, str> {
+        "List the SSH servers this agent is allowed to connect to. Returns each \
+         server's id and target. Call this before open_ssh to discover valid ids."
+            .into()
     }
 
     type Arguments = ();
@@ -359,17 +441,21 @@ impl Tool for ListSshTool {
     }
 }
 
+/// Open an SSH session to a registered server.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OpenSshArgs {
+    /// Name of a server returned by `list_ssh`.
     pub ssh_server_id: String,
 }
 
+/// Opens an SSH session to one of the registered servers.
 #[derive(Debug, Clone)]
 pub struct OpenSshTool {
     registry: ShellSessionRegistry,
 }
 
 impl OpenSshTool {
+    /// Creates the tool over the given registry.
     #[must_use]
     pub const fn new(registry: ShellSessionRegistry) -> Self {
         Self { registry }
@@ -404,6 +490,16 @@ impl Tool for OpenSshTool {
     }
 }
 
+/// Prepares a remote host to run sandboxed commands.
+///
+/// Confirms the connection is authorized, probes for the `heel` runtime, and —
+/// with the user's approval — installs it if it is missing.
+///
+/// # Errors
+///
+/// Returns an error if the authorizer denies the connection, the SSH probe
+/// fails, or `heel` is absent and either installation was declined or did not
+/// succeed.
 pub async fn bootstrap_ssh_runtime(
     target: &str,
     authorizer: &Option<Arc<dyn SshSessionAuthorizer>>,

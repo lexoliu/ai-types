@@ -1,6 +1,6 @@
 //! Model registry with capabilities, context windows, and metadata for popular LLMs.
 //!
-//! This crate provides a database of known AI models sourced from LiteLLM upstream,
+//! This crate provides a database of known AI models sourced from `LiteLLM` upstream,
 //! with their capabilities, context window sizes, pricing, and provider information.
 //!
 //! # Example

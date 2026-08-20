@@ -3,6 +3,7 @@
 //! Uses an internal command channel to avoid shared locks.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -164,6 +165,7 @@ pub struct JobRegistry {
 }
 
 /// Background service that owns the job registry state.
+#[derive(Debug)]
 pub struct JobRegistryService {
     rx: Receiver<JobCommand>,
 }
@@ -177,6 +179,11 @@ pub fn job_registry_channel() -> (JobRegistry, JobRegistryService) {
 
 impl JobRegistry {
     /// Registers a new running job.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn register(
         &self,
         pid: u32,
@@ -200,6 +207,11 @@ impl JobRegistry {
     }
 
     /// Attaches a stdin input channel to a running job.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn attach_terminal_input(&self, pid: u32, input_tx: TerminalInputSender) {
         self.tx
             .send(JobCommand::AttachTerminalInput { pid, input_tx })
@@ -208,6 +220,11 @@ impl JobRegistry {
     }
 
     /// Attaches a kill switch used by runtimes without host-visible PIDs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn attach_kill_switch(&self, pid: u32, kill_tx: Sender<()>) {
         self.tx
             .send(JobCommand::AttachKillSwitch { pid, kill_tx })
@@ -216,6 +233,11 @@ impl JobRegistry {
     }
 
     /// Appends stdout bytes for a running job.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn append_stdout(&self, pid: u32, chunk: Vec<u8>) {
         self.tx
             .send(JobCommand::AppendTerminalOutput {
@@ -228,6 +250,11 @@ impl JobRegistry {
     }
 
     /// Appends stderr bytes for a running job.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn append_stderr(&self, pid: u32, chunk: Vec<u8>) {
         self.tx
             .send(JobCommand::AppendTerminalOutput {
@@ -240,6 +267,11 @@ impl JobRegistry {
     }
 
     /// Marks stdout stream closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn close_stdout(&self, pid: u32) {
         self.tx
             .send(JobCommand::CloseTerminalStream {
@@ -251,6 +283,11 @@ impl JobRegistry {
     }
 
     /// Marks stderr stream closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn close_stderr(&self, pid: u32) {
         self.tx
             .send(JobCommand::CloseTerminalStream {
@@ -262,6 +299,15 @@ impl JobRegistry {
     }
 
     /// Sends bytes to a running task terminal stdin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task is unknown or has no attached stdin.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn input_terminal(&self, task_id: &str, bytes: Vec<u8>) -> Result<(), String> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
@@ -279,6 +325,15 @@ impl JobRegistry {
     }
 
     /// Starts continuous output redirection for a task and returns current snapshot bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task is unknown or the output file cannot be opened.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn start_output_redirect(
         &self,
         task_id: &str,
@@ -300,6 +355,11 @@ impl JobRegistry {
     }
 
     /// Returns true when both stdout/stderr streams are closed for the PID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn terminal_streams_closed(&self, pid: u32) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
@@ -316,6 +376,11 @@ impl JobRegistry {
     }
 
     /// Returns collected stdout/stderr buffers for a PID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn terminal_output(&self, pid: u32) -> Option<(Vec<u8>, Vec<u8>)> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
@@ -332,6 +397,11 @@ impl JobRegistry {
     }
 
     /// Marks a job as completed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn complete(&self, pid: u32, exit_code: i32, output_path: Option<PathBuf>) {
         self.tx
             .send(JobCommand::Complete {
@@ -344,6 +414,11 @@ impl JobRegistry {
     }
 
     /// Marks a job as failed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn fail(&self, pid: u32, error: &str, output_path: Option<PathBuf>) {
         self.tx
             .send(JobCommand::Fail {
@@ -356,6 +431,11 @@ impl JobRegistry {
     }
 
     /// Lists all jobs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn list(&self) -> Vec<JobInfo> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
@@ -369,6 +449,11 @@ impl JobRegistry {
     }
 
     /// Gets information about a specific job by PID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn get(&self, pid: u32) -> Option<JobInfo> {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
@@ -385,6 +470,11 @@ impl JobRegistry {
     }
 
     /// Kills a running job by its PID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn kill(&self, pid: u32) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
@@ -401,6 +491,11 @@ impl JobRegistry {
     }
 
     /// Kills a running job by its task ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn kill_by_task_id(&self, task_id: &str) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
@@ -417,6 +512,11 @@ impl JobRegistry {
     }
 
     /// Kills all running jobs owned by an execution key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn kill_by_execution_key(&self, execution_key: &str) -> usize {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
@@ -450,6 +550,11 @@ impl JobRegistry {
     }
 
     /// Formats only RUNNING jobs for compression preservation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn format_running_jobs(&self) -> String {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
@@ -463,6 +568,11 @@ impl JobRegistry {
     }
 
     /// Returns true if there are any running jobs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the background registry service has stopped, which means
+    /// the sandbox is no longer usable.
     pub async fn has_running(&self) -> bool {
         let (reply_tx, reply_rx) = async_channel::bounded(1);
         self.tx
@@ -690,8 +800,7 @@ impl JobRegistryService {
                                 })
                             } else {
                                 Err(format!(
-                                    "task {} does not support terminal input in this runtime",
-                                    task_id
+                                    "task {task_id} does not support terminal input in this runtime"
                                 ))
                             }
                         } else {
@@ -850,7 +959,7 @@ async fn kill_job(jobs: &mut HashMap<u32, JobState>, pid: u32) -> bool {
 
         #[cfg(unix)]
         {
-            let result = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            let result = unsafe { libc::kill(pid.cast_signed(), libc::SIGKILL) };
             if result == 0 {
                 if let Err(error) = finalize_output_redirect(job).await {
                     tracing::warn!(
@@ -937,10 +1046,11 @@ fn format_running_jobs(jobs: &HashMap<u32, JobState>) -> String {
             .as_ref()
             .map_or_else(|| "(no output)".to_string(), |p| p.display().to_string());
 
-        output.push_str(&format!(
-            "  - task {} (pid {}): `{}` -> {}\n",
-            job.info.task_id, job.info.pid, script_preview, output_path
-        ));
+        let _ = writeln!(
+            output,
+            "  - task {} (pid {}): `{script_preview}` -> {output_path}",
+            job.info.task_id, job.info.pid
+        );
     }
 
     output

@@ -1,4 +1,4 @@
-//! Shared conversion logic for LiteLLM and OpenRouter JSON.
+//! Shared conversion logic for `LiteLLM` and `OpenRouter` JSON.
 //!
 //! This module is included via `#[path]` in build.rs so the same parsing
 //! logic runs at compile time and runtime. It depends only on `serde`,
@@ -6,7 +6,7 @@
 
 use serde::Deserialize;
 
-/// Raw LiteLLM entry as it appears in the JSON.
+/// Raw `LiteLLM` entry as it appears in the JSON.
 #[derive(Debug, Deserialize)]
 pub struct RawLiteLLMEntry {
     #[serde(default)]
@@ -87,6 +87,7 @@ const PROVIDER_PREFIXES: &[(&str, &str)] = &[
 ];
 
 /// Strip known provider prefixes to get the canonical model ID.
+#[must_use]
 pub fn strip_provider_prefix(litellm_key: &str) -> &str {
     for &(prefix, _) in PROVIDER_PREFIXES {
         if let Some(rest) = litellm_key.strip_prefix(prefix) {
@@ -96,7 +97,8 @@ pub fn strip_provider_prefix(litellm_key: &str) -> &str {
     litellm_key
 }
 
-/// Map a LiteLLM `litellm_provider` string to a provider tag.
+/// Map a `LiteLLM` `litellm_provider` string to a provider tag.
+#[must_use]
 pub fn parse_provider(provider_str: &str) -> String {
     let mapped = match provider_str {
         "openai" | "text-completion-openai" | "chatgpt" => "openai",
@@ -122,7 +124,8 @@ pub fn parse_provider(provider_str: &str) -> String {
     mapped.to_string()
 }
 
-/// Map a LiteLLM `mode` string to a mode tag.
+/// Map a `LiteLLM` `mode` string to a mode tag.
+#[must_use]
 pub fn parse_mode(mode_str: &str) -> Option<&'static str> {
     match mode_str {
         "chat" | "responses" => Some("chat"),
@@ -159,7 +162,8 @@ pub struct ConvertedEntry {
     pub deprecation_date: Option<String>,
 }
 
-/// Convert a single LiteLLM JSON entry into our intermediate representation.
+/// Convert a single `LiteLLM` JSON entry into our intermediate representation.
+#[must_use]
 pub fn convert_litellm_entry(key: &str, raw: &RawLiteLLMEntry) -> Option<ConvertedEntry> {
     let provider_str = raw.litellm_provider.as_deref()?;
     let mode_str = raw.mode.as_deref()?;
@@ -211,7 +215,7 @@ pub fn convert_litellm_entry(key: &str, raw: &RawLiteLLMEntry) -> Option<Convert
     Some(ConvertedEntry {
         litellm_id: key.to_string(),
         canonical_id,
-        provider: provider.to_string(),
+        provider,
         mode: mode.to_string(),
         max_input_tokens: max_input,
         max_output_tokens: max_output,
@@ -226,7 +230,8 @@ pub fn convert_litellm_entry(key: &str, raw: &RawLiteLLMEntry) -> Option<Convert
     })
 }
 
-/// Parse the full LiteLLM JSON blob and return converted entries.
+/// Parse the full `LiteLLM` JSON blob and return converted entries.
+#[must_use]
 pub fn parse_litellm_json(json_bytes: &[u8]) -> Vec<ConvertedEntry> {
     let map: serde_json::Map<String, serde_json::Value> =
         serde_json::from_slice(json_bytes).expect("invalid LiteLLM JSON");

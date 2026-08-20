@@ -1,5 +1,5 @@
 use aither_core::{
-    Error, LanguageModel,
+    LanguageModel,
     llm::{
         Event, GenerateError, LLMRequest, Message, Role, Usage,
         model::{Ability, Parameters, Profile, ReasoningEffort, ToolChoice},
@@ -73,8 +73,7 @@ impl LanguageModel for Gemini {
                         .and_then(aither_models::ModelEntry::max_input_tokens)
                         .unwrap_or_else(|| {
                             panic!(
-                                "Gemini model '{}' missing context metadata from provider and aither-models",
-                                model_name
+                                "Gemini model '{model_name}' missing context metadata from provider and aither-models"
                             )
                         })
                 }
@@ -361,7 +360,7 @@ fn parse_tool_signature(id: &str) -> (String, Option<String>) {
     (id.to_string(), None)
 }
 
-fn usage_from_metadata(meta: &UsageMetadata) -> Usage {
+const fn usage_from_metadata(meta: &UsageMetadata) -> Usage {
     Usage {
         prompt_tokens: meta.prompt_token_count,
         completion_tokens: meta.candidates_token_count,

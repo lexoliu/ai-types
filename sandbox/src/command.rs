@@ -146,6 +146,11 @@ impl ToolRegistryBuilder {
     /// all required fields become positional args in order.
     /// For example, if a tool has `query: String` as its first required field,
     /// then `websearch "rust"` → `websearch --query "rust"`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool's argument schema cannot be serialized to JSON, which
+    /// would mean a broken `JsonSchema` implementation.
     pub fn configure_tool<T>(&mut self, tool: T)
     where
         T: Tool + Send + Sync + 'static,
@@ -492,7 +497,7 @@ impl IpcCommand for ToolCallCommand {
 
         // Parse the result as JSON to avoid double-serialization.
         // Tool outputs are JSON strings, so we need to parse them to Value.
-        serde_json::from_str(&result).unwrap_or_else(|_| Value::String(result))
+        serde_json::from_str(&result).unwrap_or(Value::String(result))
     }
 }
 
@@ -573,7 +578,7 @@ impl IpcCommand for IpcGatewayCommand {
             .query_tool_handler(tool_name, &tool_args)
             .await;
 
-        serde_json::from_str(&result).unwrap_or_else(|_| Value::String(result))
+        serde_json::from_str(&result).unwrap_or(Value::String(result))
     }
 }
 
@@ -609,6 +614,11 @@ where
     T::Arguments: DeserializeOwned + JsonSchema,
 {
     /// Creates a new command wrapper for the given tool.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool's argument schema cannot be serialized to JSON, which
+    /// would mean a broken `JsonSchema` implementation.
     pub fn new(tool: T) -> Self {
         let schema = schemars::schema_for!(T::Arguments);
         let schema = serde_json::to_value(schema).expect("failed to serialize tool schema");
@@ -684,6 +694,11 @@ where
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
     /// Creates a new IPC command wrapper for the given tool.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool's argument schema cannot be serialized to JSON, which
+    /// would mean a broken `JsonSchema` implementation.
     pub fn new(tool: T) -> Self {
         let schema = serde_json::to_value(schemars::schema_for!(T::Arguments))
             .expect("failed to serialize tool schema");
@@ -821,7 +836,7 @@ where
         match self.tool.call(parsed).await {
             Ok(output) => {
                 let result = output.as_str().unwrap_or("").to_string();
-                serde_json::from_str(&result).unwrap_or_else(|_| Value::String(result))
+                serde_json::from_str(&result).unwrap_or(Value::String(result))
             }
             Err(e) => Value::String(format!("Error: {e}")),
         }
@@ -1517,6 +1532,9 @@ pub fn schema_to_help(schema: &Value) -> String {
 }
 
 #[cfg(test)]
+// The argument structs below exist to be turned into JSON schemas by
+// `schema_for!`; their fields shape the schema and are never read directly.
+#[allow(dead_code)]
 mod tests {
     use super::*;
     use schemars::JsonSchema;
@@ -1695,8 +1713,7 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("missing required argument: content"),
-            "got: {}",
-            err
+            "got: {err}"
         );
     }
 
@@ -1832,8 +1849,7 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("missing required argument: options"),
-            "got: {}",
-            err
+            "got: {err}"
         );
     }
 
@@ -1919,7 +1935,7 @@ mod tests {
         let err = cli_to_json(&schema, &["--path".into()]).unwrap_err();
         // path is consumed as positional, so we get missing required
         // Actually --path starts with --, so it enters the named path and needs a value
-        assert!(err.to_string().contains("missing"), "got: {}", err);
+        assert!(err.to_string().contains("missing"), "got: {err}");
     }
 
     #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -1968,11 +1984,7 @@ mod tests {
         let cli = cmd.args_to_cli();
         // Should produce repeated --options flags
         let options_count = cli.iter().filter(|a| *a == "--options").count();
-        assert_eq!(
-            options_count, 3,
-            "expected 3 --options flags, got: {:?}",
-            cli
-        );
+        assert_eq!(options_count, 3, "expected 3 --options flags, got: {cli:?}");
         assert!(cli.contains(&"A".to_string()));
         assert!(cli.contains(&"B".to_string()));
         assert!(cli.contains(&"C".to_string()));
@@ -2073,7 +2085,7 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_value(result).unwrap();
         let options = parsed["option"].as_array().expect("option should be array");
-        assert_eq!(options.len(), 3, "expected 3 options, got: {:?}", options);
+        assert_eq!(options.len(), 3, "expected 3 options, got: {options:?}");
         assert_eq!(options[0], "原味");
         assert_eq!(options[1], "番茄味");
         assert_eq!(options[2], "芝士味");

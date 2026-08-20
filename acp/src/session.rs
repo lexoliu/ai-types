@@ -151,7 +151,7 @@ impl<LLM: LanguageModel> AcpSession<LLM> {
 }
 
 /// Wraps plain text in the content-chunk shape ACP expects.
-fn text_chunk(text: String) -> ContentChunk {
+const fn text_chunk(text: String) -> ContentChunk {
     ContentChunk {
         content: ContentBlock::Text(TextContent {
             text,

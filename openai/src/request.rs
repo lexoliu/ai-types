@@ -458,7 +458,7 @@ fn response_format(params: &ParameterSnapshot) -> Option<ResponseFormatPayload> 
                 strict: Some(params.structured_outputs),
             },
         })
-        .or_else(|| {
+        .or({
             if params.structured_outputs {
                 Some(ResponseFormatPayload::JsonObject)
             } else {
@@ -856,7 +856,7 @@ fn responses_text(params: &ParameterSnapshot) -> Option<ResponseTextConfig> {
                 strict: Some(params.structured_outputs),
             },
         })
-        .or_else(|| {
+        .or({
             if params.structured_outputs {
                 Some(ResponseTextConfig {
                     format: ResponseTextFormat::JsonObject,

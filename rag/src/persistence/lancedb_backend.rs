@@ -19,14 +19,14 @@ use super::Persistence;
 
 const TABLE_NAME: &str = "rag_entries";
 
-/// LanceDB persistence backend.
+/// `LanceDB` persistence backend.
 #[derive(Debug)]
 pub struct LanceDbPersistence {
     path: PathBuf,
 }
 
 impl LanceDbPersistence {
-    /// Creates a new LanceDB backend rooted at the given directory.
+    /// Creates a new `LanceDB` backend rooted at the given directory.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }

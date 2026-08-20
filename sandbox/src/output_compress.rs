@@ -143,7 +143,7 @@ fn try_json_to_tsv(text: &str) -> Option<String> {
     }
 }
 
-/// Flatten a JSON value into a list of (dotted_key, string_value) pairs.
+/// Flatten a JSON value into a list of (`dotted_key`, `string_value`) pairs.
 fn flatten_value(val: &Value, prefix: &str) -> Vec<(String, String)> {
     let mut result = Vec::new();
     match val {
@@ -181,7 +181,7 @@ fn flatten_value(val: &Value, prefix: &str) -> Vec<(String, String)> {
 
 /// Escape a TSV field: replace tabs and newlines with spaces.
 fn escape_tsv_field(s: &str) -> String {
-    s.replace('\t', " ").replace('\n', " ").replace('\r', " ")
+    s.replace(['\t', '\n', '\r'], " ")
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +324,7 @@ fn try_fold_source_code(text: &str) -> Option<FoldedCode> {
 
         // Calculate how many inner lines we're folding
         let inner_end = fold_end + 1; // exclusive
-        let folded_count = if inner_end > i { inner_end - i } else { 0 };
+        let folded_count = inner_end.saturating_sub(i);
 
         if folded_count > 0 {
             // Emit fold marker

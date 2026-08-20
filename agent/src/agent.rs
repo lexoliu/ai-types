@@ -720,14 +720,14 @@ where
 
     /// Returns a reference to the unified context manager.
     #[must_use]
-    pub fn context(&self) -> &Context {
+    pub const fn context(&self) -> &Context {
         &self.context
     }
 
     /// Returns a mutable reference to the unified context manager.
     ///
     /// Use this to insert/update system blocks, push messages, etc.
-    pub fn context_mut(&mut self) -> &mut Context {
+    pub const fn context_mut(&mut self) -> &mut Context {
         &mut self.context
     }
 
@@ -904,7 +904,7 @@ where
         self.initialized = true;
     }
 
-    /// Populates the Context's system blocks from AgentConfig.
+    /// Populates the Context's system blocks from `AgentConfig`.
     ///
     /// Called once during initialization. These blocks form the stable
     /// cacheable prefix of the system message.
