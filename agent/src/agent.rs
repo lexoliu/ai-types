@@ -1416,18 +1416,21 @@ where
             .iter()
             .find(|item| matches!(item.status, TodoStatus::Pending | TodoStatus::InProgress));
 
-        if let Some(task) = next_task {
-            Some(format!(
-                "<system-reminder>\nTask \"{}\" completed. Next task: {} ({})\n</system-reminder>",
-                completed_task, task.content, task.active_form
-            ))
-        } else if items.iter().all(|i| i.status == TodoStatus::Completed) {
-            Some(format!(
-                "<system-reminder>\nTask \"{completed_task}\" completed. All tasks in the todo list are now complete!\n</system-reminder>"
-            ))
-        } else {
-            None
-        }
+        next_task.map_or_else(
+            || {
+                items.iter().all(|i| i.status == TodoStatus::Completed).then(|| {
+                    format!(
+                        "<system-reminder>\nTask \"{completed_task}\" completed. All tasks in the todo list are now complete!\n</system-reminder>"
+                    )
+                })
+            },
+            |task| {
+                Some(format!(
+                    "<system-reminder>\nTask \"{}\" completed. Next task: {} ({})\n</system-reminder>",
+                    completed_task, task.content, task.active_form
+                ))
+            },
+        )
     }
 }
 

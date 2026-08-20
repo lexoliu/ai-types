@@ -420,10 +420,14 @@ where
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// A boxed event stream from one of the group's models.
+type BoxedEventStream<'a, M> =
+    Pin<Box<dyn Stream<Item = Result<Event, <M as LanguageModel>::Error>> + Send + 'a>>;
+
 /// Stream wrapper for `ModelGroup` that tracks usage and detects quota errors.
 struct ModelGroupStream<'a, M: LanguageModel> {
     group: &'a ModelGroup<M>,
-    inner: Option<Pin<Box<dyn Stream<Item = Result<Event, M::Error>> + Send + 'a>>>,
+    inner: Option<BoxedEventStream<'a, M>>,
 }
 
 impl<'a, M: LanguageModel> ModelGroupStream<'a, M> {

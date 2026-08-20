@@ -10,7 +10,9 @@ use async_fs as fs;
 /// Snapshot of working documents currently present in the sandbox.
 #[derive(Debug, Clone, Default)]
 pub struct WorkingDocsSnapshot {
+    /// Contents of `TODO.md`, when the sandbox has one.
     pub todo_md: Option<String>,
+    /// Contents of `PLAN.md`, when the sandbox has one.
     pub plan_md: Option<String>,
 }
 

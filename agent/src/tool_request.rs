@@ -228,9 +228,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     #[must_use]
     pub fn peek(&self) -> Option<(String, P)> {
         let inner = self.inner.lock().expect("RequestApprover lock poisoned");
-        let id = inner.order.front()?;
-        let entry = inner.pending.get(id)?;
-        Some((id.clone(), entry.payload.clone()))
+        let id = inner.order.front()?.clone();
+        let payload = inner.pending.get(&id)?.payload.clone();
+        drop(inner);
+        Some((id, payload))
     }
 
     /// Return the oldest pending request matching a predicate.

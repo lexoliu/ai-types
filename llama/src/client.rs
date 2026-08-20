@@ -44,6 +44,11 @@ pub struct Llama {
 
 impl Llama {
     /// Load a GGUF model from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot start or the model cannot be
+    /// loaded from `model_path`.
     pub fn from_file(model_path: impl AsRef<Path>) -> Result<Self, LlamaError> {
         Self::builder(model_path).build()
     }
@@ -110,7 +115,11 @@ impl LanguageModel for Llama {
 
 impl EmbeddingModel for Llama {
     fn dim(&self) -> usize {
-        self.model.n_embd() as usize
+        // Embedding dimensions are small positive counts.
+        #[allow(clippy::cast_sign_loss)]
+        {
+            self.model.n_embd() as usize
+        }
     }
 
     fn embed(
@@ -146,6 +155,8 @@ impl EmbeddingModel for Llama {
                 return Ok(embedding.to_vec());
             }
 
+            // Token counts are bounded by the context window, well inside i32.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let last_index = (tokens.len() - 1) as i32;
             let embedding = context
                 .embeddings_ith(last_index)
@@ -234,6 +245,11 @@ impl Builder {
     }
 
     /// Build the local llama provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot start or the model file cannot be
+    /// loaded.
     pub fn build(self) -> Result<Llama, LlamaError> {
         let model_params = LlamaModelParams::default()
             .with_n_gpu_layers(self.n_gpu_layers)
@@ -271,7 +287,7 @@ fn response_stream(
     match thread::Builder::new()
         .name("aither-llama-respond".to_string())
         .spawn(move || {
-            if let Err(err) = run_response_generation(model, backend, cfg, request, &worker_sender)
+            if let Err(err) = run_response_generation(&model, &backend, &cfg, request, &worker_sender)
             {
                 let _ = worker_sender.send_blocking(Err(err));
             }
@@ -288,9 +304,9 @@ fn response_stream(
 }
 
 fn run_response_generation(
-    model: Arc<LlamaModel>,
-    backend: Arc<LlamaBackend>,
-    cfg: Arc<LlamaConfig>,
+    model: &Arc<LlamaModel>,
+    backend: &Arc<LlamaBackend>,
+    cfg: &Arc<LlamaConfig>,
     request: LLMRequest,
     sender: &async_channel::Sender<Result<Event, LlamaError>>,
 ) -> Result<(), LlamaError> {
@@ -330,6 +346,8 @@ fn run_response_generation(
 
     let mut generated = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
+    // Prompt length is bounded by the context window, well inside i32.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let mut pos = prompt_tokens.len() as i32;
     let max_tokens = parameters.max_tokens.unwrap_or(512);
 
@@ -408,12 +426,11 @@ fn resolve_chat_template(
     if let Some(template) = &cfg.chat_template {
         return LlamaChatTemplate::new(template).map_err(|err| LlamaError::Model(err.to_string()));
     }
-    match model.chat_template(None) {
-        Ok(template) => Ok(template),
-        Err(_) => {
-            LlamaChatTemplate::new("chatml").map_err(|err| LlamaError::Model(err.to_string()))
-        }
-    }
+    // Fall back to ChatML when the model carries no template of its own.
+    model.chat_template(None).map_or_else(
+        |_| LlamaChatTemplate::new("chatml").map_err(|err| LlamaError::Model(err.to_string())),
+        Ok,
+    )
 }
 
 struct Prompt {
@@ -594,6 +611,8 @@ fn build_sampler(parameters: &Parameters) -> LlamaSampler {
     }
 
     if let Some(top_k) = parameters.top_k {
+        // top_k is a small positive count; the sampler API takes it signed.
+        #[allow(clippy::cast_possible_wrap)]
         samplers.push(LlamaSampler::top_k(top_k as i32));
     }
     if let Some(top_p) = parameters.top_p {
@@ -621,10 +640,11 @@ fn sampling_seed(seed: Option<u32>) -> u32 {
     if let Some(seed) = seed {
         return seed;
     }
+    // Only the low bits matter: this is seed material, not a timestamp.
+    #[allow(clippy::cast_possible_truncation)]
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos() as u64)
-        .unwrap_or(1);
+        .map_or(1, |value| value.as_nanos() as u64);
     ((now ^ (now >> 32)) & 0xFFFF_FFFF) as u32
 }
 
