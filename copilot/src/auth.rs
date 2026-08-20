@@ -145,9 +145,8 @@ pub async fn poll_for_token(
         match try_get_token(device_code).await {
             Ok(token) => return Ok(token),
             Err(CopilotError::AuthorizationPending) => {
-                // User hasn't completed auth yet, keep polling
+                // User hasn't completed auth yet, keep polling.
                 tracing::debug!("Authorization pending, polling again...");
-                continue;
             }
             Err(e) => return Err(e),
         }

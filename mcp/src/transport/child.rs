@@ -162,10 +162,8 @@ impl Transport for ChildProcessTransport {
                 Some(JsonRpcMessage::Response(response)) if response.id == id => {
                     return Ok(response);
                 }
-                Some(_) => {
-                    // Skip non-matching messages
-                    continue;
-                }
+                // Skip non-matching messages.
+                Some(_) => {}
                 None => {
                     return Err(McpError::ConnectionClosed);
                 }

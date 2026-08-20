@@ -399,8 +399,13 @@ pub fn apply_cache_strategy(
     let default_ttl = cache.ttl;
     match cache.strategy {
         ClaudePromptCacheStrategy::Automatic => {
-            let automatic =
-                maybe_automatic_cache_control(system, messages, tools, default_ttl, None)?;
+            let automatic = maybe_automatic_cache_control(
+                system.as_ref(),
+                messages,
+                tools.as_ref(),
+                default_ttl,
+                None,
+            )?;
             Ok(automatic.map(|(cache_control, _)| cache_control))
         }
         ClaudePromptCacheStrategy::Explicit(breakpoints) => {
@@ -413,9 +418,9 @@ pub fn apply_cache_strategy(
             let mut applied =
                 apply_explicit_breakpoints(system, messages, tools, breakpoints, default_ttl)?;
             let automatic = maybe_automatic_cache_control(
-                system,
+                system.as_ref(),
                 messages,
-                tools,
+                tools.as_ref(),
                 default_ttl,
                 Some(breakpoints),
             )?;
@@ -488,9 +493,9 @@ fn apply_explicit_breakpoints(
 }
 
 fn maybe_automatic_cache_control(
-    system: &Option<SystemPayload>,
+    system: Option<&SystemPayload>,
     messages: &[MessagePayload],
-    tools: &Option<Vec<ToolPayload>>,
+    tools: Option<&Vec<ToolPayload>>,
     ttl: ClaudePromptCacheTtl,
     explicit_breakpoints: Option<ClaudeExplicitCacheBreakpoints>,
 ) -> Result<Option<(CacheControlPayload, AppliedBreakpoint)>, String> {
@@ -524,9 +529,9 @@ fn maybe_automatic_cache_control(
 }
 
 fn find_last_cacheable_block(
-    system: &Option<SystemPayload>,
+    system: Option<&SystemPayload>,
     messages: &[MessagePayload],
-    tools: &Option<Vec<ToolPayload>>,
+    tools: Option<&Vec<ToolPayload>>,
 ) -> Option<(PromptPosition, Option<CacheControlPayload>)> {
     for (message_index, message) in messages.iter().enumerate().rev() {
         match &message.content {
@@ -539,7 +544,7 @@ fn find_last_cacheable_block(
                 if let Some(block_index) = last_cacheable_block_index(blocks) {
                     return Some((
                         PromptPosition::message(message_index, block_index),
-                        block_cache_control(&blocks[block_index]).clone(),
+                        block_cache_control(&blocks[block_index]).cloned(),
                     ));
                 }
             }
@@ -856,12 +861,12 @@ const fn block_cache_control_mut(block: &mut ContentBlock) -> &mut Option<CacheC
     }
 }
 
-const fn block_cache_control(block: &ContentBlock) -> &Option<CacheControlPayload> {
+const fn block_cache_control(block: &ContentBlock) -> Option<&CacheControlPayload> {
     match block {
         ContentBlock::Text { cache_control, .. }
         | ContentBlock::Image { cache_control, .. }
         | ContentBlock::ToolUse { cache_control, .. }
-        | ContentBlock::ToolResult { cache_control, .. } => cache_control,
+        | ContentBlock::ToolResult { cache_control, .. } => cache_control.as_ref(),
     }
 }
 
@@ -964,13 +969,18 @@ fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
 
 /// Check if a URL appears to be an image.
 fn is_image_url(url: &str) -> bool {
-    let lower = url.to_lowercase();
-    lower.ends_with(".jpg")
-        || lower.ends_with(".jpeg")
-        || lower.ends_with(".png")
-        || lower.ends_with(".gif")
-        || lower.ends_with(".webp")
-        || lower.contains("/image")
+    const IMAGE_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "gif", "webp"];
+
+    let has_image_extension = std::path::Path::new(url)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            IMAGE_EXTENSIONS
+                .iter()
+                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        });
+
+    has_image_extension || url.to_lowercase().contains("/image")
 }
 
 /// Flatten message content.
@@ -1048,7 +1058,9 @@ mod tests {
                 assert!(matches!(blocks[0], ContentBlock::Text { .. }));
                 assert!(matches!(blocks[1], ContentBlock::ToolUse { .. }));
             }
-            other => panic!("expected assistant blocks payload, got: {other:?}"),
+            other @ ContentPayload::Text(_) => {
+                panic!("expected assistant blocks payload, got: {other:?}")
+            }
         }
     }
 
@@ -1073,7 +1085,9 @@ mod tests {
                     other => panic!("expected tool_result block, got: {other:?}"),
                 }
             }
-            other => panic!("expected user blocks payload, got: {other:?}"),
+            other @ ContentPayload::Text(_) => {
+                panic!("expected user blocks payload, got: {other:?}")
+            }
         }
     }
 
@@ -1136,7 +1150,9 @@ mod tests {
                 assert_eq!(blocks[0].text, "Instruction A");
                 assert_eq!(blocks[1].text, "Instruction B");
             }
-            other => panic!("expected system blocks payload, got: {other:?}"),
+            other @ SystemPayload::Text(_) => {
+                panic!("expected system blocks payload, got: {other:?}")
+            }
         }
     }
 
@@ -1186,7 +1202,9 @@ mod tests {
                 }
                 other => panic!("expected tool_use block, got: {other:?}"),
             },
-            other => panic!("expected block payload, got: {other:?}"),
+            other @ ContentPayload::Text(_) => {
+                panic!("expected block payload, got: {other:?}")
+            }
         }
     }
 

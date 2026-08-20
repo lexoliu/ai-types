@@ -1100,11 +1100,6 @@ where
     P: PermissionHandler + 'static,
     E: Executor + Clone + 'static,
 {
-    let SandboxPaths {
-        working_dir,
-        writable_paths,
-        readable_paths,
-    } = paths;
     let ExecutionIds {
         task_id,
         execution_id,
@@ -1804,11 +1799,9 @@ async fn run_container_ipc_bridge<E: Executor + Clone + 'static>(
                     })
                     .detach();
             }
+            // An interrupted accept is retried on the next loop iteration.
             ContainerIpcBridgeEvent::Accept(Err(error))
-                if error.kind() == std::io::ErrorKind::Interrupted =>
-            {
-                continue;
-            }
+                if error.kind() == std::io::ErrorKind::Interrupted => {}
             ContainerIpcBridgeEvent::Accept(Err(error)) => {
                 return Err(format!("container IPC accept failed: {error}"));
             }

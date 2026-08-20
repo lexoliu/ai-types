@@ -112,10 +112,8 @@ impl Transport for StdioTransport {
                 Some(JsonRpcMessage::Response(response)) if response.id == id => {
                     return Ok(response);
                 }
-                Some(_) => {
-                    // Skip non-matching messages (notifications, other responses)
-                    continue;
-                }
+                // Skip non-matching messages (notifications, other responses).
+                Some(_) => {}
                 None => {
                     return Err(McpError::ConnectionClosed);
                 }
