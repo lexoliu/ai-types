@@ -1,3 +1,8 @@
+// These types mirror the shape of the provider's wire format. Some fields are
+// declared so serde can parse a response faithfully even where this crate does
+// not consume them; dropping them would change how the payload deserializes.
+#![allow(dead_code)]
+
 use serde::Deserialize;
 use zenwave::sse::Event;
 

@@ -1,3 +1,5 @@
+//! Storage backends for extracted memories.
+
 use aither_core::embedding::Embedding;
 use core::future::Future;
 use serde::{Deserialize, Serialize};
@@ -9,16 +11,25 @@ use crate::error::Result;
 /// A single memory entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
+    /// Stable identifier for this memory.
     pub id: Uuid,
+    /// The remembered statement.
     pub content: String,
+    /// Vector used to find this memory by similarity.
     pub embedding: Embedding,
+    /// User this memory belongs to, if scoped to one.
     pub user_id: Option<String>,
+    /// Agent this memory belongs to, if scoped to one.
     pub agent_id: Option<String>,
+    /// When the memory was first stored.
     pub created_at: OffsetDateTime,
+    /// When the memory was last changed.
     pub updated_at: OffsetDateTime,
 }
 
 impl Memory {
+    /// Creates a memory holding `content`, addressed by `embedding`.
+    #[must_use]
     pub fn new(content: impl Into<String>, embedding: Embedding) -> Self {
         let now = OffsetDateTime::now_utc();
         Self {
@@ -32,11 +43,15 @@ impl Memory {
         }
     }
 
+    /// Scopes this memory to a user.
+    #[must_use]
     pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
         self.user_id = Some(user_id.into());
         self
     }
 
+    /// Scopes this memory to an agent.
+    #[must_use]
     pub fn with_agent_id(mut self, agent_id: impl Into<String>) -> Self {
         self.agent_id = Some(agent_id.into());
         self
@@ -46,7 +61,9 @@ impl Memory {
 /// Result of a vector search.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
+    /// The matching memory.
     pub memory: Memory,
+    /// Similarity to the query, higher being closer.
     pub score: f32,
 }
 
@@ -79,20 +96,24 @@ pub trait MemoryStore: Send + Sync {
     ) -> impl Future<Output = Result<Vec<SearchResult>>> + Send;
 }
 
+/// Narrows a search to memories belonging to a user or agent.
 #[derive(Debug, Default, Clone)]
 pub struct SearchFilters {
+    /// Only match memories scoped to this user.
     pub user_id: Option<String>,
+    /// Only match memories scoped to this agent.
     pub agent_id: Option<String>,
 }
 
 /// A simple in-memory store for testing and prototyping.
 /// **Note**: This is O(N) for search and not persistent.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct InMemoryStore {
     memories: Vec<Memory>,
 }
 
 impl InMemoryStore {
+    /// Creates an empty store.
     #[must_use]
     pub fn new() -> Self {
         Self::default()

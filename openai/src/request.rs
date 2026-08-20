@@ -556,7 +556,7 @@ pub enum ResponsesInputContent {
 }
 
 #[derive(Debug, Serialize, Clone)]
-struct InputImageSource {
+pub(crate) struct InputImageSource {
     #[serde(skip_serializing_if = "Option::is_none")]
     image_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

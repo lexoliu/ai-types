@@ -1,3 +1,9 @@
+//! Conversation memory for aither agents.
+//!
+//! Extracts durable facts from a conversation, reconciles them against what is
+//! already stored, and exposes the result both as a query API and as tools an
+//! agent can call.
+
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -10,12 +16,16 @@ use tracing::debug;
 use uuid::Uuid;
 
 pub mod error;
+/// Structured types the language model produces during fact extraction.
 pub mod llm;
+/// Storage backends for extracted memories.
 pub mod store;
 
 pub use error::{Mem0Error, Result};
 pub use store::{InMemoryStore, Memory, SearchResult};
 
+/// Tool that lets an agent search its own memory.
+#[derive(Debug)]
 pub struct SearchTool<L, E, S> {
     inner: Mem0<L, E, S>,
 }
@@ -31,6 +41,13 @@ where
         "search_memories".into()
     }
 
+    fn description(&self) -> std::borrow::Cow<'static, str> {
+        "Search previously stored memories for anything relevant to a query. \
+         Pass the query as a plain string. Returns matching memories as text, \
+         or nothing if none are relevant."
+            .into()
+    }
+
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
         let result = self
             .inner
@@ -41,6 +58,8 @@ where
     }
 }
 
+/// Tool that lets an agent record facts worth remembering.
+#[derive(Debug)]
 pub struct AddFactTool<L, E, S> {
     inner: Mem0<L, E, S>,
 }
@@ -54,6 +73,13 @@ where
     type Arguments = Vec<String>;
     fn name(&self) -> std::borrow::Cow<'static, str> {
         "add_fact".into()
+    }
+
+    fn description(&self) -> std::borrow::Cow<'static, str> {
+        "Record facts worth remembering across conversations. Pass a list of \
+         short, self-contained statements. Existing memories are updated or \
+         removed automatically when a new fact supersedes them."
+            .into()
     }
 
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
@@ -96,8 +122,18 @@ struct Mem0Inner<L, E, S> {
     config: Config,
 }
 
+/// A conversation memory.
+///
+/// Cloning shares the same underlying store and extraction queue.
 pub struct Mem0<L, E, S> {
     inner: Arc<Mem0Inner<L, E, S>>,
+}
+
+impl<L, E, S> std::fmt::Debug for Mem0<L, E, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The model, embedder and store are opaque to this crate.
+        f.debug_struct("Mem0").finish_non_exhaustive()
+    }
 }
 
 impl<L, E, S> Clone for Mem0<L, E, S> {
@@ -114,7 +150,7 @@ where
     E: EmbeddingModel,
     S: MemoryStore,
 {
-    /// Create a new Mem0 instance.
+    /// Create a new memory over the given model, embedder and store.
     pub fn new(llm: L, embedder: E, store: S, config: Config) -> Self {
         Self {
             inner: Arc::new(Mem0Inner {
@@ -135,6 +171,10 @@ where
     /// 2. For each fact, retrieve similar memories.
     /// 3. Decide on an operation (Add, Update, Delete, Noop).
     /// 4. Execute the operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fact extraction, embedding, or the store fails.
     pub async fn add(&self, messages: &[Message]) -> Result<()> {
         // 1. Extract facts
         let facts = self.extract_facts(messages).await?;
@@ -150,6 +190,10 @@ where
     /// And the caller have to wait if you `.await` this method.
     ///
     /// So if you doesn't mind the result of adding facts, you can spawn a task to call this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model call, embedding, or the store fails.
     pub async fn add_fact(&self, facts: Vec<String>) -> Result<()> {
         self.inner.new_facts.write_blocking().extend(facts); // very fast operation
 
@@ -250,6 +294,10 @@ where
     }
 
     /// Search for relevant memories.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query cannot be embedded or the store fails.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<store::SearchResult>> {
         let embedding = self
             .inner
@@ -270,6 +318,7 @@ where
             .await
     }
 
+    /// A tool the agent can call to record facts into this memory.
     #[must_use]
     pub fn add_fact_tool(&self) -> AddFactTool<L, E, S> {
         AddFactTool {
@@ -277,6 +326,7 @@ where
         }
     }
 
+    /// A tool the agent can call to search this memory.
     #[must_use]
     pub fn search_tool(&self) -> SearchTool<L, E, S> {
         SearchTool {
@@ -285,11 +335,19 @@ where
     }
 
     /// Return all stored memories.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store fails.
     pub async fn memories(&self) -> Result<Vec<Memory>> {
         self.inner.store.read_blocking().all().await
     }
 
     /// Retrieve relevant memories and format them for context injection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the search fails.
     pub async fn retrieve_formatted(&self, query: &str, limit: usize) -> Result<String> {
         let results = self.search(query, limit).await?;
         if results.is_empty() {
