@@ -460,6 +460,13 @@ async fn acp_session_agent(
         .map_err(|err| to_acp(anyhow::anyhow!("{err}")))
 }
 
+/// The concrete builder `build_agent` threads through its setup stages.
+type CliAgentBuilder = BashAgentBuilder<
+    CloudProvider,
+    StatefulPermissionHandler<InteractivePermissionHandler>,
+    TokioGlobal,
+>;
+
 async fn build_agent(
     cloud: CloudProvider,
     args: &Args,
@@ -476,8 +483,8 @@ async fn build_agent(
         aither_agent::sandbox::BashTool::new_in(&workdir_parent, permission_handler, TokioGlobal)
             .await?;
 
-    // Create bash-centric agent builder
-    // All tools become IPC commands accessible via bash
+    // Create bash-centric agent builder.
+    // All tools become IPC commands accessible via bash.
     let mut builder = BashAgentBuilder::new(cloud.clone(), bash_tool)
         .tool(aither_agent::websearch::WebSearchTool::default())
         .tool(aither_agent::webfetch::WebFetchTool::new())
@@ -486,9 +493,32 @@ async fn build_agent(
             cloud.clone(),
         ));
 
-    // Load skills if path provided
+    builder = attach_skills_and_subagents(builder, args).await?;
+    builder = attach_mcp_servers(builder, args).await?;
+    builder = attach_subagent_tool(builder, cloud);
+
+    // Add system prompt
+    let builder = if let Some(ref system) = args.system {
+        builder.system_prompt_raw(system)
+    } else {
+        builder.with_default_prompt()
+    };
+
+    builder
+        .hook(DebugHook)
+        .build()
+        .map_err(|err| anyhow::anyhow!("{err}"))
+}
+
+/// Loads the skills and subagent directories the user pointed at.
+///
+/// A missing directory is a warning rather than an error: the agent still runs,
+/// just without those extras.
+async fn attach_skills_and_subagents(
+    mut builder: CliAgentBuilder,
+    args: &Args,
+) -> Result<CliAgentBuilder> {
     if let Some(ref skills_path) = args.skills {
-        // Expand ~ to home directory
         let expanded = expand_tilde(skills_path);
         if path_exists(&expanded).await? {
             builder = builder.with_skills(&expanded).await?;
@@ -503,7 +533,6 @@ async fn build_agent(
         }
     }
 
-    // Set up subagents directory if path provided
     if let Some(ref subagents_path) = args.subagents {
         let expanded = expand_tilde(subagents_path);
         if path_exists(&expanded).await? {
@@ -519,20 +548,23 @@ async fn build_agent(
         }
     }
 
-    // Add Context7 MCP server by default (documentation lookup)
+    Ok(builder)
+}
+
+/// Connects the MCP servers this run should have: Context7 unless opted out,
+/// plus anything in the user's MCP config file.
+///
+/// Context7 failing to connect is a warning — it is a convenience, not a
+/// requirement — but a config file that cannot be read or parsed is an error,
+/// because the user asked for those servers by name.
+async fn attach_mcp_servers(mut builder: CliAgentBuilder, args: &Args) -> Result<CliAgentBuilder> {
     if !args.no_context7 {
         match McpConnection::http("https://mcp.context7.com/mcp").await {
             Ok(conn) => {
                 if !args.quiet {
                     println!("Connected to Context7 MCP server");
                 }
-                // Collect MCP tool descriptions and register
-                for def in conn.mcp_definitions() {
-                    let desc = def.description.clone().unwrap_or_default();
-                    let desc = desc.split('.').next().unwrap_or(&desc).trim().to_string();
-                    builder = builder.tool_description(def.name.clone(), desc);
-                }
-                register_mcp_tools(conn, builder.tool_registry_mut());
+                builder = attach_mcp_connection(builder, conn);
             }
             Err(e) => {
                 if !args.quiet {
@@ -542,55 +574,60 @@ async fn build_agent(
         }
     }
 
-    // Add MCP connections from config file
-    if let Some(ref mcp_path) = args.mcp {
-        let config_str = tokio::fs::read_to_string(mcp_path)
-            .await
-            .with_context(|| format!("failed to read MCP config from {}", mcp_path.display()))?;
-        let config: McpServersConfig =
-            serde_json::from_str(&config_str).with_context(|| "failed to parse MCP config")?;
+    let Some(ref mcp_path) = args.mcp else {
+        return Ok(builder);
+    };
+    let config_str = tokio::fs::read_to_string(mcp_path)
+        .await
+        .with_context(|| format!("failed to read MCP config from {}", mcp_path.display()))?;
+    let config: McpServersConfig =
+        serde_json::from_str(&config_str).with_context(|| "failed to parse MCP config")?;
 
-        let connections = McpConnection::from_configs(&config).await?;
-        for (name, conn) in connections {
-            if !args.quiet {
-                println!("Connected to MCP server: {name}");
-            }
-            for def in conn.mcp_definitions() {
-                let desc = def.description.clone().unwrap_or_default();
-                let desc = desc.split('.').next().unwrap_or(&desc).trim().to_string();
-                builder = builder.tool_description(def.name.clone(), desc);
-            }
-            register_mcp_tools(conn, builder.tool_registry_mut());
+    for (name, conn) in McpConnection::from_configs(&config).await? {
+        if !args.quiet {
+            println!("Connected to MCP server: {name}");
         }
+        builder = attach_mcp_connection(builder, conn);
     }
 
-    // Create SubagentTool and register as bash IPC command
-    // Set base_dir to sandbox directory so paths like .subagents/ resolve correctly
+    Ok(builder)
+}
+
+/// Registers one MCP connection's tools as bash commands.
+///
+/// The bash command listing only has room for a one-line summary, so each
+/// tool's description is cut back to its first sentence.
+fn attach_mcp_connection(mut builder: CliAgentBuilder, conn: McpConnection) -> CliAgentBuilder {
+    for def in conn.mcp_definitions() {
+        let desc = def.description.clone().unwrap_or_default();
+        let desc = desc.split('.').next().unwrap_or(&desc).trim().to_string();
+        builder = builder.tool_description(def.name.clone(), desc);
+    }
+    register_mcp_tools(conn, builder.tool_registry_mut());
+    builder
+}
+
+/// Registers the subagent spawner as a bash IPC command.
+///
+/// Its base directory is the sandbox, so relative paths such as `.subagents/`
+/// resolve the way they do for every other command the agent runs.
+fn attach_subagent_tool(builder: CliAgentBuilder, cloud: CloudProvider) -> CliAgentBuilder {
     let subagent_tool = SubagentTool::new(cloud)
         .with_builtins()
         .with_base_dir(builder.sandbox_dir().to_string())
         .with_bash_tool_factory(builder.bash_tool_factory());
-    let mut subagent_desc = String::from("Spawn subagent for complex tasks (types: ");
-    let subagent_names: Vec<_> = subagent_tool
+
+    let names: Vec<_> = subagent_tool
         .type_descriptions()
         .iter()
-        .map(|(n, _)| *n)
+        .map(|(name, _)| *name)
         .collect();
-    subagent_desc.push_str(&subagent_names.join(", "));
-    subagent_desc.push(')');
-    builder = builder.tool_with_desc(subagent_tool, subagent_desc);
+    let description = format!(
+        "Spawn subagent for complex tasks (types: {})",
+        names.join(", ")
+    );
 
-    // Add system prompt
-    let builder = if let Some(ref system) = args.system {
-        builder.system_prompt_raw(system)
-    } else {
-        builder.with_default_prompt()
-    };
-
-    builder
-        .hook(DebugHook)
-        .build()
-        .map_err(|err| anyhow::anyhow!("{err}"))
+    builder.tool_with_desc(subagent_tool, description)
 }
 
 /// Run a single prompt and exit (headless mode).

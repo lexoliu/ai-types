@@ -104,85 +104,146 @@ fn respond_stream(
     Box::pin(respond_stream_inner(cfg, request))
 }
 
+/// Assembles the Gemini request for a provider-agnostic one.
+///
+/// Async because file attachments are uploaded before the request is sent.
+///
+/// # Errors
+///
+/// Returns [`GeminiError`] if the request carries another provider's cache
+/// settings, names an exact tool that was not supplied, or an attachment cannot
+/// be resolved.
+async fn build_generate_request(
+    cfg: &crate::config::GeminiConfig,
+    request: LLMRequest,
+) -> Result<GenerateContentRequest, GeminiError> {
+    let (messages, parameters, tool_defs) = request.into_parts();
+
+    if parameters.cache.openai.is_some() || parameters.cache.claude.is_some() {
+        return Err(GeminiError::Api(
+            "Gemini provider only accepts cache.gemini settings".to_string(),
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let messages = crate::attachments::resolve_messages(cfg, messages).await?;
+
+    let (system_instruction, contents) = messages_to_gemini(&messages);
+
+    let tool_defs: Vec<ToolDefinition> = match &parameters.tool_choice {
+        ToolChoice::None => Vec::new(),
+        ToolChoice::Exact(name) => tool_defs
+            .into_iter()
+            .filter(|tool| tool.name() == name)
+            .collect(),
+        ToolChoice::Auto | ToolChoice::Required => tool_defs,
+    };
+    let has_function_tools = !tool_defs.is_empty();
+
+    if let ToolChoice::Exact(name) = &parameters.tool_choice
+        && !has_function_tools
+    {
+        return Err(GeminiError::Api(format!(
+            "Exact tool choice '{name}' is not present in tool definitions"
+        )));
+    }
+
+    let mut tools: Vec<GeminiTool> = Vec::new();
+    if has_function_tools {
+        tools.push(GeminiTool::FunctionTool {
+            function_declarations: convert_tool_definitions(tool_defs),
+        });
+    }
+
+    // Google's own tools cannot be combined with a narrowed tool choice: the
+    // model would be free to answer with a tool the caller did not ask about.
+    let builtins_allowed = !matches!(
+        parameters.tool_choice,
+        ToolChoice::None | ToolChoice::Exact(_)
+    );
+    if builtins_allowed && parameters.websearch {
+        tools.push(GeminiTool::GoogleSearchTool {
+            google_search: GoogleSearch {},
+        });
+    }
+    if builtins_allowed && parameters.code_execution {
+        tools.push(GeminiTool::CodeExecutionTool {
+            code_execution: crate::types::CodeExecution {},
+        });
+    }
+
+    Ok(GenerateContentRequest {
+        system_instruction,
+        contents,
+        generation_config: build_generation_config(&parameters, None),
+        tools,
+        tool_config: build_tool_config(&parameters, has_function_tools),
+        safety_settings: Vec::new(),
+        cached_content: parameters
+            .cache
+            .gemini
+            .as_ref()
+            .map(|cache| cache.cached_content.clone()),
+    })
+}
+
+/// Turns one candidate's content into the events it represents, in wire order:
+/// reasoning, then text, then built-in tool output, then function calls.
+fn events_from_content(content: &GeminiContent) -> Vec<Event> {
+    let mut events = Vec::new();
+
+    events.extend(content.reasoning_chunks().into_iter().map(Event::Reasoning));
+    events.extend(
+        content
+            .text_chunks()
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .map(Event::Text),
+    );
+
+    for part in &content.parts {
+        if let Some(code) = &part.executable_code {
+            events.push(Event::BuiltInToolResult {
+                tool: "code_execution".to_string(),
+                result: format!("```{}\n{}\n```", code.language.to_lowercase(), code.code),
+            });
+        }
+        if let Some(result) = &part.code_execution_result {
+            events.push(Event::BuiltInToolResult {
+                tool: "code_execution".to_string(),
+                result: format!("```output\n{}\n```", result.output),
+            });
+        }
+    }
+
+    // Tool calls are reported, never executed: the consumer decides.
+    events.extend(
+        content
+            .function_call_parts()
+            .into_iter()
+            .map(|(call, signature)| {
+                Event::ToolCall(aither_core::llm::ToolCall {
+                    id: tool_call_id(signature.as_deref()),
+                    name: call.name,
+                    arguments: call.args,
+                })
+            }),
+    );
+
+    events
+}
+
 fn respond_stream_inner(
     cfg: crate::config::GeminiConfig,
     request: LLMRequest,
 ) -> impl Stream<Item = Result<Event, GeminiError>> + Send {
     async_stream::stream! {
-        let (messages, parameters, tool_defs) = request.into_parts();
-        if parameters.cache.openai.is_some() || parameters.cache.claude.is_some() {
-            yield Err(GeminiError::Api(
-                "Gemini provider only accepts cache.gemini settings".to_string(),
-            ));
-            return;
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let messages = match crate::attachments::resolve_messages(&cfg, messages).await {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                yield Err(err);
+        let gemini_request = match build_generate_request(&cfg, request).await {
+            Ok(request) => request,
+            Err(e) => {
+                yield Err(e);
                 return;
             }
-        };
-        #[cfg(target_arch = "wasm32")]
-        let messages = messages;
-        let (system_instruction, contents) = messages_to_gemini(&messages);
-        let mut gemini_tools_payload: Vec<GeminiTool> = Vec::new();
-        let tool_defs = match &parameters.tool_choice {
-            ToolChoice::None => Vec::new(),
-            ToolChoice::Exact(name) => tool_defs
-                .into_iter()
-                .filter(|tool| tool.name() == name)
-                .collect(),
-            ToolChoice::Auto | ToolChoice::Required => tool_defs,
-        };
-        let has_function_tools = !tool_defs.is_empty();
-        if let ToolChoice::Exact(name) = &parameters.tool_choice
-            && !has_function_tools
-        {
-            yield Err(GeminiError::Api(format!(
-                "Exact tool choice '{name}' is not present in tool definitions"
-            )));
-            return;
-        }
-
-        // Add function declarations from aither-core Tools
-        if has_function_tools {
-            gemini_tools_payload.push(GeminiTool::FunctionTool {
-                function_declarations: convert_tool_definitions(tool_defs),
-            });
-        }
-
-        // Add native Google Search tool if enabled in parameters
-        if parameters.websearch && !matches!(parameters.tool_choice, ToolChoice::None | ToolChoice::Exact(_)) {
-            gemini_tools_payload.push(GeminiTool::GoogleSearchTool {
-                google_search: GoogleSearch {},
-            });
-        }
-
-        // Add native Code Execution tool if enabled in parameters
-        if parameters.code_execution && !matches!(parameters.tool_choice, ToolChoice::None | ToolChoice::Exact(_)) {
-            gemini_tools_payload.push(GeminiTool::CodeExecutionTool {
-                code_execution: crate::types::CodeExecution {},
-            });
-        }
-
-        let tool_config = build_tool_config(&parameters, has_function_tools);
-        let generation_config = build_generation_config(&parameters, None);
-
-        let gemini_request = GenerateContentRequest {
-            system_instruction,
-            contents,
-            generation_config,
-            tools: gemini_tools_payload,
-            tool_config,
-            safety_settings: Vec::new(),
-            cached_content: parameters
-                .cache
-                .gemini
-                .as_ref()
-                .map(|cache| cache.cached_content.clone()),
         };
 
         debug!("Gemini request: {:?}", gemini_request);
@@ -215,10 +276,10 @@ fn respond_stream_inner(
             }
 
             let Some(candidate) = response.primary_candidate() else {
-                // Skip chunks without candidates (might be metadata)
+                // Chunks without candidates carry metadata, not content — but a
+                // blocked prompt is reported this way and must not pass silently.
                 if let Some(feedback) = &response.prompt_feedback {
-                    let message = format_prompt_feedback(feedback);
-                    yield Err(GeminiError::Api(message));
+                    yield Err(GeminiError::Api(format_prompt_feedback(feedback)));
                 }
                 continue;
             };
@@ -231,48 +292,8 @@ fn respond_stream_inner(
                 continue;
             };
 
-            // Emit reasoning events
-            for reasoning in content.reasoning_chunks() {
-                yield Ok(Event::Reasoning(reasoning));
-            }
-
-            // Emit text events
-            for text in content.text_chunks() {
-                if !text.is_empty() {
-                    yield Ok(Event::Text(text));
-                }
-            }
-
-            // Emit built-in tool results (code execution)
-            for part in &content.parts {
-                if let Some(code) = &part.executable_code {
-                    let code_block = format!(
-                        "```{}\n{}\n```",
-                        code.language.to_lowercase(),
-                        code.code
-                    );
-                    yield Ok(Event::BuiltInToolResult {
-                        tool: "code_execution".to_string(),
-                        result: code_block,
-                    });
-                }
-                if let Some(result) = &part.code_execution_result {
-                    let output_block = format!("```output\n{}\n```", result.output);
-                    yield Ok(Event::BuiltInToolResult {
-                        tool: "code_execution".to_string(),
-                        result: output_block,
-                    });
-                }
-            }
-
-            // Emit tool call events (NOT executed - consumer handles execution)
-            for (call, signature) in content.function_call_parts() {
-                let call_id = tool_call_id(signature.as_deref());
-                yield Ok(Event::ToolCall(aither_core::llm::ToolCall {
-                    id: call_id,
-                    name: call.name.clone(),
-                    arguments: call.args.clone(),
-                }));
+            for event in events_from_content(content) {
+                yield Ok(event);
             }
 
             if let Some(reason) = candidate.finish_reason.clone() {

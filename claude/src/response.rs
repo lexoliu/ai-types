@@ -306,149 +306,179 @@ impl StreamState {
 /// Parse a single SSE event into LLM events.
 ///
 /// Updates the stream state and returns events to emit.
+///
+/// # Errors
+///
+/// Returns [`ClaudeError`] if the event body does not parse, or if the API sent
+/// an `error` event.
 pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<Vec<LLMEvent>, ClaudeError> {
-    let event_name = event.event();
-    let event_type = event_name.unwrap_or("");
     let data = event.text_data();
 
-    let mut events = Vec::new();
-
-    match event_type {
+    match event.event().unwrap_or("") {
         "message_start" => {
-            // Store message metadata if needed
-            let ev: MessageStartEvent = serde_json::from_str(data)?;
-            if let Some(usage) = ev.message.usage {
-                state.uncached_input_tokens = Some(usage.input_tokens);
-                state.completion_tokens = Some(usage.output_tokens);
-                state.cache_write_tokens = usage.cache_write_tokens();
-                state.cache_read_tokens = usage.cache_read_input_tokens;
-                state.refresh_prompt_tokens();
-            }
+            state.apply_message_start(serde_json::from_str(data)?);
+            Ok(Vec::new())
         }
-        "content_block_start" => {
-            let ev: ContentBlockStartEvent = serde_json::from_str(data)?;
-            ensure_block_capacity(state, ev.index);
-
-            match ev.content_block {
-                ContentBlockType::Text { text } => {
-                    state.blocks[ev.index] = BlockState::Text(text.clone());
-                    if !text.is_empty() {
-                        events.push(LLMEvent::Text(text));
-                    }
-                }
-                ContentBlockType::Thinking { thinking } => {
-                    state.blocks[ev.index] = BlockState::Thinking(thinking.clone());
-                    if !thinking.is_empty() {
-                        events.push(LLMEvent::Reasoning(thinking));
-                    }
-                }
-                ContentBlockType::ToolUse { id, name, .. } => {
-                    state.blocks[ev.index] = BlockState::ToolUse {
-                        id,
-                        name,
-                        input_json: String::new(),
-                    };
-                }
-            }
-        }
-        "content_block_delta" => {
-            let ev: ContentBlockDeltaEvent = serde_json::from_str(data)?;
-
-            if let Some(block) = state.blocks.get_mut(ev.index) {
-                match (&mut *block, ev.delta) {
-                    (BlockState::Text(text), DeltaType::TextDelta { text: delta }) => {
-                        text.push_str(&delta);
-                        events.push(LLMEvent::Text(delta));
-                    }
-                    (
-                        BlockState::Thinking(thinking),
-                        DeltaType::ThinkingDelta { thinking: delta },
-                    ) => {
-                        thinking.push_str(&delta);
-                        events.push(LLMEvent::Reasoning(delta));
-                    }
-                    (
-                        BlockState::ToolUse { input_json, .. },
-                        DeltaType::InputJsonDelta { partial_json },
-                    ) => {
-                        input_json.push_str(&partial_json);
-                    }
-                    _ => {
-                        // Mismatched delta type - ignore
-                    }
-                }
-            }
-        }
+        "content_block_start" => Ok(state.begin_block(serde_json::from_str(data)?)),
+        "content_block_delta" => Ok(state.apply_block_delta(serde_json::from_str(data)?)),
         "content_block_stop" => {
-            // Block finished - finalize any tool calls
             #[derive(Deserialize)]
             struct StopEvent {
                 index: usize,
             }
             let ev: StopEvent = serde_json::from_str(data)?;
-
-            if let Some(BlockState::ToolUse {
-                id,
-                name,
-                input_json,
-            }) = state.blocks.get(ev.index)
-            {
-                // Parse the accumulated JSON
-                let input = serde_json::from_str(input_json)
-                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
-                state.tool_calls.push(ToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input,
-                });
-            }
+            state.finish_block(ev.index);
+            Ok(Vec::new())
         }
         "message_delta" => {
-            let ev: MessageDeltaEvent = serde_json::from_str(data)?;
-            state.stop_reason = ev.delta.stop_reason;
-            if let Some(usage) = ev.usage {
-                if let Some(output_tokens) = usage.output_tokens {
-                    state.completion_tokens = Some(output_tokens);
+            state.apply_message_delta(serde_json::from_str(data)?);
+            Ok(Vec::new())
+        }
+        "message_stop" => Ok(state.maybe_usage_event().into_iter().collect()),
+        // Keepalives carry nothing to emit.
+        "ping" | "" => Ok(Vec::new()),
+        "error" => Err(parse_error_event(data)),
+        unknown => {
+            // Anthropic adds event types over time; an unfamiliar one is not a
+            // reason to fail the stream.
+            tracing::debug!("Unknown Claude SSE event type: {unknown}");
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// Reads the message out of an `error` event, falling back to its raw body.
+fn parse_error_event(data: &str) -> ClaudeError {
+    #[derive(Deserialize)]
+    struct ErrorEvent {
+        error: ErrorDetail,
+    }
+    #[derive(Deserialize)]
+    struct ErrorDetail {
+        message: String,
+    }
+
+    serde_json::from_str::<ErrorEvent>(data).map_or_else(
+        |_| ClaudeError::Api(data.to_string()),
+        |ev| ClaudeError::Api(ev.error.message),
+    )
+}
+
+impl StreamState {
+    /// Records the usage figures the API reports when a message opens.
+    fn apply_message_start(&mut self, ev: MessageStartEvent) {
+        let Some(usage) = ev.message.usage else {
+            return;
+        };
+        self.uncached_input_tokens = Some(usage.input_tokens);
+        self.completion_tokens = Some(usage.output_tokens);
+        self.cache_write_tokens = usage.cache_write_tokens();
+        self.cache_read_tokens = usage.cache_read_input_tokens;
+        self.refresh_prompt_tokens();
+    }
+
+    /// Opens a content block, emitting whatever text arrived with it.
+    fn begin_block(&mut self, ev: ContentBlockStartEvent) -> Vec<LLMEvent> {
+        ensure_block_capacity(self, ev.index);
+
+        match ev.content_block {
+            ContentBlockType::Text { text } => {
+                self.blocks[ev.index] = BlockState::Text(text.clone());
+                if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![LLMEvent::Text(text)]
                 }
-                if let Some(cache_write_tokens) = usage.cache_write_tokens() {
-                    state.cache_write_tokens = Some(cache_write_tokens);
+            }
+            ContentBlockType::Thinking { thinking } => {
+                self.blocks[ev.index] = BlockState::Thinking(thinking.clone());
+                if thinking.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![LLMEvent::Reasoning(thinking)]
                 }
-                if let Some(cache_read_tokens) = usage.cache_read_input_tokens {
-                    state.cache_read_tokens = Some(cache_read_tokens);
-                }
-                state.refresh_prompt_tokens();
             }
-        }
-        "message_stop" => {
-            if let Some(usage_event) = state.maybe_usage_event() {
-                events.push(usage_event);
+            ContentBlockType::ToolUse { id, name, .. } => {
+                self.blocks[ev.index] = BlockState::ToolUse {
+                    id,
+                    name,
+                    input_json: String::new(),
+                };
+                Vec::new()
             }
-        }
-        "ping" | "" => {
-            // Keepalive - no action needed
-        }
-        "error" => {
-            // Parse error response
-            #[derive(Deserialize)]
-            struct ErrorEvent {
-                error: ErrorDetail,
-            }
-            #[derive(Deserialize)]
-            struct ErrorDetail {
-                message: String,
-            }
-            if let Ok(ev) = serde_json::from_str::<ErrorEvent>(data) {
-                return Err(ClaudeError::Api(ev.error.message));
-            }
-            return Err(ClaudeError::Api(data.to_string()));
-        }
-        _ => {
-            // Unknown event type - log but don't fail
-            tracing::debug!("Unknown Claude SSE event type: {event_type}");
         }
     }
 
-    Ok(events)
+    /// Appends a delta to its block, emitting it if it is text the caller sees.
+    ///
+    /// A delta whose type does not match the block it names is dropped: the two
+    /// disagreeing leaves nothing meaningful to append.
+    fn apply_block_delta(&mut self, ev: ContentBlockDeltaEvent) -> Vec<LLMEvent> {
+        let Some(block) = self.blocks.get_mut(ev.index) else {
+            return Vec::new();
+        };
+
+        match (block, ev.delta) {
+            (BlockState::Text(text), DeltaType::TextDelta { text: delta }) => {
+                text.push_str(&delta);
+                vec![LLMEvent::Text(delta)]
+            }
+            (BlockState::Thinking(thinking), DeltaType::ThinkingDelta { thinking: delta }) => {
+                thinking.push_str(&delta);
+                vec![LLMEvent::Reasoning(delta)]
+            }
+            (
+                BlockState::ToolUse { input_json, .. },
+                DeltaType::InputJsonDelta { partial_json },
+            ) => {
+                input_json.push_str(&partial_json);
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Closes a content block, turning a finished tool-use block into a call.
+    ///
+    /// Arguments that did not parse become an empty object rather than failing
+    /// the stream: the tool reports the mismatch far more usefully than a
+    /// truncated JSON error would.
+    fn finish_block(&mut self, index: usize) {
+        let Some(BlockState::ToolUse {
+            id,
+            name,
+            input_json,
+        }) = self.blocks.get(index)
+        else {
+            return;
+        };
+
+        let input = serde_json::from_str(input_json)
+            .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+        self.tool_calls.push(ToolCall {
+            id: id.clone(),
+            name: name.clone(),
+            input,
+        });
+    }
+
+    /// Folds in the running usage figures the API reports as it generates.
+    fn apply_message_delta(&mut self, ev: MessageDeltaEvent) {
+        self.stop_reason = ev.delta.stop_reason;
+        let Some(usage) = ev.usage else {
+            return;
+        };
+        if let Some(output_tokens) = usage.output_tokens {
+            self.completion_tokens = Some(output_tokens);
+        }
+        if let Some(cache_write_tokens) = usage.cache_write_tokens() {
+            self.cache_write_tokens = Some(cache_write_tokens);
+        }
+        if let Some(cache_read_tokens) = usage.cache_read_input_tokens {
+            self.cache_read_tokens = Some(cache_read_tokens);
+        }
+        self.refresh_prompt_tokens();
+    }
 }
 
 /// Ensure the blocks vector has capacity for the given index.

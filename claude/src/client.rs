@@ -85,6 +85,91 @@ impl Claude {
     }
 }
 
+/// Turns a provider-agnostic request into an Anthropic Messages request.
+///
+/// # Errors
+///
+/// Returns [`ClaudeError::Api`] if the request carries another provider's cache
+/// settings, names an exact tool that was not supplied, or asks for a cache
+/// strategy this request cannot satisfy.
+fn build_messages_request(
+    cfg: &Config,
+    request: LLMRequest,
+) -> Result<MessagesRequest, ClaudeError> {
+    let (core_messages, parameters, tool_definitions) = request.into_parts();
+
+    if parameters.cache.openai.is_some() || parameters.cache.gemini.is_some() {
+        return Err(ClaudeError::Api(
+            "Claude provider only accepts cache.claude settings".to_string(),
+        ));
+    }
+
+    let (mut system_prompt, mut claude_messages) = to_claude_messages(&core_messages);
+    let snapshot = ParameterSnapshot::from(&parameters);
+    let tool_definitions = filter_tool_definitions(tool_definitions, &snapshot.tool_choice);
+
+    if let ToolChoice::Exact(name) = &snapshot.tool_choice
+        && tool_definitions.is_empty()
+    {
+        return Err(ClaudeError::Api(format!(
+            "Exact tool choice '{name}' is not present in tool definitions"
+        )));
+    }
+
+    let has_tools = !tool_definitions.is_empty();
+    let mut claude_tools = has_tools.then(|| convert_tools(&tool_definitions));
+    let claude_tool_choice = tool_choice_payload(&snapshot.tool_choice, has_tools);
+
+    let cache_control = match snapshot.cache {
+        Some(cache) => apply_cache_strategy(
+            &mut system_prompt,
+            &mut claude_messages,
+            &mut claude_tools,
+            cache,
+        )
+        .map_err(ClaudeError::Api)?,
+        None => None,
+    };
+
+    Ok(MessagesRequest {
+        model: cfg.model.clone(),
+        max_tokens: snapshot.max_tokens.unwrap_or(cfg.default_max_tokens),
+        messages: claude_messages,
+        system: system_prompt,
+        stream: true,
+        temperature: snapshot.temperature,
+        top_p: snapshot.top_p,
+        top_k: snapshot.top_k,
+        stop_sequences: snapshot.stop_sequences,
+        tools: claude_tools,
+        tool_choice: claude_tool_choice,
+        cache_control,
+    })
+}
+
+/// Opens the Messages SSE stream for an already-built request body.
+///
+/// # Errors
+///
+/// Returns [`ClaudeError::Http`] if the request cannot be built or sent.
+async fn open_message_stream(
+    cfg: &Config,
+    body: &MessagesRequest,
+) -> Result<zenwave::sse::SseStream, ClaudeError> {
+    let mut backend = client();
+    let builder = backend
+        .post(cfg.request_url("/v1/messages"))
+        .and_then(|b| b.header("x-api-key", cfg.api_key.clone()))
+        .and_then(|b| b.header("anthropic-version", ANTHROPIC_VERSION))
+        .and_then(|b| b.header(header::CONTENT_TYPE.as_str(), "application/json"))
+        .and_then(|b| b.header(header::ACCEPT.as_str(), "text/event-stream"))
+        .and_then(|b| b.header(header::USER_AGENT.as_str(), "aither-claude/0.1"))
+        .and_then(|b| b.json_body(body))
+        .map_err(ClaudeError::Http)?;
+
+    builder.sse().await.map_err(ClaudeError::Http)
+}
+
 impl LanguageModel for Claude {
     type Error = ClaudeError;
 
@@ -93,129 +178,57 @@ impl LanguageModel for Claude {
         request: LLMRequest,
     ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         let cfg = self.config();
-        let (core_messages, parameters, tool_definitions) = request.into_parts();
-        let (mut system_prompt, mut claude_messages) = to_claude_messages(&core_messages);
-        let snapshot = ParameterSnapshot::from(&parameters);
-        let filtered_tool_definitions =
-            filter_tool_definitions(tool_definitions, &snapshot.tool_choice);
-        let missing_exact_tool = match &snapshot.tool_choice {
-            ToolChoice::Exact(name) if filtered_tool_definitions.is_empty() => Some(name.clone()),
-            _ => None,
-        };
-        let has_tools = !filtered_tool_definitions.is_empty();
-        let mut claude_tools = has_tools.then(|| convert_tools(&filtered_tool_definitions));
-        let claude_tool_choice = tool_choice_payload(&snapshot.tool_choice, has_tools);
-
-        let max_tokens = snapshot.max_tokens.unwrap_or(cfg.default_max_tokens);
+        // Built before the stream so a malformed request fails on its first
+        // poll rather than after the connection has been opened.
+        let prepared = build_messages_request(&cfg, request);
 
         async_stream::stream! {
-            if parameters.cache.openai.is_some() || parameters.cache.gemini.is_some() {
-                yield Err(ClaudeError::Api(
-                    "Claude provider only accepts cache.claude settings".to_string(),
-                ));
-                return;
-            }
-
-            if let Some(tool_name) = &missing_exact_tool {
-                yield Err(ClaudeError::Api(format!(
-                    "Exact tool choice '{tool_name}' is not present in tool definitions"
-                )));
-                return;
-            }
-
-            let top_level_cache_control = if let Some(cache) = snapshot.cache {
-                match apply_cache_strategy(
-                    &mut system_prompt,
-                    &mut claude_messages,
-                    &mut claude_tools,
-                    cache,
-                ) {
-                    Ok(control) => control,
-                    Err(error) => {
-                        yield Err(ClaudeError::Api(error));
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-
-            // Build and send request
-            let request_body = MessagesRequest {
-                model: cfg.model.clone(),
-                max_tokens,
-                messages: claude_messages,
-                system: system_prompt,
-                stream: true,
-                temperature: snapshot.temperature,
-                top_p: snapshot.top_p,
-                top_k: snapshot.top_k,
-                stop_sequences: snapshot.stop_sequences.clone(),
-                tools: claude_tools,
-                tool_choice: claude_tool_choice,
-                cache_control: top_level_cache_control,
-            };
-
-            debug!("Claude request: {:?}", request_body);
-
-            let endpoint = cfg.request_url("/v1/messages");
-            let mut backend = client();
-
-            // Claude-specific headers
-            let builder = match backend
-                .post(endpoint)
-                .and_then(|b| b.header("x-api-key", cfg.api_key.clone()))
-                .and_then(|b| b.header("anthropic-version", ANTHROPIC_VERSION))
-                .and_then(|b| b.header(header::CONTENT_TYPE.as_str(), "application/json"))
-                .and_then(|b| b.header(header::ACCEPT.as_str(), "text/event-stream"))
-                .and_then(|b| b.header(header::USER_AGENT.as_str(), "aither-claude/0.1"))
-                .and_then(|b| b.json_body(&request_body))
-            {
-                Ok(b) => b,
+            let request_body = match prepared {
+                Ok(body) => body,
                 Err(e) => {
-                    yield Err(ClaudeError::Http(e));
+                    yield Err(e);
                     return;
                 }
             };
 
-            let sse_stream = match builder.sse().await {
+            debug!("Claude request: {:?}", request_body);
+
+            let sse_stream = match open_message_stream(&cfg, &request_body).await {
                 Ok(stream) => stream,
                 Err(e) => {
-                    yield Err(ClaudeError::Http(e));
+                    yield Err(e);
                     return;
                 }
             };
             futures_lite::pin!(sse_stream);
 
-            // Process SSE events
             let mut state = StreamState::new();
 
             while let Some(event) = sse_stream.next().await {
-                match event {
-                    Ok(e) => {
-                        if should_skip_event(&e) {
-                            continue;
-                        }
-                        match parse_event(&e, &mut state) {
-                            Ok(llm_events) => {
-                                for llm_event in llm_events {
-                                    yield Ok(llm_event);
-                                }
-                            }
-                            Err(e) => {
-                                yield Err(e);
-                                return;
-                            }
+                let event = match event {
+                    Ok(event) => event,
+                    Err(e) => {
+                        yield Err(ClaudeError::from(e));
+                        return;
+                    }
+                };
+                if should_skip_event(&event) {
+                    continue;
+                }
+                match parse_event(&event, &mut state) {
+                    Ok(llm_events) => {
+                        for llm_event in llm_events {
+                            yield Ok(llm_event);
                         }
                     }
                     Err(e) => {
-                        yield Err(ClaudeError::from(e));
+                        yield Err(e);
                         return;
                     }
                 }
             }
 
-            // Yield tool call events (NOT executed - consumer handles execution)
+            // Tool calls are reported, never executed: the consumer decides.
             for call in state.tool_calls {
                 yield Ok(Event::ToolCall(aither_core::llm::ToolCall {
                     id: call.id,
