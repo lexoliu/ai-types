@@ -107,6 +107,11 @@ pub struct ListFilesResponse {
 /// Upload raw bytes to the Gemini Files API.
 ///
 /// This is the cross-platform upload entry point (including wasm).
+///
+/// # Errors
+///
+/// Returns an error if the upload request fails or the provider rejects
+/// the file.
 pub async fn upload_bytes(
     cfg: &GeminiConfig,
     file_name: &str,
@@ -153,7 +158,10 @@ pub async fn upload_bytes(
     // Part 1: Metadata (JSON)
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
     body.extend_from_slice(b"Content-Type: application/json; charset=UTF-8\r\n\r\n");
-    body.extend_from_slice(serde_json::to_string(&metadata).unwrap().as_bytes());
+    // `metadata` is a plain struct of owned strings, so this cannot fail.
+    let metadata_json = serde_json::to_string(&metadata)
+        .map_err(|err| GeminiError::Api(format!("failed to encode upload metadata: {err}")))?;
+    body.extend_from_slice(metadata_json.as_bytes());
     body.extend_from_slice(b"\r\n");
 
     // Part 2: File content
@@ -180,6 +188,11 @@ pub async fn upload_bytes(
 ///
 /// This is a native-only convenience API. For wasm, use [`upload_bytes`].
 #[cfg(not(target_arch = "wasm32"))]
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, the upload fails, or the
+/// provider rejects the file.
 pub async fn upload_file(cfg: &GeminiConfig, path: &Path) -> Result<GeminiFile, GeminiError> {
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let mime_type = mime_from_path(path).unwrap_or("application/octet-stream");
@@ -195,6 +208,10 @@ pub async fn upload_file(cfg: &GeminiConfig, path: &Path) -> Result<GeminiFile, 
 /// # Arguments
 /// * `cfg` - Gemini configuration
 /// * `name` - File resource name (e.g., "files/abc123")
+///
+/// # Errors
+///
+/// Returns an error if the request fails, or the provider rejects it.
 pub async fn delete_file(cfg: &GeminiConfig, name: &str) -> Result<(), GeminiError> {
     let url = cfg.endpoint(name);
 
@@ -220,6 +237,10 @@ pub async fn delete_file(cfg: &GeminiConfig, name: &str) -> Result<(), GeminiErr
 /// # Arguments
 /// * `cfg` - Gemini configuration
 /// * `name` - File resource name (e.g., "files/abc123")
+///
+/// # Errors
+///
+/// Returns an error if the request fails, or the provider rejects it.
 pub async fn get_file(cfg: &GeminiConfig, name: &str) -> Result<GeminiFile, GeminiError> {
     let url = cfg.endpoint(name);
 
@@ -245,6 +266,10 @@ pub async fn get_file(cfg: &GeminiConfig, name: &str) -> Result<GeminiFile, Gemi
 /// * `cfg` - Gemini configuration
 /// * `page_size` - Maximum number of files to return
 /// * `page_token` - Page token from previous response
+///
+/// # Errors
+///
+/// Returns an error if the request fails, or the provider rejects it.
 pub async fn list_files(
     cfg: &GeminiConfig,
     page_size: Option<u32>,

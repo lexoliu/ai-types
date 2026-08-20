@@ -236,21 +236,6 @@ impl Part {
         }
     }
 
-    pub(crate) const fn function_call(name: String, args: Value) -> Self {
-        Self {
-            text: None,
-            thought: None,
-            thought_signature: None,
-            inline_data: None,
-            file_data: None,
-            function_call: Some(FunctionCall { name, args }),
-            function_response: None,
-            executable_code: None,
-            code_execution_result: None,
-            metadata: None,
-        }
-    }
-
     pub(crate) const fn function_call_with_signature(
         name: String,
         args: Value,
@@ -390,6 +375,8 @@ pub struct FunctionResponse {
     pub(crate) response: Value,
 }
 
+// Every variant names a kind of tool, so the shared suffix is the point.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)] // This allows deserialization to try matching one variant after another
 pub enum GeminiTool {
@@ -580,6 +567,8 @@ pub struct Candidate {
     pub(crate) safety_ratings: Vec<SafetyRating>,
 }
 
+// The `_token_count` suffix comes from the wire format and must match it.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageMetadata {

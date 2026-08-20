@@ -326,9 +326,8 @@ fn parse_tool_response(content: &str) -> Option<(String, serde_json::Value, Opti
     let mut header_split = header.splitn(2, ':');
     let id = header_split.next()?.trim();
     let name = header_split.next()?.trim().to_string();
-    let output = content[end + 1..]
-        .strip_prefix(' ')
-        .unwrap_or(&content[end + 1..]);
+    let rest = &content[end + 1..];
+    let output = rest.strip_prefix(' ').unwrap_or(rest);
     let (_, signature) = parse_tool_signature(id);
     let response_value = match serde_json::from_str::<serde_json::Value>(output) {
         Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
@@ -585,8 +584,8 @@ fn build_thinking_config(parameters: &Parameters) -> Option<ThinkingConfig> {
         thinking_level: parameters.reasoning_effort.map(|effort| {
             // Gemini does not have a direct mapping for Minimum, so we map it to Low.
             match effort {
-                ReasoningEffort::Minimum => "low",
-                ReasoningEffort::Low => "low",
+                // Gemini has no Minimum tier, so it collapses into Low.
+                ReasoningEffort::Minimum | ReasoningEffort::Low => "low",
                 ReasoningEffort::Medium => "medium",
                 ReasoningEffort::High => "high",
             }
@@ -619,7 +618,7 @@ fn url_to_part(url: &url::Url) -> Option<Part> {
         "http" | "https" => {
             // Check if this is a Gemini Files API URI
             if is_gemini_file_uri(url) {
-                gemini_file_uri_to_part(url)
+                Some(gemini_file_uri_to_part(url))
             } else {
                 // Other HTTP/HTTPS URLs would need to be downloaded first
                 tracing::warn!("Unsupported attachment URL: {}", url);
@@ -640,12 +639,12 @@ fn is_gemini_file_uri(url: &url::Url) -> bool {
 }
 
 /// Convert a Gemini Files API URI to a Part using file reference.
-fn gemini_file_uri_to_part(url: &url::Url) -> Option<Part> {
-    // The file URI contains the path which includes the file type info
-    // We need to infer the MIME type from the original file or use a generic one
-    // For now, use application/octet-stream as the API will handle it
+///
+/// A Files API URI carries no MIME information, so fall back to a generic type
+/// and let the API resolve it from the stored file.
+fn gemini_file_uri_to_part(url: &url::Url) -> Part {
     let mime_type = infer_mime_from_gemini_uri(url).unwrap_or("application/octet-stream");
-    Some(Part::from_file(mime_type, url.as_str()))
+    Part::from_file(mime_type, url.as_str())
 }
 
 /// Try to infer MIME type from a Gemini file URI.

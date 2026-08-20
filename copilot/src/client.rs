@@ -835,10 +835,10 @@ fn chat_completions_stream_inner(
         for (_, acc) in sorted_calls {
             if let (Some(id), Some(name)) = (acc.id, acc.name) {
                 let arguments = if acc.arguments.is_empty() {
-                    Value::Object(Default::default())
+                    Value::Object(serde_json::Map::default())
                 } else {
                     serde_json::from_str(&acc.arguments)
-                        .unwrap_or(Value::Object(Default::default()))
+                        .unwrap_or_else(|_| Value::Object(serde_json::Map::default()))
                 };
                 yield Ok(Event::ToolCall(ToolCall { id, name, arguments }));
             }

@@ -1,3 +1,8 @@
+// These types mirror the provider's error payload. Some fields are declared
+// so a response deserializes faithfully even where this crate only reads a
+// few of them.
+#![allow(dead_code)]
+
 use std::fmt;
 
 use base64::DecodeError;
@@ -21,7 +26,9 @@ pub enum GeminiError {
     Parse(String),
     /// Rate limit exceeded (includes retry delay if available).
     RateLimit {
+        /// What the API said about the limit.
         message: String,
+        /// How long the API asked us to wait, when it said.
         retry_after_secs: Option<u64>,
     },
 }
@@ -29,44 +36,61 @@ pub enum GeminiError {
 /// Gemini API error response structure.
 #[derive(Debug, Deserialize)]
 pub struct ApiErrorResponse {
+    /// The error the API reported, when it reported one.
     pub error: Option<ApiErrorDetail>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ApiErrorDetail {
+    /// Numeric status code.
     pub code: Option<i32>,
+    /// Human-readable description.
     pub message: Option<String>,
+    /// Canonical status name, such as `RESOURCE_EXHAUSTED`.
     pub status: Option<String>,
+    /// Structured details, used to distinguish quota failures from retries.
     pub details: Option<Vec<ApiErrorInfo>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum ApiErrorInfo {
+    /// A quota was exceeded; names which one.
     QuotaFailure(QuotaFailureInfo),
+    /// The API suggested when to retry.
     RetryInfo(RetryInfoDetail),
+    /// Any other detail payload, kept verbatim.
     Other(serde_json::Value),
 }
 
 #[derive(Debug, Deserialize)]
 pub struct QuotaFailureInfo {
+    /// Type URL identifying this detail payload.
     #[serde(rename = "@type")]
     pub type_url: Option<String>,
+    /// The specific quotas that were exceeded.
     pub violations: Option<Vec<QuotaViolation>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+// The `quota_` prefix comes from the wire format and must match it.
+#[allow(clippy::struct_field_names)]
 pub struct QuotaViolation {
+    /// Metric the quota is measured in.
     pub quota_metric: Option<String>,
+    /// Identifier of the exceeded quota.
     pub quota_id: Option<String>,
+    /// The limit that was hit.
     pub quota_value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct RetryInfoDetail {
+    /// Type URL identifying this detail payload.
     #[serde(rename = "@type")]
     pub type_url: Option<String>,
+    /// How long the API suggests waiting before retrying.
     #[serde(rename = "retryDelay")]
     pub retry_delay: Option<String>,
 }

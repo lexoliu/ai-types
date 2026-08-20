@@ -62,8 +62,18 @@ impl RetryConfig {
 
     /// Calculate delay for a given attempt number (0-indexed).
     fn delay_for_attempt(&self, attempt: u32) -> Duration {
+        // Retry delays are milliseconds, so none of these conversions can lose
+        // anything that matters: the value is small, positive, and clamped to
+        // `max_delay` immediately afterwards.
+        #[allow(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_wrap,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss
+        )]
         let delay_ms =
             self.initial_delay.as_millis() as f64 * self.backoff_multiplier.powi(attempt as i32);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let delay = Duration::from_millis(delay_ms as u64);
         delay.min(self.max_delay)
     }
@@ -72,23 +82,17 @@ impl RetryConfig {
 /// Check if an error is retryable.
 const fn is_retryable_error(err: &OpenAIError) -> bool {
     match err {
-        // Network/transport errors are retryable
-        OpenAIError::Http(_) => true,
-        // Body errors (connection issues) may be retryable
-        OpenAIError::Body(_) => true,
-        // SSE stream errors may be retryable
-        OpenAIError::Stream(_) => true,
-        // Rate limit and server errors are retryable
-        OpenAIError::RateLimit { .. } => true,
-        OpenAIError::ServerError { .. } => true,
-        // Timeout is retryable
-        OpenAIError::Timeout => true,
-        // API errors are generally not retryable (bad request, auth, etc.)
-        OpenAIError::Api(_) => false,
-        // Parse errors are not retryable
-        OpenAIError::Json(_) => false,
-        // Decode errors are not retryable
-        OpenAIError::Decode(_) => false,
+        // Transport, stream and server-side failures are all worth another go:
+        // a connection reset, a rate limit, a 5xx or a timeout can all clear.
+        OpenAIError::Http(_)
+        | OpenAIError::Body(_)
+        | OpenAIError::Stream(_)
+        | OpenAIError::RateLimit { .. }
+        | OpenAIError::ServerError { .. }
+        | OpenAIError::Timeout => true,
+        // A rejected request, a malformed response or an undecodable body will
+        // fail identically however many times it is sent.
+        OpenAIError::Api(_) | OpenAIError::Json(_) | OpenAIError::Decode(_) => false,
     }
 }
 
@@ -706,10 +710,10 @@ fn chat_completions_stream_inner(
         for (_, acc) in sorted_calls {
             if let (Some(id), Some(name)) = (acc.id, acc.name) {
                 let arguments = if acc.arguments.is_empty() {
-                    serde_json::Value::Object(Default::default())
+                    serde_json::Value::Object(serde_json::Map::default())
                 } else {
                     serde_json::from_str(&acc.arguments)
-                        .unwrap_or(serde_json::Value::Object(Default::default()))
+                        .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::default()))
                 };
                 yield Ok(Event::ToolCall(ToolCall {
                     id,
@@ -744,9 +748,10 @@ struct FunctionCallAccumulator {
 
 fn parse_tool_call_arguments(arguments: &str) -> serde_json::Value {
     if arguments.is_empty() {
-        serde_json::Value::Object(Default::default())
+        serde_json::Value::Object(serde_json::Map::default())
     } else {
-        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Object(Default::default()))
+        serde_json::from_str(arguments)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::default()))
     }
 }
 
@@ -800,7 +805,7 @@ fn mark_and_emit_done_function_call(
     let acc = function_calls.entry(id).or_default();
     acc.call_id = Some(resolved_call_id.clone());
     acc.name = Some(name.clone());
-    acc.arguments = arguments.clone();
+    acc.arguments.clone_from(&arguments);
     acc.emitted = true;
 
     ToolCall {
