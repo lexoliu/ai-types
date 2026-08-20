@@ -146,11 +146,22 @@ async fn request_with_timeout<T>(
     }
     #[cfg(target_arch = "wasm32")]
     {
+        // The browser timer is not `Send`, and `LanguageModel` requires the
+        // futures built on top of this one to be. Run the timer on the JS event
+        // loop where it belongs and wait on a channel, which is `Send`.
         let millis = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+        let (expired_tx, expired_rx) = async_channel::bounded::<()>(1);
+        wasm_bindgen_futures::spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(millis).await;
+            let _ = expired_tx.send(()).await;
+        });
+
         futures_lite::future::or(
             async move { fut.await.map_err(map_zenwave_error) },
             async move {
-                gloo_timers::future::TimeoutFuture::new(millis).await;
+                // A closed channel means the timer task was dropped, which can
+                // only happen once the whole request is being torn down.
+                let _ = expired_rx.recv().await;
                 Err(OpenAIError::Timeout)
             },
         )

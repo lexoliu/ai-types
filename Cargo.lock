@@ -139,6 +139,7 @@ dependencies = [
  "base64 0.23.1",
  "futures-core",
  "futures-lite",
+ "mime_guess",
  "serde",
  "serde_json",
  "tracing",
@@ -258,12 +259,15 @@ dependencies = [
  "aither-attachments",
  "aither-core",
  "aither-models",
+ "async-channel",
  "async-fs",
  "async-io",
  "async-stream",
  "base64 0.23.1",
  "futures-core",
  "futures-lite",
+ "gloo-timers 0.4.0",
+ "jiff",
  "mime_guess",
  "rustls",
  "schemars 1.2.2",
@@ -272,6 +276,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "wasm-bindgen-futures",
  "zenwave",
 ]
 
@@ -342,6 +347,7 @@ dependencies = [
  "aither-attachments",
  "aither-core",
  "aither-models",
+ "async-channel",
  "async-fs",
  "async-io",
  "async-stream",
@@ -355,6 +361,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "url",
+ "wasm-bindgen-futures",
  "zenwave",
 ]
 

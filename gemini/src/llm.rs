@@ -127,6 +127,10 @@ async fn build_generate_request(
 
     #[cfg(not(target_arch = "wasm32"))]
     let messages = crate::attachments::resolve_messages(cfg, messages).await?;
+    // wasm32 has no filesystem, so there is nothing to upload and no use for
+    // the config here.
+    #[cfg(target_arch = "wasm32")]
+    let _ = cfg;
 
     let (system_instruction, contents) = messages_to_gemini(&messages);
 
@@ -696,7 +700,7 @@ fn parse_data_url(url: &str) -> Option<Part> {
 fn read_file_to_part(url: &url::Url) -> Option<Part> {
     let path = url.to_file_path().ok()?;
     let data = std::fs::read(&path).ok()?;
-    let mime_type = mime_from_path(&path)?;
+    let mime_type = crate::mime::mime_from_path(&path)?;
 
     Some(Part::inline_media(mime_type, data))
 }
@@ -704,36 +708,4 @@ fn read_file_to_part(url: &url::Url) -> Option<Part> {
 #[cfg(target_arch = "wasm32")]
 fn read_file_to_part(_url: &url::Url) -> Option<Part> {
     None
-}
-
-/// Get MIME type from file path extension.
-fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())?
-        .to_lowercase()
-        .as_str()
-    {
-        // Images
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "heic" => Some("image/heic"),
-        "heif" => Some("image/heif"),
-        // Video
-        "mp4" => Some("video/mp4"),
-        "webm" => Some("video/webm"),
-        "mov" => Some("video/quicktime"),
-        "avi" => Some("video/x-msvideo"),
-        // Audio
-        "mp3" => Some("audio/mpeg"),
-        "wav" => Some("audio/wav"),
-        "ogg" => Some("audio/ogg"),
-        "m4a" => Some("audio/mp4"),
-        "flac" => Some("audio/flac"),
-        // Documents
-        "pdf" => Some("application/pdf"),
-        _ => None,
-    }
 }

@@ -20,6 +20,7 @@ futures-core = { version = "0.3", default-features = false }
 futures-lite = "2.6"
 base64 = "0.23"
 mime_guess = "2"
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -30,6 +31,11 @@ tracing.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 async-io = "2.6.0"
 async-fs = "2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-timers = { version = "0.4", features = ["futures"] }
+wasm-bindgen-futures = "0.4"
+async-channel = "2"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }

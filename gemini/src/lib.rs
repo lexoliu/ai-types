@@ -36,6 +36,8 @@ mod error;
 pub mod files;
 mod image;
 mod llm;
+#[cfg(not(target_arch = "wasm32"))]
+mod mime;
 mod moderation;
 mod provider;
 mod types;

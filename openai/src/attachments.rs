@@ -1,5 +1,6 @@
 use url::Url;
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::error::OpenAIError;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -174,6 +175,7 @@ fn purpose_for_kind(kind: OpenAIFileKind) -> FilePurpose {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn build_openai_file_url(kind: OpenAIFileKind, id: &str) -> Result<Url, OpenAIError> {
     let raw = format!("openai://{}/{}", kind.0, id);
     Url::parse(&raw).map_err(|e| OpenAIError::Api(format!("Invalid OpenAI file URL: {e}")))

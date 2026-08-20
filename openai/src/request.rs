@@ -390,40 +390,10 @@ fn read_file_to_data_url(url: &url::Url) -> Option<String> {
 
     let path = url.to_file_path().ok()?;
     let data = std::fs::read(&path).ok()?;
-    let mime_type = mime_from_path(&path)?;
+    let mime_type = crate::mime::mime_from_path(&path)?;
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
 
     Some(format!("data:{mime_type};base64,{base64_data}"))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn read_file_to_data_url(_url: &url::Url) -> Option<String> {
-    None
-}
-
-/// Get MIME type from file path extension.
-fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())?
-        .to_lowercase()
-        .as_str()
-    {
-        // Images
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        // Video (for providers that support it)
-        "mp4" => Some("video/mp4"),
-        "webm" => Some("video/webm"),
-        // Audio (for providers that support it)
-        "mp3" => Some("audio/mpeg"),
-        "wav" => Some("audio/wav"),
-        // Documents
-        "pdf" => Some("application/pdf"),
-        _ => None,
-    }
 }
 
 pub fn convert_tools(definitions: Vec<ToolDefinition>) -> Vec<ToolPayload> {

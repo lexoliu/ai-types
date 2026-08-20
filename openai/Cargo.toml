@@ -33,6 +33,8 @@ async-fs = "2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gloo-timers = { version = "0.4", features = ["futures"] }
+wasm-bindgen-futures = "0.4"
+async-channel = "2"
 
 [lints]
 workspace = true

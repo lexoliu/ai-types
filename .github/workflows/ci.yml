@@ -39,7 +39,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
-      - run: cargo build --target wasm32-unknown-unknown --features std
+      # `aither` itself is not wasm-buildable: the agent, sandbox, and CLI need
+      # a filesystem and processes. Build the crates that are meant to run in a
+      # browser, and deny warnings so a native-only helper cannot quietly rot
+      # into dead code on this target.
+      - run: cargo build --target wasm32-unknown-unknown -p aither-core -p aither-openai -p aither-gemini -p aither-claude
+        env:
+          RUSTFLAGS: "-D warnings"
 
   coverage:
     name: Coverage

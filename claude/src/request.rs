@@ -8,6 +8,8 @@ use aither_core::llm::{
     },
     tool::ToolDefinition,
 };
+// Only the native file:// reader encodes anything here.
+#[cfg(not(target_arch = "wasm32"))]
 use base64::Engine;
 use serde::Serialize;
 use serde_json::Value;
@@ -903,7 +905,15 @@ fn parse_image_source(url: &str) -> Option<ImageSource> {
         })
     } else if url.starts_with("file://") {
         // Read local file and convert to base64
-        read_file_to_base64_source(url)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            read_file_to_base64_source(url)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            tracing::warn!("file:// attachments are not supported on wasm32");
+            None
+        }
     } else if is_image_url(url) {
         Some(ImageSource::Url {
             url: url.to_string(),
@@ -914,6 +924,9 @@ fn parse_image_source(url: &str) -> Option<ImageSource> {
 }
 
 /// Read a file:// URL and convert to base64 image source.
+///
+/// Native only: wasm32 has neither a filesystem nor `Url::to_file_path`.
+#[cfg(not(target_arch = "wasm32"))]
 fn read_file_to_base64_source(file_url: &str) -> Option<ImageSource> {
     let url = url::Url::parse(file_url).ok()?;
     let path = url.to_file_path().ok()?;
@@ -922,7 +935,7 @@ fn read_file_to_base64_source(file_url: &str) -> Option<ImageSource> {
     let data = std::fs::read(&path).ok()?;
 
     // Determine media type from extension
-    let media_type = mime_from_path(&path)?;
+    let media_type = mime_guess::from_path(&path).first_raw()?;
 
     // Encode to base64
     let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
@@ -931,40 +944,6 @@ fn read_file_to_base64_source(file_url: &str) -> Option<ImageSource> {
         media_type: media_type.to_string(),
         data: base64_data,
     })
-}
-
-/// Get MIME type from file path extension.
-///
-/// Supports images, video, audio, and PDFs.
-fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())?
-        .to_lowercase()
-        .as_str()
-    {
-        // Images
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "heic" => Some("image/heic"),
-        "heif" => Some("image/heif"),
-        // Video
-        "mp4" => Some("video/mp4"),
-        "webm" => Some("video/webm"),
-        "mov" => Some("video/quicktime"),
-        "avi" => Some("video/x-msvideo"),
-        // Audio
-        "mp3" => Some("audio/mpeg"),
-        "wav" => Some("audio/wav"),
-        "ogg" => Some("audio/ogg"),
-        "m4a" => Some("audio/mp4"),
-        "flac" => Some("audio/flac"),
-        // Documents
-        "pdf" => Some("application/pdf"),
-        _ => None,
-    }
 }
 
 /// Check if a URL appears to be an image.
