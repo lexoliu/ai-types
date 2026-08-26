@@ -2092,7 +2092,7 @@ mod tests {
         let schema = schemars::schema_for!(SimpleArgs);
         let schema = serde_json::to_value(schema).unwrap();
 
-        // Typo in flag name
+        // Typo in flag name -- deliberate, it is what the suggestion is for.
         let err = cli_to_json(&schema, &["--paht".to_string(), "foo.txt".to_string()]).unwrap_err();
         assert!(err.to_string().contains("Did you mean --path?"));
     }
