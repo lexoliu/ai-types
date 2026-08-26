@@ -16,6 +16,7 @@ aither-core.workspace = true
 
 # Sandboxing
 heel = { path = "../../native-sandbox" }
+rmp-serde = "1"
 
 # Executor for tokio integration
 executor-core = { version = "0.7", features = ["tokio"] }

@@ -156,7 +156,6 @@ fn parse_terminal_result(result: &str) -> Option<TerminalOutput> {
     let exit_code = parsed
         .get("exit_code")
         .and_then(serde_json::Value::as_i64)
-        .and_then(|code| i32::try_from(code).ok())
         .unwrap_or(0);
     let task_id = parsed
         .get("task_id")

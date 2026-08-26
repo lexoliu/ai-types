@@ -192,7 +192,9 @@ where
     ///
     /// Eager tools are included in every LLM request.
     pub fn tool<T: Tool + 'static>(mut self, tool: T) -> Self {
-        self.tools.register(tool);
+        self.tools
+            .register(tool)
+            .expect("tool registration must succeed: duplicate name or missing description");
         self
     }
 
@@ -416,7 +418,9 @@ where
         let permission_receiver = terminal_tool.permission_receiver();
         let job_registry = terminal_tool.job_registry();
         self.sandbox_dir = Some(terminal_tool.working_dir().clone());
-        self.tools.register(terminal_tool);
+        self.tools
+            .register(terminal_tool)
+            .expect("tool registration must succeed: duplicate name or missing description");
         self.background_receiver = Some(background_receiver);
         self.permission_receiver = Some(permission_receiver);
         self.job_registry = Some(job_registry);
@@ -445,7 +449,9 @@ where
     pub fn todo(mut self) -> Self {
         let list = TodoList::new();
         let tool = TodoTool::with_list(list.clone());
-        self.tools.register(tool);
+        self.tools
+            .register(tool)
+            .expect("tool registration must succeed: duplicate name or missing description");
         self.todo_list = Some(list);
         self
     }
@@ -456,7 +462,9 @@ where
     /// or access the list externally.
     pub fn todo_with_list(mut self, list: TodoList) -> Self {
         let tool = TodoTool::with_list(list.clone());
-        self.tools.register(tool);
+        self.tools
+            .register(tool)
+            .expect("tool registration must succeed: duplicate name or missing description");
         self.todo_list = Some(list);
         self
     }
@@ -547,6 +555,7 @@ mod tests {
     // Mock tool
     struct MockTool;
 
+    /// Does nothing, for tests that only care that a tool was registered.
     #[derive(Debug, JsonSchema, Deserialize)]
     struct MockArgs;
 

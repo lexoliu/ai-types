@@ -3,7 +3,7 @@
 //! All registered tools are always loaded into the LLM context.
 
 use aither_core::llm::tool::{
-    IntoToolResult, Tool, ToolDefinition, ToolResult, Tools as CoreTools,
+    IntoToolResult, RegisterError, Tool, ToolDefinition, ToolResult, Tools as CoreTools,
 };
 #[cfg(feature = "mcp")]
 use aither_mcp::{McpConnection, McpToolService};
@@ -79,7 +79,8 @@ impl AgentTools {
                     handler(&args).await.into_tool_result()
                 })
                 },
-            );
+            )
+            .expect("dynamic terminal tool registration must succeed: duplicate name or missing description");
         }
     }
 

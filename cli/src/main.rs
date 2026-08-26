@@ -436,14 +436,15 @@ async fn acp_session_agent(
             .await
             .map_err(|err| to_acp(err.into()))?;
 
-    TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
+    let agent = TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
         .tool(aither_agent::websearch::WebSearchTool::default())
         .tool(aither_agent::webfetch::WebFetchTool::new())
         .tool(aither_agent::TodoTool::new())
         .tool(aither_agent::sandbox::builtin::AskCommand::new(cloud))
         .with_default_prompt()
-        .build()
-        .map_err(|err| to_acp(anyhow::anyhow!("{err}")))
+        .build();
+
+    Ok(agent)
 }
 
 async fn build_agent(
