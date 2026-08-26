@@ -1,3 +1,4 @@
+use aither_core::llm::model::ReasoningEffort;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -375,8 +376,9 @@ pub struct FunctionResponse {
     pub(crate) response: Value,
 }
 
-#[derive(Debug, Clone, Serialize)]
+// Every variant names a kind of tool, so the shared suffix is the point.
 #[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)] // This allows deserialization to try matching one variant after another
 pub enum GeminiTool {
     FunctionTool {
@@ -573,8 +575,9 @@ pub struct Candidate {
     pub(crate) safety_ratings: Vec<SafetyRating>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+// The `_token_count` suffix comes from the wire format and must match it.
 #[allow(clippy::struct_field_names)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageMetadata {
     #[serde(default)]
@@ -632,12 +635,43 @@ pub struct EmbeddingValue {
     pub(crate) values: Vec<f32>,
 }
 
+/// Thinking depth requested from a Gemini model.
+///
+/// Gemini's legacy `thinkingBudget` token count and `thinkingLevel` are
+/// mutually exclusive: sending both returns a 400. Only the level is modelled,
+/// because a level is what the portable [`ReasoningEffort`] scale actually
+/// expresses — translating it into a token count would be inventing precision
+/// the caller never supplied.
+///
+/// [`ReasoningEffort`]: aither_core::llm::model::ReasoningEffort
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingLevel {
+    /// Least thinking. Only accepted by some models; others reject it.
+    Minimal,
+    /// Shallow thinking.
+    Low,
+    /// Balanced thinking depth.
+    Medium,
+    /// Deepest thinking.
+    High,
+}
+
+impl From<ReasoningEffort> for ThinkingLevel {
+    fn from(effort: ReasoningEffort) -> Self {
+        match effort {
+            ReasoningEffort::Minimum => Self::Minimal,
+            ReasoningEffort::Low => Self::Low,
+            ReasoningEffort::Medium => Self::Medium,
+            ReasoningEffort::High => Self::High,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingConfig {
     #[serde(rename = "includeThoughts", skip_serializing_if = "Option::is_none")]
     pub(crate) include_thoughts: Option<bool>,
-    #[serde(rename = "tokenBudget", skip_serializing_if = "Option::is_none")]
-    pub(crate) token_budget: Option<i32>,
     #[serde(rename = "thinkingLevel", skip_serializing_if = "Option::is_none")]
-    pub(crate) thinking_level: Option<String>, // enum in doc, string here for simplicity
+    pub(crate) thinking_level: Option<ThinkingLevel>,
 }

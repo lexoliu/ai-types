@@ -1,6 +1,6 @@
 [package]
 name = "aither-models"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version = "1.87"
 description = "Model registry with capabilities, context windows, and metadata for popular LLMs"
@@ -20,8 +20,10 @@ zenwave = { workspace = true, optional = true }
 [build-dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-ureq = "3"
 
 [features]
 default = []
 remote = ["zenwave", "dep:async-fs"]
+
+[lints]
+workspace = true

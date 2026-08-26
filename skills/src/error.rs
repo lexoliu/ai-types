@@ -18,7 +18,7 @@ pub enum SkillError {
 
     /// Failed to parse skill frontmatter.
     #[error("failed to parse skill frontmatter: {0}")]
-    ParseFrontmatter(#[from] serde_yaml::Error),
+    ParseFrontmatter(#[from] serde_norway::Error),
 
     /// Skill file is missing required frontmatter.
     #[error("skill file missing frontmatter delimiter '---'")]

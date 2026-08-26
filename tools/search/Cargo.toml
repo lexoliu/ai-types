@@ -1,10 +1,11 @@
 [package]
 name = "aither-search"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 description = "Search index/query tool for aither agents"
 readme = "../../README.md"
 keywords = ["ai", "agent", "tool", "search", "rag"]

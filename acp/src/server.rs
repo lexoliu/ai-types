@@ -1,7 +1,12 @@
 //! ACP server that exposes aither agents to code editors.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::path::PathBuf;
+use std::pin::Pin;
 
+use aither_agent::Agent;
+use aither_core::LanguageModel;
 use aither_mcp::transport::{BidirectionalTransport, StdioTransport};
 use tracing::debug;
 
@@ -30,14 +35,25 @@ use crate::session::AcpSession;
 ///     Ok(agent)
 /// }).await?;
 /// ```
-pub struct AcpServer<T: BidirectionalTransport> {
+pub struct AcpServer<T: BidirectionalTransport, LLM: LanguageModel> {
     transport: T,
     info: Implementation,
-    sessions: HashMap<String, AcpSession>,
+    sessions: HashMap<String, AcpSession<LLM>>,
     initialized: bool,
+    /// Builds a fresh agent for each new session.
+    ///
+    /// Sessions are independent conversations, so each gets its own agent
+    /// rather than sharing one and interleaving their contexts. Building one
+    /// is async because setting up a sandbox touches the filesystem.
+    make_agent: AgentFactory<LLM>,
 }
 
-impl<T: BidirectionalTransport> std::fmt::Debug for AcpServer<T> {
+/// Builds the agent backing a new session, given that session's working directory.
+pub type AgentFactory<LLM> = Box<
+    dyn Fn(PathBuf) -> Pin<Box<dyn Future<Output = Result<Agent<LLM, LLM, LLM>>> + Send>> + Send,
+>;
+
+impl<T: BidirectionalTransport, LLM: LanguageModel> std::fmt::Debug for AcpServer<T, LLM> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcpServer")
             .field("info", &self.info)
@@ -47,7 +63,7 @@ impl<T: BidirectionalTransport> std::fmt::Debug for AcpServer<T> {
     }
 }
 
-impl AcpServer<StdioTransport> {
+impl<LLM: LanguageModel> AcpServer<StdioTransport, LLM> {
     /// Create an ACP server using stdio transport.
     ///
     /// This is the standard way to create an ACP server that communicates
@@ -57,11 +73,21 @@ impl AcpServer<StdioTransport> {
     ///
     /// * `name` - The agent name.
     /// * `version` - The agent version.
+    /// * `make_agent` - Builds the agent backing each new session, given the
+    ///   session's working directory.
     ///
     /// # Errors
     ///
     /// Returns an error if stdio cannot be initialized.
-    pub fn stdio(name: impl Into<String>, version: impl Into<String>) -> Result<Self> {
+    pub fn stdio<F, Fut>(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        make_agent: F,
+    ) -> Result<Self>
+    where
+        F: Fn(PathBuf) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Agent<LLM, LLM, LLM>>> + Send + 'static,
+    {
         let transport = StdioTransport::new().map_err(|e| AcpError::Transport(e.to_string()))?;
         Ok(Self {
             transport,
@@ -72,11 +98,12 @@ impl AcpServer<StdioTransport> {
             },
             sessions: HashMap::new(),
             initialized: false,
+            make_agent: Box::new(move |cwd| Box::pin(make_agent(cwd))),
         })
     }
 }
 
-impl<T: BidirectionalTransport> AcpServer<T> {
+impl<T: BidirectionalTransport, LLM: LanguageModel> AcpServer<T, LLM> {
     /// Run the server main loop.
     ///
     /// This processes incoming requests until the connection is closed.
@@ -153,8 +180,8 @@ impl<T: BidirectionalTransport> AcpServer<T> {
 
         match req.method.as_str() {
             "initialize" => self.handle_initialize(req),
-            "session/new" => self.handle_session_new(req),
-            "session/prompt" => self.handle_session_prompt(req),
+            "session/new" => self.handle_session_new(req).await,
+            "session/prompt" => self.handle_session_prompt(req).await,
             "session/stop" => self.handle_session_stop(req),
             method => JsonRpcResponse::error(req.id, JsonRpcError::method_not_found(method)),
         }
@@ -212,8 +239,17 @@ impl<T: BidirectionalTransport> AcpServer<T> {
             }
         };
 
-        // Create new session
-        let session = AcpSession::new(params.cwd, params.mcp_servers);
+        let agent = match (self.make_agent)(params.cwd.clone()).await {
+            Ok(agent) => agent,
+            Err(err) => {
+                return JsonRpcResponse::error(
+                    req.id,
+                    JsonRpcError::internal_error(format!("could not start a session: {err}")),
+                );
+            }
+        };
+
+        let session = AcpSession::new(params.cwd, params.mcp_servers, agent);
         let session_id = session.id().to_string();
 
         self.sessions.insert(session_id.clone(), session);
@@ -236,18 +272,15 @@ impl<T: BidirectionalTransport> AcpServer<T> {
             }
         };
 
-        let Some(session) = self.sessions.get_mut(&params.session_id) else {
+        // Take the session out of the map for the duration of the turn so the
+        // transport can be borrowed to send updates while the agent runs.
+        let Some(mut session) = self.sessions.remove(&params.session_id) else {
             return JsonRpcResponse::error(
                 req.id,
                 JsonRpcError::invalid_params(format!("Session not found: {}", params.session_id)),
             );
         };
 
-        // Process prompt and stream updates
-        // For now, we'll implement a simple placeholder
-        // The actual implementation will integrate with the agent
-
-        // Extract text from prompt
         let prompt_text = params
             .prompt
             .iter()
@@ -261,21 +294,41 @@ impl<T: BidirectionalTransport> AcpServer<T> {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Run the agent and stream updates
-        let stop_reason = match session.prompt(&prompt_text, |update| {
-            // Send session update notification
-            let session_id = params.session_id.clone();
-            let notif = SessionNotification { session_id, update };
-            // Note: In a real implementation, we'd need async notification sending
-            // For now, we'll collect updates and send them after
-            debug!("Session update: {:?}", notif);
-        }) {
+        // Updates are queued as they are produced and flushed after the turn:
+        // `on_update` is a synchronous callback, so it cannot await the
+        // transport itself.
+        let mut updates = Vec::new();
+        let outcome = session
+            .prompt(&prompt_text, |update| updates.push(update))
+            .await;
+
+        for update in updates {
+            let notif = SessionNotification {
+                session_id: params.session_id.clone(),
+                update,
+            };
+            match serde_json::to_value(&notif) {
+                Ok(value) => {
+                    let mut notification = JsonRpcNotification::new("session/update");
+                    notification.params = Some(value);
+                    if let Err(err) = self.notify(notification).await {
+                        debug!("failed to send session update: {err}");
+                    }
+                }
+                Err(err) => debug!("failed to encode session update: {err}"),
+            }
+        }
+
+        let stop_reason = match outcome {
+            Ok(()) if session.is_cancelled() => StopReason::Cancelled,
             Ok(()) => StopReason::EndTurn,
             Err(e) => {
                 debug!("Agent error: {e}");
                 StopReason::Error
             }
         };
+
+        self.sessions.insert(params.session_id, session);
 
         JsonRpcResponse::success(req.id, PromptResult { stop_reason })
     }
@@ -311,7 +364,7 @@ impl<T: BidirectionalTransport> AcpServer<T> {
     ///
     /// # Errors
     ///
-    /// Returns an error if the transport fails while sending the notification.
+    /// Returns an error if the notification cannot be written to the client.
     pub async fn send_update(&mut self, session_id: &str, update: SessionUpdate) -> Result<()> {
         let notif = JsonRpcNotification::with_params(
             "session/update",

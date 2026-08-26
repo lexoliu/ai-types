@@ -111,7 +111,11 @@ impl LanguageModel for Claude {
         claude_tool_payloads.extend(convert_native_tools(&snapshot.native_tools));
         let has_tools = !claude_tool_payloads.is_empty();
         let mut claude_tools = has_tools.then_some(claude_tool_payloads);
-        let claude_tool_choice = tool_choice_payload(&snapshot.tool_choice, has_tools);
+        let claude_tool_choice = tool_choice_payload(
+            &snapshot.tool_choice,
+            has_tools,
+            snapshot.parallel_tool_calls,
+        );
 
         let max_tokens = snapshot.max_tokens.unwrap_or(cfg.default_max_tokens);
 
@@ -202,35 +206,33 @@ impl LanguageModel for Claude {
             };
             futures_lite::pin!(sse_stream);
 
-            // Process SSE events
             let mut state = StreamState::new();
 
             while let Some(event) = sse_stream.next().await {
-                match event {
-                    Ok(e) => {
-                        if should_skip_event(&e) {
-                            continue;
-                        }
-                        match parse_event(&e, &mut state) {
-                            Ok(llm_events) => {
-                                for llm_event in llm_events {
-                                    yield Ok(llm_event);
-                                }
-                            }
-                            Err(e) => {
-                                yield Err(e);
-                                return;
-                            }
+                let event = match event {
+                    Ok(event) => event,
+                    Err(e) => {
+                        yield Err(ClaudeError::from(e));
+                        return;
+                    }
+                };
+                if should_skip_event(&event) {
+                    continue;
+                }
+                match parse_event(&event, &mut state) {
+                    Ok(llm_events) => {
+                        for llm_event in llm_events {
+                            yield Ok(llm_event);
                         }
                     }
                     Err(e) => {
-                        yield Err(ClaudeError::from(e));
+                        yield Err(e);
                         return;
                     }
                 }
             }
 
-            // Yield tool call events (NOT executed - consumer handles execution)
+            // Tool calls are reported, never executed: the consumer decides.
             for call in state.tool_calls {
                 yield Ok(Event::ToolCall(aither_core::llm::ToolCall {
                     id: call.id,

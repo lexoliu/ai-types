@@ -92,13 +92,11 @@ pub mod tool;
 use crate::llm::{model::Parameters, tool::Tools};
 use alloc::{
     boxed::Box,
-    format,
     string::{String, ToString},
     sync::Arc,
     vec,
     vec::Vec,
 };
-use anyhow::{Context, anyhow};
 use core::{any::TypeId, future::Future};
 pub use event::{Event, ToolCall, Usage};
 use futures_core::Stream;
@@ -113,7 +111,54 @@ use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 pub use tool::{IntoToolResult, Tool, ToolResult};
 
-use crate::llm::{model::Profile, tool::json};
+use crate::llm::model::Profile;
+
+/// Why a structured-output call failed.
+///
+/// [`LanguageModel::respond`] reports provider failures through the model's own
+/// [`LanguageModel::Error`]. Structured output adds a second, separate way to
+/// fail — the model answered, but not with the requested shape — so this keeps
+/// the two distinguishable instead of flattening both into one opaque error.
+/// Callers need that distinction: a rate limit is worth retrying, a schema
+/// mismatch is worth re-prompting, and an auth failure is worth neither.
+#[derive(Debug)]
+pub enum GenerateError<E> {
+    /// The provider itself failed: transport, rate limit, auth, and so on.
+    Provider(E),
+
+    /// The provider answered, but the response did not match the schema.
+    ///
+    /// Carries the text that could not be parsed so callers can log or retry.
+    Parse {
+        /// The underlying deserialization failure.
+        source: serde_json::Error,
+        /// The response text that failed to parse, truncated for logging.
+        response: String,
+    },
+}
+
+impl<E: core::fmt::Display> core::fmt::Display for GenerateError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Provider(err) => write!(f, "language model request failed: {err}"),
+            Self::Parse { source, response } => {
+                write!(
+                    f,
+                    "structured output did not match the requested schema: {source}; response: {response}"
+                )
+            }
+        }
+    }
+}
+
+impl<E: core::error::Error + 'static> core::error::Error for GenerateError<E> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Provider(err) => Some(err),
+            Self::Parse { source, .. } => Some(source),
+        }
+    }
+}
 
 /// Builder-style request passed into [`LanguageModel::respond`].
 ///
@@ -284,7 +329,7 @@ pub trait LanguageModel: Sized + Send + Sync {
     fn generate<T: JsonSchema + DeserializeOwned + 'static>(
         &self,
         request: LLMRequest,
-    ) -> impl Future<Output = crate::Result<T>> + Send {
+    ) -> impl Future<Output = Result<T, GenerateError<Self::Error>>> + Send {
         async { structured_generate(self, request).await }
     }
 
@@ -310,7 +355,7 @@ pub trait LanguageModel: Sized + Send + Sync {
     fn categorize<T: JsonSchema + DeserializeOwned + 'static>(
         &self,
         text: &str,
-    ) -> impl Future<Output = crate::Result<T>> + Send {
+    ) -> impl Future<Output = Result<T, GenerateError<Self::Error>>> + Send {
         async { categorize_text(self, text).await }
     }
 
@@ -343,7 +388,7 @@ macro_rules! impl_language_model {
                 fn generate<U: JsonSchema + DeserializeOwned + 'static>(
                     &self,
                     request: LLMRequest,
-                ) -> impl Future<Output = crate::Result<U>> + Send {
+                ) -> impl Future<Output = Result<U, GenerateError<Self::Error>>> + Send {
                     T::generate(self, request)
                 }
 
@@ -364,7 +409,7 @@ macro_rules! impl_language_model {
                 fn categorize<U: JsonSchema + DeserializeOwned + 'static>(
                     &self,
                     text: &str,
-                ) -> impl Future<Output = crate::Result<U>> + Send {
+                ) -> impl Future<Output = Result<U, GenerateError<Self::Error>>> + Send {
                     T::categorize(self, text)
                 }
 
@@ -396,7 +441,7 @@ impl<T: LanguageModel> LanguageModel for &T {
     fn generate<U: JsonSchema + DeserializeOwned + 'static>(
         &self,
         request: LLMRequest,
-    ) -> impl Future<Output = crate::Result<U>> + Send {
+    ) -> impl Future<Output = Result<U, GenerateError<Self::Error>>> + Send {
         T::generate(self, request)
     }
 
@@ -411,7 +456,7 @@ impl<T: LanguageModel> LanguageModel for &T {
     fn categorize<U: JsonSchema + DeserializeOwned + 'static>(
         &self,
         text: &str,
-    ) -> impl Future<Output = crate::Result<U>> + Send {
+    ) -> impl Future<Output = Result<U, GenerateError<Self::Error>>> + Send {
         T::categorize(self, text)
     }
 
@@ -446,26 +491,48 @@ where
 async fn structured_generate<T: JsonSchema + DeserializeOwned + 'static, M: LanguageModel>(
     model: &M,
     mut request: LLMRequest,
-) -> crate::Result<T> {
+) -> Result<T, GenerateError<M::Error>> {
     let schema = schema_for!(T);
 
     // If it is a string, we are not required to set up structured generation and JSON schema.
     let json = if schema.as_value().is_string() {
         let stream = model.respond(request);
-        let response = collect_text(stream).await?;
-        // Let's encode it as JSON string.
-        serde_json::to_string(&response)?
+        let response = collect_text(stream)
+            .await
+            .map_err(GenerateError::Provider)?;
+        // Let's encode it as JSON string. Serializing a String cannot fail.
+        serde_json::to_string(&response).map_err(|source| GenerateError::Parse {
+            source,
+            response: response.clone(),
+        })?
     } else {
-        let schema = json(&schema);
+        // Serializing a `Schema` is infallible in practice, but keep the error
+        // typed rather than unwrapping.
+        let schema =
+            serde_json::to_string_pretty(&schema).map_err(|source| GenerateError::Parse {
+                source,
+                response: String::new(),
+            })?;
         let prompt = prompts::generate(&schema);
         request.messages.push(Message::system(prompt));
         request.parameters.structured_outputs = true;
 
         let stream = model.respond(request);
-        collect_text(stream).await?
+        collect_text(stream)
+            .await
+            .map_err(GenerateError::Provider)?
     };
 
-    parse_json_with_recovery(&json)
+    parse_json_with_recovery(&json).map_err(|source| GenerateError::Parse {
+        source,
+        response: truncate_for_error(&json),
+    })
+}
+
+/// Keeps a failed response short enough to log without dumping a whole context.
+fn truncate_for_error(response: &str) -> String {
+    const LIMIT: usize = 500;
+    response.chars().take(LIMIT).collect()
 }
 
 /// Convenience helper that creates a single system + user [`LLMRequest`].
@@ -485,12 +552,16 @@ fn summarize<M: LanguageModel>(
 async fn categorize_text<T: JsonSchema + DeserializeOwned + 'static, M: LanguageModel>(
     model: &M,
     text: &str,
-) -> crate::Result<T> {
+) -> Result<T, GenerateError<M::Error>> {
     let request = oneshot("Categorize text by provided schema", text);
     model.generate(request).await
 }
 
-fn parse_json_with_recovery<T: DeserializeOwned + 'static>(json: &str) -> crate::Result<T> {
+fn parse_json_with_recovery<T: DeserializeOwned + 'static>(
+    json: &str,
+) -> Result<T, serde_json::Error> {
+    use serde::de::Error as _;
+
     let trimmed = json.trim();
     let mut last_error: Option<serde_json::Error> = None;
     let mut last_candidate: Option<String> = None;
@@ -505,36 +576,25 @@ fn parse_json_with_recovery<T: DeserializeOwned + 'static>(json: &str) -> crate:
         }
     }
 
-    if is_string_type::<T>() {
-        if let Some(candidate) = last_candidate.clone() {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate) {
-                let text = match value {
-                    serde_json::Value::String(s) => s,
-                    other => other.to_string(),
-                };
-                let encoded = serde_json::to_string(&text)
-                    .map_err(|err| anyhow!(err))
-                    .context("failed to encode fallback string while parsing structured output")?;
-                if let Ok(value) = serde_json::from_str::<T>(&encoded) {
-                    return Ok(value);
-                }
-            }
+    // A model asked for a plain string will often answer with an object or a
+    // bare word instead. Re-encode whatever it did produce as a JSON string.
+    if is_string_type::<T>()
+        && let Some(candidate) = last_candidate
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate)
+    {
+        let text = match value {
+            serde_json::Value::String(s) => s,
+            other => other.to_string(),
+        };
+        let encoded = serde_json::to_string(&text)?;
+        if let Ok(value) = serde_json::from_str::<T>(&encoded) {
+            return Ok(value);
         }
     }
 
-    let primary = last_error.map_or_else(
-        || anyhow!("structured output was empty or missing JSON block"),
-        anyhow::Error::new,
-    );
-    let snippet = last_candidate
-        .as_deref()
-        .unwrap_or(trimmed)
-        .chars()
-        .take(500)
-        .collect::<String>();
-    Err(primary.context(format!(
-        "failed to parse structured output; sample: {snippet}"
-    )))
+    Err(last_error.unwrap_or_else(|| {
+        serde_json::Error::custom("structured output was empty or missing a JSON block")
+    }))
 }
 
 fn strip_code_fences(raw: &str) -> Option<String> {

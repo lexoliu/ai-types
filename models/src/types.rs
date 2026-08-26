@@ -1,4 +1,4 @@
-//! Owned model metadata types sourced from LiteLLM and OpenRouter.
+//! Owned model metadata types sourced from `LiteLLM` and `OpenRouter`.
 
 use std::borrow::Cow;
 
@@ -36,25 +36,25 @@ pub enum ModelMode {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Provider {
-    /// OpenAI.
+    /// `OpenAI`.
     OpenAI,
     /// Anthropic.
     Anthropic,
     /// Google (Gemini).
     Google,
-    /// DeepSeek.
+    /// `DeepSeek`.
     DeepSeek,
     /// xAI (Grok).
     XAI,
     /// Mistral AI.
     Mistral,
-    /// Meta (LLaMA).
+    /// Meta (`LLaMA`).
     Meta,
-    /// Alibaba (Qwen / DashScope).
+    /// Alibaba (Qwen / `DashScope`).
     Alibaba,
     /// AWS Bedrock.
     Bedrock,
-    /// Azure OpenAI.
+    /// Azure `OpenAI`.
     Azure,
     /// Google Vertex AI.
     VertexAI,
@@ -111,6 +111,9 @@ impl core::fmt::Display for Provider {
 }
 
 /// Per-token pricing information (USD).
+// Every field is a per-token rate, so the shared suffix is the point rather
+// than redundant.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Pricing {
     input_per_token: f64,
@@ -273,7 +276,7 @@ impl ModelEntry {
         &self.canonical_id
     }
 
-    /// The original LiteLLM key (e.g. `"gemini/gemini-2.5-flash"`).
+    /// The original `LiteLLM` key (e.g. `"gemini/gemini-2.5-flash"`).
     #[must_use]
     pub fn litellm_id(&self) -> &str {
         &self.litellm_id
@@ -281,13 +284,13 @@ impl ModelEntry {
 
     /// The model provider.
     #[must_use]
-    pub fn provider(&self) -> &Provider {
+    pub const fn provider(&self) -> &Provider {
         &self.provider
     }
 
     /// The operational mode.
     #[must_use]
-    pub fn mode(&self) -> ModelMode {
+    pub const fn mode(&self) -> ModelMode {
         self.mode
     }
 
@@ -305,7 +308,7 @@ impl ModelEntry {
 
     /// Pricing information.
     #[must_use]
-    pub fn pricing(&self) -> &Pricing {
+    pub const fn pricing(&self) -> &Pricing {
         &self.pricing
     }
 
@@ -358,7 +361,7 @@ impl ModelEntry {
 
     /// Sets pricing.
     #[must_use]
-    pub fn with_pricing(mut self, pricing: Pricing) -> Self {
+    pub const fn with_pricing(mut self, pricing: Pricing) -> Self {
         self.pricing = pricing;
         self
     }
@@ -379,7 +382,7 @@ impl ModelEntry {
 }
 
 /// Convert days since Unix epoch to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+const fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     // Civil calendar algorithm from Howard Hinnant
     let z = days + 719_468;
     let era = z / 146_097;

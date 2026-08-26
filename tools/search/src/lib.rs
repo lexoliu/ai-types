@@ -1486,8 +1486,11 @@ mod tests {
             3
         }
 
-        async fn embed(&self, _text: &str) -> aither_core::Result<Vec<f32>> {
-            Ok(vec![0.0, 0.0, 0.0])
+        fn embed(
+            &self,
+            _text: &str,
+        ) -> impl std::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
+            std::future::ready(Ok(vec![0.0, 0.0, 0.0]))
         }
     }
 

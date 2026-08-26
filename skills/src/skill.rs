@@ -73,7 +73,7 @@ impl Skill {
         let yaml_content = &after_first[..end_idx];
         let instructions = after_first[end_idx + 4..].trim().to_string();
 
-        let frontmatter: SkillFrontmatter = serde_yaml::from_str(yaml_content)?;
+        let frontmatter: SkillFrontmatter = serde_norway::from_str(yaml_content)?;
 
         Ok(Self {
             name: frontmatter.name,

@@ -7,8 +7,8 @@
 //!
 //! ## What's inside?
 //!
-//! - [`LanguageModel`] + [`llm::LLMResponse`] for streaming
-//!   chat plus reasoning/thinking summaries.
+//! - [`LanguageModel`] for streaming chat, emitting [`llm::Event`]s that carry
+//!   visible text, reasoning summaries, and tool calls.
 //! - Audio, image, embeddings, and moderation traits that follow the same ergonomics.
 //! - `#[tool]` macros for function-calling schemas, so you can share tool definitions across providers.
 //!
@@ -43,6 +43,7 @@
 extern crate alloc;
 
 pub use aither_core::*;
+#[cfg(feature = "derive")]
 pub use aither_derive::tool;
 
 // Provider integrations
@@ -71,6 +72,9 @@ pub use aither_rag as rag;
 #[cfg(feature = "mem0")]
 pub use aither_mem0 as mem0;
 
+#[cfg(feature = "skills")]
+pub use aither_skills as skills;
+
 // Tools
 #[cfg(feature = "browser")]
 pub use aither_browser as browser;
@@ -80,12 +84,18 @@ pub use aither_websearch as websearch;
 
 #[cfg(feature = "search")]
 pub use aither_search as search;
+#[cfg(feature = "webfetch")]
+pub use aither_webfetch as webfetch;
 
 #[cfg(feature = "fs")]
 pub use aither_fs as fs;
 
 #[cfg(feature = "command")]
 pub use aither_command as command;
+
+// Model Context Protocol
+#[cfg(feature = "mcp")]
+pub use aither_mcp as mcp;
 
 #[doc(hidden)]
 /// For internal use only.

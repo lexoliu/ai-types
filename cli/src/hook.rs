@@ -126,7 +126,7 @@ fn parse_terminal_args(arguments: &str) -> Option<(String, Option<String>)> {
 struct TerminalOutput {
     stdout: Option<String>,
     stderr: Option<String>,
-    exit_code: i32,
+    exit_code: i64,
     task_id: Option<String>,
     status: Option<String>,
 }

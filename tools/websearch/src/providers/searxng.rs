@@ -22,6 +22,7 @@
 use crate::{SearchProvider, SearchResult};
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
+use std::fmt::Write as _;
 use zenwave::{Client, client, header};
 
 fn ensure_rustls_provider() {
@@ -91,7 +92,7 @@ impl SearchProvider for SearXNG {
         );
 
         if let Some(ref engines) = self.engines {
-            url.push_str(&format!("&engines={engines}"));
+            let _ = write!(url, "&engines={engines}");
         }
 
         let mut backend = client();

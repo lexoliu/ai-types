@@ -110,8 +110,8 @@ async fn run_loop(gemini: Backend, mem0: MemoryManager, rag: Store) -> Result<()
 
         let params = Parameters::default().reasoning_effort(ReasoningEffort::Low);
         let mut tools = Tools::new();
-        tools.register(mem0.add_fact_tool());
-        tools.register(mem0.search_tool());
+        tools.register(mem0.add_fact_tool())?;
+        tools.register(mem0.search_tool())?;
         let request = LLMRequest::new(request_messages)
             .with_parameters(params)
             .with_tool_definitions(tools.definitions());
@@ -139,7 +139,8 @@ async fn run_loop(gemini: Backend, mem0: MemoryManager, rag: Store) -> Result<()
 
         let mem_msgs = vec![Message::user(user), Message::assistant(&response)];
         let mem0_for_task = mem0.clone();
-        std::mem::drop(tokio::spawn(async move {
+        // Fire-and-forget: a failed memory write must not stall the chat.
+        drop(tokio::spawn(async move {
             if let Err(err) = mem0_for_task.add(&mem_msgs).await {
                 if !should_quiet_mem0_error(&err) {
                     eprintln!("Mem0 update failed: {err}");
@@ -185,11 +186,10 @@ fn format_rag_hits(hits: &[RagSearchResult]) -> Option<String> {
                 .get("path")
                 .cloned()
                 .unwrap_or_else(|| hit.chunk.id.clone());
-            let score = format!("{:.2}", hit.score);
             format!(
-                "{}. [{}] {} :: {}",
+                "{}. [{:.2}] {} :: {}",
                 idx + 1,
-                score,
+                hit.score,
                 origin,
                 truncate(&hit.chunk.text, 240)
             )

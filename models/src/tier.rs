@@ -62,7 +62,7 @@ impl ModelTier {
 /// distribution. Chat models priced at or below the lower breakpoint classify
 /// as [`ModelTier::Fast`], at or above the upper as [`ModelTier::Advanced`].
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ChatPriceBreakpoints {
+pub struct ChatPriceBreakpoints {
     fast_ceiling: f64,
     advanced_floor: f64,
 }
@@ -72,7 +72,7 @@ impl ChatPriceBreakpoints {
     ///
     /// Returns `None` when fewer than three priced chat models exist, in
     /// which case classification falls back to context-window heuristics.
-    pub(crate) fn compute<'a>(entries: impl Iterator<Item = &'a ModelEntry>) -> Option<Self> {
+    pub fn compute<'a>(entries: impl Iterator<Item = &'a ModelEntry>) -> Option<Self> {
         let mut prices: Vec<f64> = entries
             .filter(|info| info.mode() == ModelMode::Chat)
             .map(|info| info.pricing().output_per_token())
@@ -91,7 +91,7 @@ impl ChatPriceBreakpoints {
         })
     }
 
-    pub(crate) fn classify(self, info: &ModelEntry) -> Option<ModelTier> {
+    pub fn classify(self, info: &ModelEntry) -> Option<ModelTier> {
         let output_price = info.pricing().output_per_token();
         if !output_price.is_finite() || output_price <= 0.0 {
             return None;
@@ -107,10 +107,7 @@ impl ChatPriceBreakpoints {
 }
 
 /// Classify an entry given precomputed chat-price breakpoints.
-pub(crate) fn classify_entry(
-    info: &ModelEntry,
-    breakpoints: Option<ChatPriceBreakpoints>,
-) -> ModelTier {
+pub fn classify_entry(info: &ModelEntry, breakpoints: Option<ChatPriceBreakpoints>) -> ModelTier {
     match info.mode() {
         ModelMode::ImageGeneration => return ModelTier::ImageGeneration,
         ModelMode::Chat => {}

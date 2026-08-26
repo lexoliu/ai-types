@@ -1,3 +1,9 @@
+//! Conversation memory for aither agents.
+//!
+//! Extracts durable facts from a conversation, reconciles them against what is
+//! already stored, and exposes the result both as a query API and as tools an
+//! agent can call.
+
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -11,12 +17,16 @@ use tracing::debug;
 use uuid::Uuid;
 
 pub mod error;
+/// Structured types the language model produces during fact extraction.
 pub mod llm;
+/// Storage backends for extracted memories.
 pub mod store;
 
 pub use error::{Mem0Error, Result};
 pub use store::{InMemoryStore, Memory, SearchResult};
 
+/// Tool that lets an agent search its own memory.
+#[derive(Debug)]
 pub struct SearchTool<L, E, S> {
     inner: Mem0<L, E, S>,
 }
@@ -27,6 +37,13 @@ where
     E: EmbeddingModel + 'static,
     S: MemoryStore + 'static,
 {
+    fn description(&self) -> std::borrow::Cow<'static, str> {
+        "Search previously stored memories for anything relevant to a query. \
+         Pass the query as a plain string. Returns matching memories as text, \
+         or nothing if none are relevant."
+            .into()
+    }
+
     type Arguments = String;
     type Res = ToolResult;
     fn name(&self) -> std::borrow::Cow<'static, str> {
@@ -43,6 +60,8 @@ where
     }
 }
 
+/// Tool that lets an agent record facts worth remembering.
+#[derive(Debug)]
 pub struct AddFactTool<L, E, S> {
     inner: Mem0<L, E, S>,
 }
@@ -53,6 +72,13 @@ where
     E: EmbeddingModel + 'static,
     S: MemoryStore + 'static,
 {
+    fn description(&self) -> std::borrow::Cow<'static, str> {
+        "Record facts worth remembering across conversations. Pass a list of \
+         short, self-contained statements. Existing memories are updated or \
+         removed automatically when a new fact supersedes them."
+            .into()
+    }
+
     type Arguments = Vec<String>;
     type Res = ToolResult;
     fn name(&self) -> std::borrow::Cow<'static, str> {
@@ -119,9 +145,19 @@ struct Mem0Inner {
     command_tx: Sender<Mem0Command>,
 }
 
+/// A conversation memory.
+///
+/// Cloning shares the same underlying store and extraction queue.
 pub struct Mem0<L, E, S> {
     inner: Arc<Mem0Inner>,
     _marker: std::marker::PhantomData<(L, E, S)>,
+}
+
+impl<L, E, S> std::fmt::Debug for Mem0<L, E, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The model, embedder and store are opaque to this crate.
+        f.debug_struct("Mem0").finish_non_exhaustive()
+    }
 }
 
 impl<L, E, S> Clone for Mem0<L, E, S> {
@@ -139,7 +175,7 @@ where
     E: EmbeddingModel + 'static,
     S: MemoryStore + 'static,
 {
-    /// Create a new Mem0 instance.
+    /// Create a new memory over the given model, embedder and store.
     pub fn new(llm: L, embedder: E, store: S, config: Config) -> Self {
         let (command_tx, command_rx) = async_channel::unbounded();
         let actor = Mem0Actor {
@@ -162,6 +198,15 @@ where
     /// 2. For each fact, retrieve similar memories.
     /// 3. Decide on an operation (Add, Update, Delete, Noop).
     /// 4. Execute the operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fact extraction, embedding, or the store fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the memory runtime task has stopped, which leaves this handle
+    /// unusable.
     pub async fn add(&self, messages: &[Message]) -> Result<()> {
         let (response_tx, response_rx) = async_channel::bounded(1);
         self.inner
@@ -184,6 +229,15 @@ where
     /// And the caller have to wait if you `.await` this method.
     ///
     /// So if you doesn't mind the result of adding facts, you can spawn a task to call this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model call, embedding, or the store fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the memory runtime task has stopped, which leaves this handle
+    /// unusable.
     pub async fn add_fact(&self, facts: Vec<String>) -> Result<()> {
         let (response_tx, response_rx) = async_channel::bounded(1);
         self.inner
@@ -198,6 +252,15 @@ where
     }
 
     /// Search for relevant memories.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query cannot be embedded or the store fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the memory runtime task has stopped, which leaves this handle
+    /// unusable.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<store::SearchResult>> {
         let (response_tx, response_rx) = async_channel::bounded(1);
         self.inner
@@ -215,12 +278,16 @@ where
             .expect("mem0 runtime response must be delivered")
     }
 
+    /// A tool the agent can call to record facts into this memory.
+    #[must_use]
     pub fn add_fact_tool(&self) -> AddFactTool<L, E, S> {
         AddFactTool {
             inner: self.clone(),
         }
     }
 
+    /// A tool the agent can call to search this memory.
+    #[must_use]
     pub fn search_tool(&self) -> SearchTool<L, E, S> {
         SearchTool {
             inner: self.clone(),
@@ -228,6 +295,15 @@ where
     }
 
     /// Return all stored memories.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be read.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the memory runtime task has stopped, which leaves this handle
+    /// unusable.
     pub async fn memories(&self) -> Result<Vec<Memory>> {
         let (response_tx, response_rx) = async_channel::bounded(1);
         self.inner
@@ -242,6 +318,10 @@ where
     }
 
     /// Retrieve relevant memories and format them for context injection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying search fails.
     pub async fn retrieve_formatted(&self, query: &str, limit: usize) -> Result<String> {
         let results = self.search(query, limit).await?;
         if results.is_empty() {
@@ -254,7 +334,7 @@ where
             .collect::<Vec<_>>()
             .join("\n");
 
-        Ok(format!("Relevant Memories:\n{}", formatted))
+        Ok(format!("Relevant Memories:\n{formatted}"))
     }
 }
 
@@ -373,7 +453,7 @@ where
         Ok(())
     }
 
-    async fn search(&mut self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
         let embedding = self.embedder.embed(query).await.map_err(Mem0Error::Llm)?;
         let filters = SearchFilters {
             user_id: self.config.user_id.clone(),
@@ -382,7 +462,7 @@ where
         self.store.search(&embedding, limit, filters).await
     }
 
-    async fn memories(&mut self) -> Result<Vec<Memory>> {
+    async fn memories(&self) -> Result<Vec<Memory>> {
         self.store.all().await
     }
 }
@@ -398,12 +478,14 @@ async fn extract_facts<L: LanguageModel>(llm: &L, messages: &[Message]) -> Resul
     let request = LLMRequest::new(vec![
         Message::system(system_prompt),
         Message::user(format!(
-            "Extract facts from the following conversation:\n\n{}",
-            context
+            "Extract facts from the following conversation:\n\n{context}"
         )),
     ]);
 
-    let extracted: ExtractedFacts = llm.generate(request).await.map_err(Mem0Error::Llm)?;
+    let extracted: ExtractedFacts = llm
+        .generate(request)
+        .await
+        .map_err(|err| Mem0Error::Llm(anyhow::Error::new(err)))?;
     Ok(extracted.facts)
 }
 
@@ -420,8 +502,7 @@ async fn decide_operation<L: LanguageModel>(
 
     let system_prompt = include_str!("../prompts/manager.txt");
     let user_prompt = format!(
-        "New Fact: {}\n\nExisting Memories:\n{}\n\nDecide the operation.",
-        fact, memories_context
+        "New Fact: {fact}\n\nExisting Memories:\n{memories_context}\n\nDecide the operation."
     );
     let request = LLMRequest::new(vec![
         Message::system(system_prompt),
@@ -430,5 +511,7 @@ async fn decide_operation<L: LanguageModel>(
 
     debug!("Deciding operation for fact: {}", fact);
 
-    llm.generate(request).await.map_err(Mem0Error::Llm)
+    llm.generate(request)
+        .await
+        .map_err(|err| Mem0Error::Llm(anyhow::Error::new(err)))
 }

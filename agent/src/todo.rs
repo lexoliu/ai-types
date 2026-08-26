@@ -100,22 +100,38 @@ impl TodoList {
     }
 
     /// Returns all items in the list.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn items(&self) -> Vec<TodoItem> {
         self.items.load_full().as_ref().clone()
     }
 
     /// Replaces the entire todo list with new items.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     pub fn write(&self, items: Vec<TodoItem>) {
         self.items.store(Arc::new(items));
     }
 
     /// Clears all tasks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     pub fn clear(&self) {
         self.items.store(Arc::new(Vec::new()));
     }
 
     /// Returns the currently in-progress task, if any.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn current_task(&self) -> Option<TodoItem> {
         self.items
@@ -126,6 +142,10 @@ impl TodoList {
     }
 
     /// Returns a formatted summary of progress.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn progress_summary(&self) -> String {
         let items = self.items.load();

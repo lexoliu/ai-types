@@ -359,9 +359,9 @@ fn find_tokenizer_file(dir: &Path) -> Result<PathBuf, OrtError> {
 /// Detect the embedding dimension from model output metadata.
 fn detect_embedding_dimension(session: &Session) -> Result<usize, OrtError> {
     // Look for the output that contains hidden states
-    for output in &session.outputs {
+    for output in session.outputs() {
         // Get tensor type info if available
-        if let ort::value::ValueType::Tensor { shape, .. } = &output.output_type {
+        if let ort::value::ValueType::Tensor { shape, .. } = output.dtype() {
             // Expect shape [batch, seq_len, hidden_dim] or [batch, hidden_dim]
             if shape.len() >= 2 {
                 // Last dimension is typically the hidden dimension
@@ -382,9 +382,7 @@ fn detect_embedding_dimension(session: &Session) -> Result<usize, OrtError> {
 
 /// Get number of CPU cores for parallelism.
 fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(4)
+    std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
 }
 
 fn spawn_inference_worker(session: Session) -> Result<Sender<InferenceRequest>, OrtError> {

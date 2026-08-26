@@ -1,5 +1,7 @@
+//! Storage backends for extracted memories.
+
 use aither_core::embedding::Embedding;
-use core::future::Future;
+use core::future::{Future, ready};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -9,16 +11,25 @@ use crate::error::Result;
 /// A single memory entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
+    /// Stable identifier for this memory.
     pub id: Uuid,
+    /// The remembered statement.
     pub content: String,
+    /// Vector used to find this memory by similarity.
     pub embedding: Embedding,
+    /// User this memory belongs to, if scoped to one.
     pub user_id: Option<String>,
+    /// Agent this memory belongs to, if scoped to one.
     pub agent_id: Option<String>,
+    /// When the memory was first stored.
     pub created_at: OffsetDateTime,
+    /// When the memory was last changed.
     pub updated_at: OffsetDateTime,
 }
 
 impl Memory {
+    /// Creates a memory holding `content`, addressed by `embedding`.
+    #[must_use]
     pub fn new(content: impl Into<String>, embedding: Embedding) -> Self {
         let now = OffsetDateTime::now_utc();
         Self {
@@ -32,11 +43,15 @@ impl Memory {
         }
     }
 
+    /// Scopes this memory to a user.
+    #[must_use]
     pub fn with_user_id(mut self, user_id: impl Into<String>) -> Self {
         self.user_id = Some(user_id.into());
         self
     }
 
+    /// Scopes this memory to an agent.
+    #[must_use]
     pub fn with_agent_id(mut self, agent_id: impl Into<String>) -> Self {
         self.agent_id = Some(agent_id.into());
         self
@@ -46,7 +61,9 @@ impl Memory {
 /// Result of a vector search.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
+    /// The matching memory.
     pub memory: Memory,
+    /// Similarity to the query, higher being closer.
     pub score: f32,
 }
 
@@ -69,7 +86,7 @@ pub trait MemoryStore: Send + Sync {
 
     /// Search for memories similar to the query vector.
     ///
-    /// `filters` can be used to filter by user_id or agent_id.
+    /// `filters` can be used to filter by `user_id` or `agent_id`.
     /// `limit` is the maximum number of results to return.
     fn search(
         &self,
@@ -79,64 +96,70 @@ pub trait MemoryStore: Send + Sync {
     ) -> impl Future<Output = Result<Vec<SearchResult>>> + Send;
 }
 
+/// Narrows a search to memories belonging to a user or agent.
 #[derive(Debug, Default, Clone)]
 pub struct SearchFilters {
+    /// Only match memories scoped to this user.
     pub user_id: Option<String>,
+    /// Only match memories scoped to this agent.
     pub agent_id: Option<String>,
 }
 
 /// A simple in-memory store for testing and prototyping.
 /// **Note**: This is O(N) for search and not persistent.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct InMemoryStore {
     memories: Vec<Memory>,
 }
 
 impl InMemoryStore {
+    /// Creates an empty store.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 }
 
 impl MemoryStore for InMemoryStore {
-    async fn add(&mut self, memory: Memory) -> Result<()> {
+    fn add(&mut self, memory: Memory) -> impl Future<Output = Result<()>> + Send {
         self.memories.push(memory);
-        Ok(())
+        ready(Ok(()))
     }
 
-    async fn get(&self, id: Uuid) -> Result<Option<Memory>> {
+    fn get(&self, id: Uuid) -> impl Future<Output = Result<Option<Memory>>> + Send {
         let memories = self.memories.clone();
-        Ok(memories.iter().find(|m| m.id == id).cloned())
+        ready(Ok(memories.iter().find(|m| m.id == id).cloned()))
     }
 
-    async fn update(&mut self, memory: Memory) -> Result<()> {
-        if let Some(m) = self.memories.iter_mut().find(|m| m.id == memory.id) {
-            *m = memory;
-            Ok(())
-        } else {
-            Err(crate::error::Mem0Error::Store(format!(
-                "Memory {} not found",
-                memory.id
-            )))
-        }
+    fn update(&mut self, memory: Memory) -> impl Future<Output = Result<()>> + Send {
+        ready(
+            if let Some(m) = self.memories.iter_mut().find(|m| m.id == memory.id) {
+                *m = memory;
+                Ok(())
+            } else {
+                Err(crate::error::Mem0Error::Store(format!(
+                    "Memory {} not found",
+                    memory.id
+                )))
+            },
+        )
     }
 
-    async fn delete(&mut self, id: Uuid) -> Result<()> {
+    fn delete(&mut self, id: Uuid) -> impl Future<Output = Result<()>> + Send {
         self.memories.retain(|m| m.id != id);
-        Ok(())
+        ready(Ok(()))
     }
 
-    async fn all(&self) -> Result<Vec<Memory>> {
-        let memories = self.memories.clone();
-        Ok(memories)
+    fn all(&self) -> impl Future<Output = Result<Vec<Memory>>> + Send {
+        ready(Ok(self.memories.clone()))
     }
 
-    async fn search(
+    fn search(
         &self,
         query_embedding: &Embedding,
         limit: usize,
         filters: SearchFilters,
-    ) -> Result<Vec<SearchResult>> {
+    ) -> impl Future<Output = Result<Vec<SearchResult>>> + Send {
         let memories = self.memories.clone();
 
         let mut scored_memories: Vec<SearchResult> = memories
@@ -170,7 +193,7 @@ impl MemoryStore for InMemoryStore {
                 .unwrap_or(core::cmp::Ordering::Equal)
         });
 
-        Ok(scored_memories.into_iter().take(limit).collect())
+        ready(Ok(scored_memories.into_iter().take(limit).collect()))
     }
 }
 

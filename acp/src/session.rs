@@ -6,30 +6,37 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use aither_agent::{Agent, AgentEvent};
+use aither_core::LanguageModel;
+use futures_lite::StreamExt;
 use uuid::Uuid;
 
-use crate::protocol::{ContentBlock, ContentChunk, McpServerSpec, SessionUpdate, TextContent};
+use crate::protocol::{
+    ContentBlock, ContentChunk, McpServerSpec, SessionUpdate, TextContent, ToolCall,
+    ToolCallContent, ToolCallStatus, ToolCallUpdate,
+};
 
 /// An active ACP session.
 ///
 /// Each session wraps a conversation context and can process prompts.
 #[derive(Debug)]
-pub struct AcpSession {
+pub struct AcpSession<LLM: LanguageModel> {
     id: String,
     cwd: PathBuf,
     mcp_servers: Vec<McpServerSpec>,
     cancelled: Arc<AtomicBool>,
+    agent: Agent<LLM, LLM, LLM>,
 }
 
-impl AcpSession {
-    /// Create a new session.
-    #[must_use]
-    pub fn new(cwd: PathBuf, mcp_servers: Vec<McpServerSpec>) -> Self {
+impl<LLM: LanguageModel> AcpSession<LLM> {
+    /// Create a new session that drives the given agent.
+    pub fn new(cwd: PathBuf, mcp_servers: Vec<McpServerSpec>, agent: Agent<LLM, LLM, LLM>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             cwd,
             mcp_servers,
             cancelled: Arc::new(AtomicBool::new(false)),
+            agent,
         }
     }
 
@@ -67,32 +74,88 @@ impl AcpSession {
         self.cancelled.store(false, Ordering::SeqCst);
     }
 
-    /// Process a prompt and emit updates via the callback.
+    /// Run the agent over `prompt`, reporting progress through `on_update`.
     ///
-    /// This is a placeholder implementation. The full implementation
-    /// will integrate with the aither agent to process prompts and
-    /// stream events as ACP session updates.
+    /// Each agent event is translated into the corresponding ACP session update
+    /// as it arrives, so the client sees text and tool activity while the turn
+    /// is still running. Returns when the turn completes, the client cancels
+    /// via [`Self::stop`], or the agent errors.
     ///
     /// # Errors
     ///
-    /// Returns an error if prompt processing fails.
-    pub fn prompt<F>(&mut self, prompt: &str, mut on_update: F) -> Result<(), String>
+    /// Returns the agent's error message if the turn could not be completed.
+    pub async fn prompt<F>(&mut self, prompt: &str, mut on_update: F) -> Result<(), String>
     where
         F: FnMut(SessionUpdate),
     {
-        // Reset cancellation flag
         self.reset();
 
-        // Placeholder: Echo back the prompt as an agent message
-        // In the real implementation, this will run the agent loop
-        // Send agent message chunk
-        on_update(SessionUpdate::AgentMessageChunk(ContentChunk {
-            content: ContentBlock::Text(TextContent {
-                text: format!("Received prompt in {}: {}", self.cwd.display(), prompt),
-                annotations: None,
-            }),
-        }));
+        let mut stream = Box::pin(self.agent.run(prompt, []));
+
+        while let Some(event) = stream.next().await {
+            if self.cancelled.load(Ordering::SeqCst) {
+                break;
+            }
+
+            match event.map_err(|err| err.to_string())? {
+                AgentEvent::Text(text) => {
+                    on_update(SessionUpdate::AgentMessageChunk(text_chunk(text)));
+                }
+                AgentEvent::Reasoning(text) => {
+                    on_update(SessionUpdate::AgentThoughtChunk(text_chunk(text)));
+                }
+                AgentEvent::ToolCallStart {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    on_update(SessionUpdate::ToolCall(ToolCall {
+                        tool_call_id: id,
+                        title: name,
+                        kind: None,
+                        status: Some(ToolCallStatus::InProgress),
+                        content: Vec::new(),
+                        locations: Vec::new(),
+                        raw_input: serde_json::from_str(&arguments).ok(),
+                        raw_output: None,
+                    }));
+                }
+                AgentEvent::ToolCallEnd { id, result, .. } => {
+                    let (status, text) = match result {
+                        Ok(output) => (ToolCallStatus::Completed, output),
+                        Err(err) => (ToolCallStatus::Error, err),
+                    };
+                    on_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+                        tool_call_id: id,
+                        status: Some(status),
+                        content: Some(vec![ToolCallContent::Content {
+                            content: ContentBlock::Text(TextContent {
+                                text,
+                                annotations: None,
+                            }),
+                        }]),
+                        title: None,
+                        kind: None,
+                        locations: None,
+                        raw_input: None,
+                        raw_output: None,
+                    }));
+                }
+                // Remaining events carry no ACP equivalent.
+                _ => {}
+            }
+        }
 
         Ok(())
+    }
+}
+
+/// Wraps plain text in the content-chunk shape ACP expects.
+const fn text_chunk(text: String) -> ContentChunk {
+    ContentChunk {
+        content: ContentBlock::Text(TextContent {
+            text,
+            annotations: None,
+        }),
     }
 }

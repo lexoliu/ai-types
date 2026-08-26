@@ -31,6 +31,7 @@ mod embedding;
 mod error;
 pub mod files;
 mod image;
+#[cfg(not(target_arch = "wasm32"))]
 mod mime;
 mod moderation;
 mod provider;

@@ -39,7 +39,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-ubuntu
-      - run: cargo build --target wasm32-unknown-unknown --features std
+      # `aither` itself is not wasm-buildable: the agent, sandbox, and CLI need
+      # a filesystem and processes. Build the crates that are meant to run in a
+      # browser, and deny warnings so a native-only helper cannot quietly rot
+      # into dead code on this target.
+      - run: cargo build --target wasm32-unknown-unknown -p aither-core -p aither-openai -p aither-gemini -p aither-claude
+        env:
+          RUSTFLAGS: "-D warnings"
 
   coverage:
     name: Coverage
@@ -97,7 +103,12 @@ jobs:
           shared-key: ci-ubuntu
       - uses: taiki-e/install-action@cargo-hack
       - run: cargo hack check --each-feature --no-dev-deps
-      - run: cargo hack check --feature-powerset --no-dev-deps
+      # The full powerset of this crate's 20 features is 89,766 `cargo check`
+      # runs, which no CI job can finish. Depth 2 covers every pair of features
+      # — where feature-interaction bugs actually live — in 152 runs. The three
+      # aggregate aliases are unions of features already covered individually
+      # and pairwise, and are what makes the full powerset explode.
+      - run: cargo hack check --feature-powerset --depth 2 --exclude-features all-providers,all-tools,full --no-dev-deps
 
   test:
     name: Test

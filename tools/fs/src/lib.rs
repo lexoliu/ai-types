@@ -218,11 +218,11 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                     .list_dir(path.as_deref().map_or(Path::new(""), Path::new))
                     .await
                     .map_err(anyhow::Error::new)?;
-                Ok(ToolResult::text(json(&listing)))
+                Ok(ToolResult::text(json(&listing)?))
             }
             FsOperation::Glob { pattern } => {
                 let matches = self.filesystem.glob(&pattern)?;
-                Ok(ToolResult::text(json(&matches)))
+                Ok(ToolResult::text(json(&matches)?))
             }
         }
     }

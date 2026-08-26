@@ -204,7 +204,7 @@ async fn hash_file(path: &Path) -> std::io::Result<String> {
         hasher.update(&buffer[..bytes_read]);
     }
     let result = hasher.finalize();
-    Ok(format!("{result:x}"))
+    Ok(const_hex::encode(result))
 }
 
 /// Serde support for Option<SystemTime>.

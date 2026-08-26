@@ -1,6 +1,6 @@
 [package]
 name = "aither-openai"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -16,12 +16,11 @@ aither-core.workspace = true
 aither-models.workspace = true
 aither-attachments.workspace = true
 async-stream = "0.3"
-http = "1"
 futures-core = { version = "0.3", default-features = false }
 futures-lite = "2.6"
-base64 = "0.22"
+base64 = "0.23"
 mime_guess = "2"
-schemars = "1.0"
+schemars = "1.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
@@ -33,7 +32,9 @@ async-io = "2"
 async-fs = "2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-gloo-timers = { version = "0.3", features = ["futures"] }
+gloo-timers = { version = "0.4", features = ["futures"] }
+wasm-bindgen-futures = "0.4"
+async-channel = "2"
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["macros", "rt"] }

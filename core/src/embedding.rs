@@ -148,7 +148,7 @@ mod tests {
         }
 
         #[allow(clippy::cast_precision_loss)]
-        async fn embed(&self, text: &str) -> crate::Result<Vec<f32>> {
+        fn embed(&self, text: &str) -> impl Future<Output = crate::Result<Vec<f32>>> + Send {
             // Create a simple mock embedding based on text length
             let mut embedding = vec![0.0; self.dimension];
             let text_len = text.len();
@@ -157,7 +157,7 @@ mod tests {
                 *value = (text_len + i) as f32 * 0.01;
             }
 
-            Ok(embedding)
+            core::future::ready(Ok(embedding))
         }
     }
 

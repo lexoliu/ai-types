@@ -122,6 +122,6 @@ impl Tool for CommandTool {
             stderr: self.truncate(String::from_utf8_lossy(&output.stderr).to_string()),
         };
 
-        Ok(ToolResult::text(json(&response)))
+        Ok(ToolResult::text(json(&response)?))
     }
 }

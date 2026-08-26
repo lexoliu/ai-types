@@ -88,7 +88,7 @@ pub enum Content {
 /// Serializes to a flat JSON object with optional fields.
 #[derive(Debug, Clone)]
 pub enum OutputEntry {
-    /// No output (`ToolOutput::Done`) - nothing to store
+    /// No output (`ToolResult::Done`) - nothing to store
     Empty,
 
     /// Super tiny content - always in context, NEVER gets URL.
@@ -130,6 +130,8 @@ impl Serialize for OutputEntry {
                 let map = serializer.serialize_map(Some(0))?;
                 map.end()
             }
+            // Loaded output carries provenance the caller does not need on the
+            // wire, so it serializes exactly like inline output.
             Self::Inline { content } | Self::Loaded { content, .. } => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("content", content)?;

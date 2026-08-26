@@ -5,7 +5,7 @@
 //!
 //! See: <https://ai.google.dev/api/files>
 
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 #[cfg(not(target_arch = "wasm32"))]
 use async_fs;
@@ -110,7 +110,8 @@ pub struct ListFilesResponse {
 ///
 /// # Errors
 ///
-/// Returns an error when request construction, metadata serialization, or upload fails.
+/// Returns an error if the upload request fails or the provider rejects
+/// the file.
 pub async fn upload_bytes(
     cfg: &GeminiConfig,
     file_name: &str,
@@ -189,9 +190,14 @@ pub async fn upload_bytes(
 ///
 /// Returns an error when the file cannot be read or upload fails.
 #[cfg(not(target_arch = "wasm32"))]
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, the upload fails, or the
+/// provider rejects the file.
 pub async fn upload_file(cfg: &GeminiConfig, path: &Path) -> Result<GeminiFile, GeminiError> {
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
-    let mime_type = mime_from_path(path).unwrap_or("application/octet-stream");
+    let mime_type = crate::mime::mime_from_path(path).unwrap_or("application/octet-stream");
     let data = async_fs::read(path)
         .await
         .map_err(|e| GeminiError::Parse(format!("Failed to read file: {e}")))?;
@@ -207,7 +213,7 @@ pub async fn upload_file(cfg: &GeminiConfig, path: &Path) -> Result<GeminiFile, 
 ///
 /// # Errors
 ///
-/// Returns an error when request construction or deletion fails.
+/// Returns an error if the request fails, or the provider rejects it.
 pub async fn delete_file(cfg: &GeminiConfig, name: &str) -> Result<(), GeminiError> {
     let url = cfg.endpoint(name);
 
@@ -236,7 +242,7 @@ pub async fn delete_file(cfg: &GeminiConfig, name: &str) -> Result<(), GeminiErr
 ///
 /// # Errors
 ///
-/// Returns an error when request construction or lookup fails.
+/// Returns an error if the request fails, or the provider rejects it.
 pub async fn get_file(cfg: &GeminiConfig, name: &str) -> Result<GeminiFile, GeminiError> {
     let url = cfg.endpoint(name);
 
@@ -265,7 +271,7 @@ pub async fn get_file(cfg: &GeminiConfig, name: &str) -> Result<GeminiFile, Gemi
 ///
 /// # Errors
 ///
-/// Returns an error when request construction or listing fails.
+/// Returns an error if the request fails, or the provider rejects it.
 pub async fn list_files(
     cfg: &GeminiConfig,
     page_size: Option<u32>,
@@ -307,23 +313,12 @@ fn build_upload_url(cfg: &GeminiConfig) -> String {
 }
 
 /// Parse an RFC 3339 timestamp to `SystemTime`.
+///
+/// Returns `None` for an empty or malformed timestamp — including the empty
+/// string the API sends for a file that never expires.
 fn parse_rfc3339(s: &str) -> Option<SystemTime> {
-    // Simple RFC 3339 parser for timestamps like "2024-01-15T10:30:00Z"
-    // or "2024-01-15T10:30:00.123456Z"
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-
-    // Use jiff if available, otherwise try a simple parse
-    // For now, assume 48 hours from now for new uploads
-    // A proper implementation would parse the actual timestamp
-    Some(SystemTime::now() + Duration::from_secs(48 * 60 * 60))
-}
-
-/// Determine MIME type from file extension.
-fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
-    mime_guess::from_path(path).first_raw()
+    let timestamp: jiff::Timestamp = s.trim().parse().ok()?;
+    Some(SystemTime::from(timestamp))
 }
 
 #[cfg(test)]
@@ -331,25 +326,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_rfc3339_expiration() {
+        // 2024-01-15T10:30:00Z is 1_705_314_600 seconds after the epoch.
+        let parsed = parse_rfc3339("2024-01-15T10:30:00Z").expect("should parse");
+        let secs = parsed
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+        assert_eq!(secs, 1_705_314_600);
+
+        // Fractional seconds and a numeric offset are both valid RFC 3339.
+        assert!(parse_rfc3339("2024-01-15T10:30:00.123456Z").is_some());
+        assert!(parse_rfc3339("  2024-01-15T11:30:00+01:00  ").is_some());
+
+        // What the API sends when a file never expires, and outright garbage.
+        assert!(parse_rfc3339("").is_none());
+        assert!(parse_rfc3339("not a timestamp").is_none());
+    }
+
+    #[test]
     fn test_mime_from_path() {
         assert_eq!(
-            mime_from_path(Path::new("/path/to/image.png")),
+            crate::mime::mime_from_path(Path::new("/path/to/image.png")),
             Some("image/png")
         );
         assert_eq!(
-            mime_from_path(Path::new("/path/to/video.mp4")),
+            crate::mime::mime_from_path(Path::new("/path/to/video.mp4")),
             Some("video/mp4")
         );
         assert_eq!(
-            mime_from_path(Path::new("/path/to/audio.mp3")),
+            crate::mime::mime_from_path(Path::new("/path/to/audio.mp3")),
             Some("audio/mpeg")
         );
         assert_eq!(
-            mime_from_path(Path::new("/path/to/doc.pdf")),
+            crate::mime::mime_from_path(Path::new("/path/to/doc.pdf")),
             Some("application/pdf")
         );
         assert_eq!(
-            mime_from_path(Path::new("/path/to/unknown.aither_unknown")),
+            crate::mime::mime_from_path(Path::new("/path/to/unknown.aither_unknown")),
             None
         );
     }

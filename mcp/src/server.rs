@@ -62,23 +62,14 @@ impl McpServer<StdioTransport> {
         version: impl Into<String>,
     ) -> Result<Self, McpError> {
         let transport = StdioTransport::new().map_err(|e| McpError::Transport(e.to_string()))?;
-        Ok(Self {
-            transport,
-            tools,
-            info: ServerInfo {
-                name: name.into(),
-                version: Some(version.into()),
-            },
-            instructions: None,
-            initialized: false,
-        })
+        Ok(Self::new(transport, tools, name, version))
     }
 }
 
 impl<T: BidirectionalTransport + Sync> McpServer<T> {
     /// Create a new MCP server with a custom transport.
     ///
-    /// For most use cases, prefer `McpServer::stdio()` instead.
+    /// For most use cases, prefer [`McpServer::stdio`] instead.
     ///
     /// # Arguments
     ///
@@ -165,7 +156,7 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
         match req.method.as_str() {
             "initialize" => self.handle_initialize(req),
             "tools/list" => self.handle_list_tools(req),
-            "tools/call" => self.handle_call_tool(req).await,
+            "tools/call" => Self::handle_call_tool(&self.tools, req).await,
             method => JsonRpcResponse::error(req.id, JsonRpcError::method_not_found(method)),
         }
     }
@@ -216,7 +207,10 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
     }
 
     /// Handle tools/call request.
-    async fn handle_call_tool(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+    ///
+    /// Takes the tool table rather than `&self` so the returned future does not
+    /// borrow the transport, which is only `Send`, and so stays `Send` itself.
+    async fn handle_call_tool(tools: &Tools, req: JsonRpcRequest) -> JsonRpcResponse {
         let params: CallToolParams = match req.params.map(serde_json::from_value).transpose() {
             Ok(Some(p)) => p,
             Ok(None) => {
@@ -232,7 +226,7 @@ impl<T: BidirectionalTransport + Sync> McpServer<T> {
 
         let args_str = serde_json::to_string(&params.arguments).unwrap_or_default();
 
-        match self.tools.call(&params.name, &args_str).await {
+        match tools.call(&params.name, &args_str).await {
             Ok(output) => {
                 let text = match output.render_for_model() {
                     Ok(text) => text,

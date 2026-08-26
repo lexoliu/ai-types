@@ -68,7 +68,7 @@ pub struct OpenAIFile {
     /// Size of the file in bytes.
     pub bytes: u64,
     /// Unix timestamp when the file was created.
-    pub created_at: i64,
+    pub created_at: u64,
     /// Name of the file.
     pub filename: String,
     /// Purpose of the file.
@@ -85,7 +85,7 @@ impl OpenAIFile {
     /// Get the creation time as `SystemTime`.
     #[must_use]
     pub fn created(&self) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(self.created_at.cast_unsigned())
+        UNIX_EPOCH + Duration::from_secs(self.created_at)
     }
 
     /// Check if the file is ready for use.
@@ -169,7 +169,8 @@ impl FilesConfig {
 ///
 /// # Errors
 ///
-/// Returns an error when request construction or the `OpenAI` Files API call fails.
+/// Returns an error if the upload request fails or the provider rejects
+/// the file.
 pub async fn upload_bytes(
     cfg: &FilesConfig,
     file_name: &str,
@@ -242,6 +243,11 @@ pub async fn upload_bytes(
 ///
 /// Returns an error when the file cannot be read or the upload request fails.
 #[cfg(not(target_arch = "wasm32"))]
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, the upload fails, or the
+/// provider rejects the file.
 pub async fn upload_file(
     cfg: &FilesConfig,
     path: &Path,
@@ -264,7 +270,7 @@ pub async fn upload_file(
 ///
 /// # Errors
 ///
-/// Returns an error when request construction or deletion fails.
+/// Returns an error if the request fails, or the provider rejects it.
 pub async fn delete_file(
     cfg: &FilesConfig,
     file_id: &str,
@@ -298,7 +304,7 @@ pub async fn delete_file(
 ///
 /// # Errors
 ///
-/// Returns an error when request construction or lookup fails.
+/// Returns an error if the request fails, or the provider rejects it.
 pub async fn get_file(cfg: &FilesConfig, file_id: &str) -> Result<OpenAIFile, OpenAIError> {
     let endpoint = format!("{}/{}", cfg.files_endpoint(), file_id);
 
@@ -329,7 +335,7 @@ pub async fn get_file(cfg: &FilesConfig, file_id: &str) -> Result<OpenAIFile, Op
 ///
 /// # Errors
 ///
-/// Returns an error when request construction or listing fails.
+/// Returns an error if the request fails, or the provider rejects it.
 pub async fn list_files(
     cfg: &FilesConfig,
     purpose: Option<FilePurpose>,

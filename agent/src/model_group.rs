@@ -417,6 +417,7 @@ where
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// A boxed event stream from one of the group's models.
 /// Stream wrapper for `ModelGroup` that tracks usage and detects quota errors.
 type BoxedModelStream<'a, M> =
     Pin<Box<dyn Stream<Item = Result<Event, <M as LanguageModel>::Error>> + Send + 'a>>;

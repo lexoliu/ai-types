@@ -99,7 +99,7 @@ impl Tool for EchoTool {
 
 async fn tool_call(gemini: &Gemini) -> Result<()> {
     let mut tools = Tools::new();
-    tools.register(EchoTool);
+    tools.register(EchoTool)?;
 
     let params = Parameters {
         tool_choice: ToolChoice::Exact("echo_tool".into()),

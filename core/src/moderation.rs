@@ -150,7 +150,10 @@ mod tests {
     impl Moderation for MockModeration {
         type Error = Infallible;
 
-        async fn moderate(&self, content: &str) -> Result<ModerationResult, Self::Error> {
+        fn moderate(
+            &self,
+            content: &str,
+        ) -> impl Future<Output = Result<ModerationResult, Self::Error>> + Send {
             // Mock moderation logic based on content
             let flagged = content.contains("bad") || content.contains("harmful");
             let mut categories = Vec::new();
@@ -171,7 +174,7 @@ mod tests {
                 categories.push(ModerationCategory::SelfHarm { score: 0.95 });
             }
 
-            Ok(ModerationResult::new(flagged, categories))
+            core::future::ready(Ok(ModerationResult::new(flagged, categories)))
         }
     }
 

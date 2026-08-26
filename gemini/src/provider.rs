@@ -127,8 +127,12 @@ struct ModelListResponse {
     models: Vec<ModelDescriptor>,
 }
 
-#[derive(Debug, Deserialize)]
+/// A model entry as the list-models endpoint returns it.
+///
+/// Fields this crate does not read are still declared so the payload
+/// deserializes faithfully.
 #[allow(dead_code)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ModelDescriptor {
     name: String,

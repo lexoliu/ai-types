@@ -145,6 +145,7 @@ pub async fn poll_for_token(
         match try_get_token(device_code).await {
             Ok(token) => return Ok(token),
             Err(CopilotError::AuthorizationPending) => {
+                // User hasn't completed auth yet, keep polling.
                 tracing::debug!("Authorization pending, polling again...");
             }
             Err(e) => return Err(e),
@@ -163,8 +164,9 @@ pub async fn poll_for_token(
 ///
 /// # Errors
 ///
-/// Returns an error if the device code is still pending, expired, denied, or if
-/// the token endpoint request fails.
+/// Returns [`CopilotError::AuthorizationPending`] while the user has not yet
+/// approved the device code, and other [`CopilotError`] variants if the request
+/// fails or GitHub rejects the code.
 pub async fn try_get_token(device_code: &str) -> Result<CopilotToken, CopilotError> {
     let mut backend = client();
 
@@ -188,6 +190,7 @@ pub async fn try_get_token(device_code: &str) -> Result<CopilotToken, CopilotErr
     // Check for errors
     if let Some(error) = response.error {
         return match error.as_str() {
+            // `slow_down` is still pending; the caller's poll interval handles it.
             "authorization_pending" | "slow_down" => Err(CopilotError::AuthorizationPending),
             "expired_token" => Err(CopilotError::DeviceCodeExpired),
             "access_denied" => Err(CopilotError::AccessDenied),
@@ -276,8 +279,8 @@ struct SessionTokenResponse {
 ///
 /// # Errors
 ///
-/// Returns an error if GitHub rejects the OAuth token or the session token
-/// response cannot be fetched.
+/// Returns a [`CopilotError`] if the request fails or the OAuth token is not
+/// accepted — most often because it has expired or lacks Copilot access.
 pub async fn get_session_token(oauth_token: &str) -> Result<SessionToken, CopilotError> {
     use crate::constant::{COPILOT_TOKEN_URL, EDITOR_VERSION};
 

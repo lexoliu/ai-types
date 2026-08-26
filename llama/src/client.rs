@@ -13,8 +13,7 @@ use llama_cpp_2::{
     context::params::{LlamaContextParams, LlamaPoolingType},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{AddBos, LlamaChatTemplate, LlamaModel, params::LlamaModelParams},
-    openai::OpenAIChatTemplateParams,
+    model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
 };
 use serde::Serialize;
@@ -47,7 +46,9 @@ impl Llama {
     /// Load a GGUF model from disk.
     ///
     /// # Errors
-    /// Returns an error when the llama backend or GGUF model cannot be initialized.
+    ///
+    /// Returns an error if the backend cannot start or the model cannot be
+    /// loaded from `model_path`.
     pub fn from_file(model_path: impl AsRef<Path>) -> Result<Self, LlamaError> {
         Self::builder(model_path).build()
     }
@@ -114,8 +115,11 @@ impl LanguageModel for Llama {
 
 impl EmbeddingModel for Llama {
     fn dim(&self) -> usize {
-        usize::try_from(self.model.n_embd())
-            .expect("llama embedding dimension must be non-negative")
+        // Embedding dimensions are small positive counts.
+        #[allow(clippy::cast_sign_loss)]
+        {
+            self.model.n_embd() as usize
+        }
     }
 
     fn embed(
@@ -151,8 +155,9 @@ impl EmbeddingModel for Llama {
                 return Ok(embedding.to_vec());
             }
 
-            let last_index = i32::try_from(tokens.len() - 1)
-                .map_err(|_| LlamaError::Unsupported("token sequence is too long".to_string()))?;
+            // Token counts are bounded by the context window, well inside i32.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let last_index = (tokens.len() - 1) as i32;
             let embedding = context
                 .embeddings_ith(last_index)
                 .map_err(|err| LlamaError::Decode(err.to_string()))?;
@@ -242,7 +247,9 @@ impl Builder {
     /// Build the local llama provider.
     ///
     /// # Errors
-    /// Returns an error when the backend cannot be initialized or the model file cannot be loaded.
+    ///
+    /// Returns an error if the backend cannot start or the model file cannot be
+    /// loaded.
     pub fn build(self) -> Result<Llama, LlamaError> {
         let model_params = LlamaModelParams::default()
             .with_n_gpu_layers(self.n_gpu_layers)
@@ -280,13 +287,9 @@ fn response_stream(
     match thread::Builder::new()
         .name("aither-llama-respond".to_string())
         .spawn(move || {
-            if let Err(err) = run_response_generation(
-                model.as_ref(),
-                backend.as_ref(),
-                cfg.as_ref(),
-                request,
-                &worker_sender,
-            ) {
+            if let Err(err) =
+                run_response_generation(&model, &backend, &cfg, request, &worker_sender)
+            {
                 let _ = worker_sender.send_blocking(Err(err));
             }
         }) {
@@ -302,9 +305,9 @@ fn response_stream(
 }
 
 fn run_response_generation(
-    model: &LlamaModel,
-    backend: &LlamaBackend,
-    cfg: &LlamaConfig,
+    model: &Arc<LlamaModel>,
+    backend: &Arc<LlamaBackend>,
+    cfg: &Arc<LlamaConfig>,
     request: LLMRequest,
     sender: &async_channel::Sender<Result<Event, LlamaError>>,
 ) -> Result<(), LlamaError> {
@@ -317,12 +320,12 @@ fn run_response_generation(
     }
 
     let tool_defs = filter_tool_definitions(tool_defs, &parameters.tool_choice);
-    let template = resolve_chat_template(model, cfg)?;
-    let prompt = build_prompt(model, &template, &messages, &parameters, &tool_defs)?;
+    let template = resolve_chat_template(model.as_ref(), cfg.as_ref())?;
+    let prompt = build_prompt(model.as_ref(), &template, &messages, &tool_defs)?;
 
-    let mut context = create_context(model, backend, cfg, false)?;
+    let mut context = create_context(model.as_ref(), backend.as_ref(), cfg.as_ref(), false)?;
     let prompt_tokens = model
-        .str_to_token(&prompt.template_result.prompt, AddBos::Never)
+        .str_to_token(&prompt.text, AddBos::Never)
         .map_err(|err| LlamaError::Token(err.to_string()))?;
 
     if prompt_tokens.is_empty() {
@@ -344,11 +347,12 @@ fn run_response_generation(
 
     let mut generated = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut pos = i32::try_from(prompt_tokens.len())
-        .map_err(|_| LlamaError::Unsupported("prompt is too long".to_string()))?;
+    // Prompt length is bounded by the context window, well inside i32.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let start_pos = prompt_tokens.len() as i32;
     let max_tokens = parameters.max_tokens.unwrap_or(512);
 
-    for _ in 0..max_tokens {
+    for pos in (start_pos..).take(usize::try_from(max_tokens).unwrap_or(usize::MAX)) {
         let token = sampler.sample(&context, -1);
         sampler.accept(token);
 
@@ -373,14 +377,16 @@ fn run_response_generation(
         context
             .decode(&mut step_batch)
             .map_err(|err| LlamaError::Decode(err.to_string()))?;
-        pos += 1;
     }
 
-    if let Ok(parsed) = prompt
-        .template_result
-        .parse_response_oaicompat(&generated, false)
+    // Templates have no tool channel, so the call payload arrives inline in the
+    // generated text. Only look for it when tools were actually offered, and
+    // treat a non-match as "the model chose to answer in prose".
+    if prompt.expects_tool_calls
+        && let Some(payload) = extract_tool_call_payload(&generated)
+        && let Ok(calls) = parse_openai_message(payload)
     {
-        for call in parse_openai_message(&parsed)? {
+        for call in calls {
             if sender.send_blocking(Ok(Event::ToolCall(call))).is_err() {
                 return Ok(());
             }
@@ -420,6 +426,7 @@ fn resolve_chat_template(
     if let Some(template) = &cfg.chat_template {
         return LlamaChatTemplate::new(template).map_err(|err| LlamaError::Model(err.to_string()));
     }
+    // Fall back to ChatML when the model carries no template of its own.
     model.chat_template(None).map_or_else(
         |_| LlamaChatTemplate::new("chatml").map_err(|err| LlamaError::Model(err.to_string())),
         Ok,
@@ -427,42 +434,66 @@ fn resolve_chat_template(
 }
 
 struct Prompt {
-    template_result: llama_cpp_2::model::ChatTemplateResult,
+    text: String,
+    /// Whether tools were advertised, and so whether the generated text should
+    /// be inspected for a tool-call payload.
+    expects_tool_calls: bool,
+}
+
+/// Instructions prepended as a system message when tools are available.
+///
+/// `llama.cpp`'s chat templates take plain role/content pairs and have no tool
+/// channel of their own, so the schemas and the expected reply shape have to be
+/// described in-band.
+fn tool_system_prompt(tools_json: &str) -> String {
+    format!(
+        "You have access to the following tools, described as JSON schemas:\n\
+         {tools_json}\n\n\
+         To call one or more tools, reply with nothing but a JSON object of the form:\n\
+         {{\"tool_calls\":[{{\"id\":\"<unique id>\",\"function\":{{\"name\":\"<tool name>\",\
+         \"arguments\":\"<arguments as a JSON string>\"}}}}]}}\n\
+         If no tool is needed, answer normally and do not emit that object."
+    )
 }
 
 fn build_prompt(
     model: &LlamaModel,
     template: &LlamaChatTemplate,
     messages: &[Message],
-    parameters: &Parameters,
     tool_defs: &[ToolDefinition],
 ) -> Result<Prompt, LlamaError> {
-    let messages_json = serde_json::to_string(&messages_to_openai(messages))?;
     let tools_json = tools_to_openai_json(tool_defs);
+    let mut chat = Vec::with_capacity(messages.len() + usize::from(tools_json.is_some()));
 
-    let template_result = model
-        .apply_chat_template_oaicompat(
-            template,
-            &OpenAIChatTemplateParams {
-                messages_json: &messages_json,
-                tools_json: tools_json.as_deref(),
-                tool_choice: None,
-                json_schema: None,
-                grammar: None,
-                reasoning_format: None,
-                chat_template_kwargs: None,
-                add_generation_prompt: true,
-                use_jinja: true,
-                parallel_tool_calls: true,
-                enable_thinking: parameters.include_reasoning,
-                add_bos: false,
-                add_eos: false,
-                parse_tool_calls: !tool_defs.is_empty(),
-            },
-        )
+    if let Some(tools_json) = &tools_json {
+        chat.push(
+            LlamaChatMessage::new("system".to_string(), tool_system_prompt(tools_json))
+                .map_err(|err| LlamaError::Model(err.to_string()))?,
+        );
+    }
+
+    for msg in messages_to_openai(messages) {
+        // A tool result carries no role of its own in a plain template; fold it
+        // into the user turn so the model still sees the output it asked for.
+        let (role, content) = if msg.role == "tool" {
+            ("user".to_string(), format!("Tool result: {}", msg.content))
+        } else {
+            (msg.role, msg.content)
+        };
+        chat.push(
+            LlamaChatMessage::new(role, content)
+                .map_err(|err| LlamaError::Model(err.to_string()))?,
+        );
+    }
+
+    let text = model
+        .apply_chat_template(template, &chat, true)
         .map_err(|err| LlamaError::Model(err.to_string()))?;
 
-    Ok(Prompt { template_result })
+    Ok(Prompt {
+        text,
+        expects_tool_calls: tools_json.is_some(),
+    })
 }
 
 fn filter_tool_definitions(
@@ -580,7 +611,9 @@ fn build_sampler(parameters: &Parameters) -> LlamaSampler {
     }
 
     if let Some(top_k) = parameters.top_k {
-        samplers.push(LlamaSampler::top_k(top_k.cast_signed()));
+        // top_k is a small positive count; the sampler API takes it signed.
+        #[allow(clippy::cast_possible_wrap)]
+        samplers.push(LlamaSampler::top_k(top_k as i32));
     }
     if let Some(top_p) = parameters.top_p {
         samplers.push(LlamaSampler::top_p(top_p, 1));
@@ -607,12 +640,51 @@ fn sampling_seed(seed: Option<u32>) -> u32 {
     if let Some(seed) = seed {
         return seed;
     }
+    // Only the low bits matter: this is seed material, not a timestamp.
+    #[allow(clippy::cast_possible_truncation)]
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|value| u64::try_from(value.as_nanos()).unwrap_or(u64::MAX))
-        .unwrap_or(1);
-    let mixed = now ^ (now >> 32);
-    u32::try_from(mixed & u64::from(u32::MAX)).expect("masked seed fits in u32")
+        .map_or(1, |value| value.as_nanos() as u64);
+    ((now ^ (now >> 32)) & 0xFFFF_FFFF) as u32
+}
+
+/// Extracts the JSON object carrying `tool_calls` from generated text.
+///
+/// Models routinely wrap the object in prose or a fenced code block, so scan for
+/// the outermost balanced braces containing a `"tool_calls"` key rather than
+/// requiring the whole response to be JSON.
+fn extract_tool_call_payload(generated: &str) -> Option<&str> {
+    let start = generated.find('{')?;
+    let bytes = generated.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, &byte) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let candidate = &generated[start..=idx];
+                    return candidate.contains("\"tool_calls\"").then_some(candidate);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn parse_openai_message(json_text: &str) -> Result<Vec<ToolCall>, LlamaError> {
@@ -662,4 +734,46 @@ fn parse_openai_message(json_text: &str) -> Result<Vec<ToolCall>, LlamaError> {
     }
 
     Ok(calls)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_tool_call_payload, parse_openai_message};
+
+    #[test]
+    fn extracts_bare_tool_call_object() {
+        let raw = r#"{"tool_calls":[{"id":"a","function":{"name":"f","arguments":"{}"}}]}"#;
+        assert_eq!(extract_tool_call_payload(raw), Some(raw));
+    }
+
+    #[test]
+    fn extracts_tool_call_wrapped_in_prose_and_fences() {
+        let raw = "Sure, calling it now:\n```json\n{\"tool_calls\":[{\"id\":\"a\",\
+                   \"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}\n```\nDone.";
+        let payload = extract_tool_call_payload(raw).expect("payload should be found");
+        assert!(payload.starts_with('{') && payload.ends_with('}'));
+        assert!(payload.contains("\"tool_calls\""));
+    }
+
+    #[test]
+    fn ignores_prose_without_tool_calls() {
+        assert_eq!(extract_tool_call_payload("The answer is 4."), None);
+        assert_eq!(extract_tool_call_payload(r#"{"content":"hi"}"#), None);
+    }
+
+    #[test]
+    fn brace_inside_string_does_not_end_the_object() {
+        let raw =
+            r#"{"tool_calls":[{"id":"a","function":{"name":"f","arguments":"{\"q\":\"}\"}"}}]}"#;
+        assert_eq!(extract_tool_call_payload(raw), Some(raw));
+    }
+
+    #[test]
+    fn parses_arguments_into_tool_calls() {
+        let raw = r#"{"tool_calls":[{"id":"call_1","function":{"name":"search","arguments":"{\"q\":\"rust\"}"}}]}"#;
+        let calls = parse_openai_message(raw).expect("should parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "search");
+        assert_eq!(calls[0].arguments["q"], "rust");
+    }
 }

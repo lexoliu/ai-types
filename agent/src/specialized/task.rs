@@ -43,17 +43,20 @@ pub struct SubagentType<LLM> {
     builder: SubagentBuilder<LLM>,
 }
 
-/// Mapping from a sandbox-visible path prefix to a host directory.
+/// Maps a path the subagent sees onto the host directory it really refers to.
+///
+/// A subagent works inside a sandbox, so the paths in its prompts are virtual;
+/// this records how to resolve them without letting one escape its root.
 #[derive(Clone, Debug)]
 pub struct SubagentFileMount {
-    /// Path prefix visible to the sandboxed agent.
+    /// Path prefix as the subagent sees it.
     pub virtual_prefix: PathBuf,
-    /// Host directory backing the virtual prefix.
+    /// Directory on the host that prefix resolves to.
     pub host_root: PathBuf,
 }
 
 impl SubagentFileMount {
-    /// Creates a mount from a virtual sandbox prefix to a host root directory.
+    /// Maps `virtual_prefix` onto `host_root`.
     #[must_use]
     pub fn new(virtual_prefix: impl Into<PathBuf>, host_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -330,7 +333,6 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
     }
 
     async fn resolve_relative_path_through_mounts(
-        &self,
         requested_display: &Path,
         file_path: &Path,
         mounts: &[SubagentFileMount],
@@ -372,17 +374,25 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
         ))
     }
 
-    async fn resolve_subagent_path(&self, file_path: &Path) -> anyhow::Result<PathBuf> {
-        let mounts = self.effective_mounts();
+    /// Resolves a path the subagent asked for against its mounts.
+    ///
+    /// Takes the mounts and base directory rather than `&self` so the returned
+    /// future does not borrow the tool, and so stays `Send`.
+    async fn resolve_subagent_path(
+        mounts: &[SubagentFileMount],
+        base_dir: Option<&Path>,
+        file_path: &Path,
+    ) -> anyhow::Result<PathBuf> {
         if file_path.is_absolute() {
-            if let Some(base_dir) = &self.base_dir
+            if let Some(base_dir) = base_dir
                 && let Ok(stripped) = file_path.strip_prefix(base_dir)
             {
                 let relative = Self::strip_leading_curdir(stripped);
                 if !relative.as_os_str().is_empty() {
-                    return self
-                        .resolve_relative_path_through_mounts(&relative, &relative, &mounts)
-                        .await;
+                    return Self::resolve_relative_path_through_mounts(
+                        &relative, &relative, mounts,
+                    )
+                    .await;
                 }
             }
 
@@ -395,8 +405,7 @@ impl<LLM: Clone + Sync> SubagentTool<LLM> {
             ));
         }
 
-        self.resolve_relative_path_through_mounts(file_path, file_path, &mounts)
-            .await
+        Self::resolve_relative_path_through_mounts(file_path, file_path, mounts).await
     }
 }
 
@@ -451,7 +460,12 @@ where
             // Load subagent from file
             // Resolve paths using explicit search roots.
             let file_path = PathBuf::from(&args.subagent);
-            let resolved_path = self.resolve_subagent_path(&file_path).await?;
+            let resolved_path = Self::resolve_subagent_path(
+                &self.effective_mounts(),
+                self.base_dir.as_deref(),
+                &file_path,
+            )
+            .await?;
 
             let def = SubagentDefinition::from_file_async(&resolved_path)
                 .await
@@ -498,7 +512,9 @@ where
             (agent_builder, None)
         };
 
-        let mut agent = agent_builder.build();
+        let mut agent = agent_builder
+            .build()
+            .map_err(|err| anyhow::anyhow!("subagent '{subagent_id}' is misconfigured: {err}"))?;
 
         // Run the subagent with the prompt
         let query_result = agent.query(&args.prompt).await;
@@ -605,10 +621,13 @@ mod tests {
             SubagentFileMount::new(".", root.join("workspace")),
             SubagentFileMount::new("skills", skills_root.clone()),
         ]);
-        let resolved = tool
-            .resolve_subagent_path(Path::new("skills/slide/SKILL.md"))
-            .await
-            .expect("resolve mounted skill path");
+        let resolved = SubagentTool::<()>::resolve_subagent_path(
+            &tool.effective_mounts(),
+            tool.base_dir.as_deref(),
+            Path::new(".skills/slide/SKILL.md"),
+        )
+        .await
+        .expect("resolve mounted skill path");
         assert_eq!(resolved, skill_file);
 
         let _ = std::fs::remove_dir_all(root);
@@ -620,10 +639,13 @@ mod tests {
         let tool = SubagentTool::new(())
             .with_file_mounts([SubagentFileMount::new("skills", root.join("skills"))]);
 
-        let error = tool
-            .resolve_subagent_path(Path::new("../outside.md"))
-            .await
-            .expect_err("parent traversal should fail");
+        let error = SubagentTool::<()>::resolve_subagent_path(
+            &tool.effective_mounts(),
+            tool.base_dir.as_deref(),
+            Path::new("../outside.md"),
+        )
+        .await
+        .expect_err("parent traversal should fail");
         assert!(
             error
                 .to_string()
@@ -642,10 +664,13 @@ mod tests {
         let tool = SubagentTool::new(())
             .with_file_mounts([SubagentFileMount::new("skills", skills_root.clone())]);
 
-        let error = tool
-            .resolve_subagent_path(Path::new("skills/missing.md"))
-            .await
-            .expect_err("missing file should fail");
+        let error = SubagentTool::<()>::resolve_subagent_path(
+            &tool.effective_mounts(),
+            tool.base_dir.as_deref(),
+            Path::new(".skills/missing.md"),
+        )
+        .await
+        .expect_err("missing file should fail");
         let message = error.to_string();
         assert!(
             message.contains("skills/missing.md"),
@@ -679,10 +704,13 @@ mod tests {
                 SubagentFileMount::new("skills", skills_root.clone()),
             ]);
 
-        let resolved = tool
-            .resolve_subagent_path(&session_skills_file)
-            .await
-            .expect("resolve absolute workspace skills path");
+        let resolved = SubagentTool::<()>::resolve_subagent_path(
+            &tool.effective_mounts(),
+            tool.base_dir.as_deref(),
+            &session_skills_file,
+        )
+        .await
+        .expect("resolve absolute workspace .skills path");
         assert_eq!(resolved, mounted_skill_file);
 
         let _ = std::fs::remove_dir_all(root);

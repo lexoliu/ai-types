@@ -28,7 +28,7 @@ impl<Args, Response> ToolRequest<Args, Response> {
     ///
     /// # Errors
     ///
-    /// Returns the unsent response if the request receiver is unavailable.
+    /// Returns the response back if the requester has already given up waiting.
     pub fn respond(self, response: Response) -> Result<(), async_channel::TrySendError<Response>> {
         self.response_tx.try_send(response)
     }
@@ -45,7 +45,8 @@ impl<Args, Response> ToolRequestBroker<Args, Response> {
     ///
     /// # Errors
     ///
-    /// Returns an error when the queue is closed or the response is cancelled.
+    /// Returns an error if the queue has been dropped, which means no UI is
+    /// listening for tool requests any more.
     pub async fn request(&self, args: Args) -> anyhow::Result<Response> {
         let (response_tx, response_rx) = async_channel::bounded(1);
         self.tx
@@ -93,7 +94,7 @@ pub fn channel<Args, Response>() -> (
 ///
 /// # Panics
 ///
-/// Panics if `capacity` is zero.
+/// Panics if `capacity` is zero, which would deadlock every request.
 #[must_use]
 pub fn bounded_channel<Args, Response>(
     capacity: usize,
@@ -191,6 +192,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     ///
     /// The returned [`Receiver`] yields the response once [`respond`](Self::respond)
     /// is called with the matching ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request lock was poisoned by a panic in another thread.
     pub fn enqueue(&self, payload: P) -> (String, Receiver<R>) {
         let order = self.next_id.fetch_add(1, Ordering::Relaxed);
         let id = order.to_string();
@@ -209,6 +214,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     /// Respond to a pending request by ID.
     ///
     /// Returns `true` if the request was found and the response was sent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request lock was poisoned by a panic in another thread.
     pub fn respond(&self, id: &str, response: R) -> bool {
         let mut found = None;
         loop {
@@ -233,6 +242,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     }
 
     /// Return the oldest pending request (ID + cloned payload) without removing it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn peek(&self) -> Option<(String, P)> {
         let state = self.state.load();
@@ -244,6 +257,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     }
 
     /// Return the oldest pending request matching a predicate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn peek_filtered(&self, predicate: impl Fn(&P) -> bool) -> Option<(String, P)> {
         let state = self.state.load();
@@ -259,6 +276,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     }
 
     /// Get a cloned payload by request ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn get_payload(&self, id: &str) -> Option<P> {
         self.state
@@ -269,6 +290,10 @@ impl<P: Clone, R> RequestApprover<P, R> {
     }
 
     /// Returns `true` if there are no pending requests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the request lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.state.load().pending.is_empty()

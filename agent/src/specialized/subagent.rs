@@ -106,7 +106,9 @@ where
             builder = builder.system_prompt(prompt);
         }
 
-        let mut agent = builder.build();
+        let mut agent = builder
+            .build()
+            .map_err(|err| anyhow::anyhow!("subagent '{}' is misconfigured: {err}", self.name))?;
 
         let result = agent
             .query(&args.task)

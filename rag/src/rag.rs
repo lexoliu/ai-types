@@ -94,17 +94,19 @@ where
     }
 
     /// Indexes all files in a directory.
-    ///
     /// # Errors
-    /// Returns an error when file collection, embedding, indexing, or persistence fails.
+    ///
+    /// Returns an error if the directory cannot be walked, a file cannot be
+    /// read, or embedding fails.
     pub async fn index_directory<Pth: AsRef<Path>>(&self, dir: Pth) -> Result<usize> {
         self.index_directory_with_progress(dir, |_| {}).await
     }
 
     /// Indexes all files in a directory with progress callback.
-    ///
     /// # Errors
-    /// Returns an error when file collection, embedding, indexing, or persistence fails.
+    ///
+    /// Returns an error if the directory cannot be walked, a file cannot be
+    /// read, or embedding fails.
     pub async fn index_directory_with_progress<Pth, F>(
         &self,
         dir: Pth,
@@ -180,9 +182,9 @@ where
     }
 
     /// Inserts a single document.
-    ///
     /// # Errors
-    /// Returns an error when cleaning, chunking, embedding, or indexing fails.
+    ///
+    /// Returns an error if the document cannot be embedded or stored.
     pub async fn insert(&self, document: Document) -> Result<usize> {
         self.store.insert(document).await
     }
@@ -193,17 +195,19 @@ where
     }
 
     /// Searches for similar content.
-    ///
     /// # Errors
-    /// Returns an error when embedding the query or searching the index fails.
+    ///
+    /// Returns an error if the query cannot be embedded, or its dimension does
+    /// not match the index.
     pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
         self.store.search(query).await
     }
 
     /// Searches with a custom result count.
-    ///
     /// # Errors
-    /// Returns an error when embedding the query or searching the index fails.
+    ///
+    /// Returns an error if the query cannot be embedded, or its dimension does
+    /// not match the index.
     pub async fn search_with_k(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         self.store.search_with_k(query, top_k).await
     }
@@ -377,9 +381,9 @@ where
     }
 
     /// Builds the [`Rag`] instance using a provided persistence backend.
-    ///
     /// # Errors
-    /// Returns an error when the builder configuration is invalid.
+    ///
+    /// Returns an error if the persistence backend rejects initialization.
     pub fn build_with_persistence<P: Persistence>(self, persistence: P) -> Result<Rag<M, C, L, P>> {
         let config = self.config_builder.build();
         let store =
@@ -420,14 +424,17 @@ mod tests {
             self.dimension
         }
 
-        async fn embed(&self, text: &str) -> aither_core::Result<Vec<f32>> {
+        fn embed(
+            &self,
+            text: &str,
+        ) -> impl std::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {
                 let digit = u8::try_from((text.len() + idx) % 10).expect("modulo result fits u8");
                 *value = f32::from(digit) / 10.0;
             }
-            Ok(vec)
+            std::future::ready(Ok(vec))
         }
     }
 

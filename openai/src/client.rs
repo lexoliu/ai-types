@@ -145,11 +145,22 @@ async fn request_with_timeout<T>(
     }
     #[cfg(target_arch = "wasm32")]
     {
+        // The browser timer is not `Send`, and `LanguageModel` requires the
+        // futures built on top of this one to be. Run the timer on the JS event
+        // loop where it belongs and wait on a channel, which is `Send`.
         let millis = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+        let (expired_tx, expired_rx) = async_channel::bounded::<()>(1);
+        wasm_bindgen_futures::spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(millis).await;
+            let _ = expired_tx.send(()).await;
+        });
+
         futures_lite::future::or(
             async move { fut.await.map_err(map_zenwave_error) },
             async move {
-                gloo_timers::future::TimeoutFuture::new(millis).await;
+                // A closed channel means the timer task was dropped, which can
+                // only happen once the whole request is being torn down.
+                let _ = expired_rx.recv().await;
                 Err(OpenAIError::Timeout)
             },
         )
@@ -344,6 +355,7 @@ impl OpenAI {
 impl LanguageModel for OpenAI {
     type Error = OpenAIError;
 
+    #[allow(clippy::too_many_lines)]
     fn respond(
         &self,
         request: LLMRequest,
@@ -375,7 +387,7 @@ impl LanguageModel for OpenAI {
             }
 
             if effective_api_kind == ApiKind::ChatCompletions
-                && messages.iter().flat_map(|message| message.attachments()).any(|attachment| {
+                && messages.iter().flat_map(aither_core::llm::Message::attachments).any(|attachment| {
                     let media_type = attachment.media_type().as_ref();
                     !media_type.starts_with("image/") && !media_type.starts_with("audio/")
                 })
@@ -387,7 +399,7 @@ impl LanguageModel for OpenAI {
             }
 
             if effective_api_kind == ApiKind::Responses
-                && messages.iter().flat_map(|message| message.attachments()).any(|attachment| {
+                && messages.iter().flat_map(aither_core::llm::Message::attachments).any(|attachment| {
                     attachment.media_type().as_ref().starts_with("video/")
                 })
             {
@@ -813,13 +825,7 @@ fn normalize_response_call_id(call_id: Option<String>, fallback: &str) -> String
 }
 
 fn non_empty_response_id(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        if value.trim().is_empty() {
-            None
-        } else {
-            Some(value)
-        }
-    })
+    value.filter(|value| !value.trim().is_empty())
 }
 
 fn fallback_response_item_id(output_index: usize) -> String {

@@ -23,19 +23,19 @@ pub struct Transcript {
 }
 
 impl Transcript {
-    /// Create a transcript writer for the given path.
+    /// Creates a transcript that appends to `path`.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
-    /// Return the transcript path.
+    /// The file this transcript is written to.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Append a user message block.
+    /// Appends a user turn.
     pub async fn write_user_message(&self, content: &str) {
         let mut block = String::new();
         let _ = writeln!(block, "\n## User\n");
@@ -43,7 +43,7 @@ impl Transcript {
         self.append(&block).await;
     }
 
-    /// Append assistant text.
+    /// Appends an assistant turn. Empty content is skipped.
     pub async fn write_assistant_text(&self, content: &str) {
         if content.is_empty() {
             return;
@@ -54,7 +54,7 @@ impl Transcript {
         self.append(&block).await;
     }
 
-    /// Append a tool call block.
+    /// Appends the command a tool was invoked with.
     pub async fn write_tool_call(&self, name: &str, command: &str) {
         let mut block = String::new();
         let _ = writeln!(block, "\n### Tool: {name}\n");

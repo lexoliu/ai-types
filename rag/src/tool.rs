@@ -96,14 +96,17 @@ mod tests {
             self.dimension
         }
 
-        async fn embed(&self, text: &str) -> aither_core::Result<Vec<f32>> {
+        fn embed(
+            &self,
+            text: &str,
+        ) -> impl std::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {
                 let digit = u8::try_from((text.len() + idx) % 10).expect("modulo result fits u8");
                 *value = f32::from(digit) / 10.0;
             }
-            Ok(vec)
+            std::future::ready(Ok(vec))
         }
     }
 

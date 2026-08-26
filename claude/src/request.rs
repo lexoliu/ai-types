@@ -8,6 +8,8 @@ use aither_core::llm::{
     },
     tool::ToolDefinition,
 };
+// Only the native file:// reader encodes anything here.
+#[cfg(not(target_arch = "wasm32"))]
 use base64::Engine;
 use serde::Serialize;
 use serde_json::Value;
@@ -235,14 +237,27 @@ impl From<ClaudePromptCache> for CacheControlPayload {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolChoicePayload {
     /// Let Claude decide when to call a tool.
-    Auto,
+    Auto {
+        /// Forbids Claude from requesting more than one tool per turn.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
     /// Require Claude to call at least one tool.
-    Any,
+    Any {
+        /// Forbids Claude from requesting more than one tool per turn.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
     /// Restrict tool calling to a single tool by name.
     Tool {
         /// Name of the tool Claude is allowed to call.
         name: String,
+        /// Forbids Claude from requesting more than one tool per turn.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
     },
+    /// Forbid tool calls outright.
+    None,
 }
 
 /// Snapshot of parameters for request building.
@@ -261,6 +276,8 @@ pub struct ParameterSnapshot {
     pub stop_sequences: Option<Vec<String>>,
     /// Whether to include reasoning/thinking.
     pub include_reasoning: bool,
+    /// Whether Claude may request several tools per turn. `None` keeps Anthropic's default.
+    pub parallel_tool_calls: Option<bool>,
     /// Tool choice policy.
     pub tool_choice: ToolChoice,
     /// Claude-specific cache controls.
@@ -278,6 +295,7 @@ impl From<&Parameters> for ParameterSnapshot {
             max_tokens: params.max_tokens,
             stop_sequences: params.stop.clone(),
             include_reasoning: params.include_reasoning,
+            parallel_tool_calls: params.parallel_tool_calls,
             tool_choice: params.tool_choice.clone(),
             cache: params.cache.claude,
             native_tools: params.native_tools.claude.clone(),
@@ -441,8 +459,13 @@ pub fn apply_cache_strategy(
     let default_ttl = cache.ttl;
     match cache.strategy {
         ClaudePromptCacheStrategy::Automatic => {
-            let automatic =
-                maybe_automatic_cache_control(system, messages, tools, default_ttl, None)?;
+            let automatic = maybe_automatic_cache_control(
+                system.as_ref(),
+                messages,
+                tools.as_ref(),
+                default_ttl,
+                None,
+            )?;
             Ok(automatic.map(|(cache_control, _)| cache_control))
         }
         ClaudePromptCacheStrategy::Explicit(breakpoints) => {
@@ -455,9 +478,9 @@ pub fn apply_cache_strategy(
             let mut applied =
                 apply_explicit_breakpoints(system, messages, tools, breakpoints, default_ttl)?;
             let automatic = maybe_automatic_cache_control(
-                system,
+                system.as_ref(),
                 messages,
-                tools,
+                tools.as_ref(),
                 default_ttl,
                 Some(breakpoints),
             )?;
@@ -531,9 +554,9 @@ fn apply_explicit_breakpoints(
 
 #[allow(clippy::ref_option)]
 fn maybe_automatic_cache_control(
-    system: &Option<SystemPayload>,
+    system: Option<&SystemPayload>,
     messages: &[MessagePayload],
-    tools: &Option<Vec<ToolPayload>>,
+    tools: Option<&Vec<ToolPayload>>,
     ttl: ClaudePromptCacheTtl,
     explicit_breakpoints: Option<ClaudeExplicitCacheBreakpoints>,
 ) -> Result<Option<(CacheControlPayload, AppliedBreakpoint)>, String> {
@@ -568,9 +591,9 @@ fn maybe_automatic_cache_control(
 
 #[allow(clippy::ref_option)]
 fn find_last_cacheable_block(
-    system: &Option<SystemPayload>,
+    system: Option<&SystemPayload>,
     messages: &[MessagePayload],
-    tools: &Option<Vec<ToolPayload>>,
+    tools: Option<&Vec<ToolPayload>>,
 ) -> Option<(PromptPosition, Option<CacheControlPayload>)> {
     for (message_index, message) in messages.iter().enumerate().rev() {
         match &message.content {
@@ -583,7 +606,7 @@ fn find_last_cacheable_block(
                 if let Some(block_index) = last_cacheable_block_index(blocks) {
                     return Some((
                         PromptPosition::message(message_index, block_index),
-                        block_cache_control(&blocks[block_index]).clone(),
+                        block_cache_control(&blocks[block_index]).cloned(),
                     ));
                 }
             }
@@ -914,14 +937,13 @@ const fn block_cache_control_mut(block: &mut ContentBlock) -> &mut Option<CacheC
     }
 }
 
-#[allow(clippy::ref_option)]
-const fn block_cache_control(block: &ContentBlock) -> &Option<CacheControlPayload> {
+const fn block_cache_control(block: &ContentBlock) -> Option<&CacheControlPayload> {
     match block {
         ContentBlock::Text { cache_control, .. }
         | ContentBlock::Image { cache_control, .. }
         | ContentBlock::Document { cache_control, .. }
         | ContentBlock::ToolUse { cache_control, .. }
-        | ContentBlock::ToolResult { cache_control, .. } => cache_control,
+        | ContentBlock::ToolResult { cache_control, .. } => cache_control.as_ref(),
     }
 }
 
@@ -966,6 +988,12 @@ async fn parse_media_source(attachment: &Attachment) -> Result<MediaSource, Stri
                 data: data.to_string(),
             })
         }
+        // wasm32 has no filesystem, and CI builds this crate for it with -D warnings.
+        #[cfg(target_arch = "wasm32")]
+        "file" => {
+            Err("Claude attachments from file:// URLs are not supported on wasm32".to_string())
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         "file" => {
             let path = url
                 .to_file_path()
@@ -1075,15 +1103,29 @@ pub fn filter_tool_definitions(
     }
 }
 
-pub fn tool_choice_payload(choice: &ToolChoice, has_tools: bool) -> Option<ToolChoicePayload> {
+pub fn tool_choice_payload(
+    choice: &ToolChoice,
+    has_tools: bool,
+    parallel_tool_calls: Option<bool>,
+) -> Option<ToolChoicePayload> {
     if !has_tools {
         return None;
     }
+    // Anthropic states the negative: the wire flag disables parallelism, while
+    // the portable parameter enables it.
+    let disable_parallel_tool_use = parallel_tool_calls.map(|enabled| !enabled);
     match choice {
-        ToolChoice::None => None,
-        ToolChoice::Auto => Some(ToolChoicePayload::Auto),
-        ToolChoice::Required => Some(ToolChoicePayload::Any),
-        ToolChoice::Exact(name) => Some(ToolChoicePayload::Tool { name: name.clone() }),
+        ToolChoice::None => Some(ToolChoicePayload::None),
+        ToolChoice::Auto => Some(ToolChoicePayload::Auto {
+            disable_parallel_tool_use,
+        }),
+        ToolChoice::Required => Some(ToolChoicePayload::Any {
+            disable_parallel_tool_use,
+        }),
+        ToolChoice::Exact(name) => Some(ToolChoicePayload::Tool {
+            name: name.clone(),
+            disable_parallel_tool_use,
+        }),
     }
 }
 
@@ -1120,7 +1162,9 @@ mod tests {
                 assert!(matches!(blocks[0], ContentBlock::Text { .. }));
                 assert!(matches!(blocks[1], ContentBlock::ToolUse { .. }));
             }
-            other => panic!("expected assistant blocks payload, got: {other:?}"),
+            other @ ContentPayload::Text(_) => {
+                panic!("expected assistant blocks payload, got: {other:?}")
+            }
         }
     }
 
@@ -1147,7 +1191,9 @@ mod tests {
                     other => panic!("expected tool_result block, got: {other:?}"),
                 }
             }
-            other => panic!("expected user blocks payload, got: {other:?}"),
+            other @ ContentPayload::Text(_) => {
+                panic!("expected user blocks payload, got: {other:?}")
+            }
         }
     }
 
@@ -1190,7 +1236,7 @@ mod tests {
 
     #[test]
     fn required_tool_choice_maps_to_any() {
-        let payload = tool_choice_payload(&ToolChoice::Required, true)
+        let payload = tool_choice_payload(&ToolChoice::Required, true, None)
             .expect("required should create payload");
         let json = serde_json::to_value(payload).expect("serialize tool choice");
         assert_eq!(json["type"], "any");
@@ -1198,11 +1244,66 @@ mod tests {
 
     #[test]
     fn exact_tool_choice_maps_to_named_tool() {
-        let payload = tool_choice_payload(&ToolChoice::Exact("search".to_string()), true)
+        let payload = tool_choice_payload(&ToolChoice::Exact("search".to_string()), true, None)
             .expect("exact should create payload");
         let json = serde_json::to_value(payload).expect("serialize tool choice");
         assert_eq!(json["type"], "tool");
         assert_eq!(json["name"], "search");
+    }
+
+    fn tool_choice_json(choice: &ToolChoice, parallel: Option<bool>) -> serde_json::Value {
+        let payload = tool_choice_payload(choice, true, parallel).expect("tool choice payload");
+        serde_json::to_value(payload).expect("serialize tool choice")
+    }
+
+    /// Anthropic states the flag negatively, so the portable "enable parallel"
+    /// parameter has to invert on its way to the wire.
+    #[test]
+    fn parallel_tool_calls_inverts_into_disable_parallel_tool_use() {
+        let serialized = tool_choice_json(&ToolChoice::Auto, Some(false));
+        assert_eq!(serialized["disable_parallel_tool_use"], true);
+
+        let parallel = tool_choice_json(&ToolChoice::Required, Some(true));
+        assert_eq!(parallel["disable_parallel_tool_use"], false);
+    }
+
+    /// Unset must stay off the wire entirely so Anthropic's own default applies.
+    #[test]
+    fn unset_parallel_tool_calls_is_omitted() {
+        for choice in [
+            ToolChoice::Auto,
+            ToolChoice::Required,
+            ToolChoice::Exact("search".to_string()),
+        ] {
+            let serialized = tool_choice_json(&choice, None);
+            assert_eq!(
+                serialized.get("disable_parallel_tool_use"),
+                None,
+                "{choice:?} leaked a parallelism hint"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_tool_choice_carries_the_parallelism_hint() {
+        let serialized = tool_choice_json(&ToolChoice::Exact("search".to_string()), Some(false));
+        assert_eq!(serialized["type"], "tool");
+        assert_eq!(serialized["name"], "search");
+        assert_eq!(serialized["disable_parallel_tool_use"], true);
+    }
+
+    /// Anthropic expresses "do not call tools" as a choice, not as an absent
+    /// tool list, and that variant takes no parallelism hint.
+    #[test]
+    fn none_tool_choice_maps_to_the_none_variant() {
+        let serialized = tool_choice_json(&ToolChoice::None, Some(false));
+        assert_eq!(serialized["type"], "none");
+        assert_eq!(serialized.get("disable_parallel_tool_use"), None);
+    }
+
+    #[test]
+    fn tool_choice_is_absent_without_tools() {
+        assert!(tool_choice_payload(&ToolChoice::Auto, false, Some(false)).is_none());
     }
 
     #[test]
@@ -1249,7 +1350,9 @@ mod tests {
                 assert_eq!(blocks[0].text, "Instruction A");
                 assert_eq!(blocks[1].text, "Instruction B");
             }
-            other => panic!("expected system blocks payload, got: {other:?}"),
+            other @ SystemPayload::Text(_) => {
+                panic!("expected system blocks payload, got: {other:?}")
+            }
         }
     }
 
@@ -1299,7 +1402,9 @@ mod tests {
                 }
                 other => panic!("expected tool_use block, got: {other:?}"),
             },
-            other => panic!("expected block payload, got: {other:?}"),
+            other @ ContentPayload::Text(_) => {
+                panic!("expected block payload, got: {other:?}")
+            }
         }
     }
 

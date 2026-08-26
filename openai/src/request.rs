@@ -27,6 +27,7 @@ pub struct ParameterSnapshot {
     pub(crate) logit_bias: Option<HashMap<String, f32>>,
     pub(crate) seed: Option<u32>,
     pub(crate) tool_choice: ToolChoice,
+    pub(crate) parallel_tool_calls: Option<bool>,
     pub(crate) logprobs: Option<bool>,
     pub(crate) top_logprobs: Option<u8>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
@@ -56,6 +57,7 @@ impl From<&Parameters> for ParameterSnapshot {
                 .map(|pairs| pairs.iter().cloned().collect()),
             seed: value.seed,
             tool_choice: value.tool_choice.clone(),
+            parallel_tool_calls: value.parallel_tool_calls,
             logprobs: value.logprobs,
             top_logprobs: value.top_logprobs,
             reasoning_effort: value.reasoning_effort,
@@ -114,7 +116,8 @@ pub struct ChatCompletionRequest {
     tools: Option<Vec<ToolPayload>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<ToolChoicePayload>,
-    /// Enable parallel tool calls (default: true when tools provided)
+    /// Whether the model may request several tools per turn. Omitted unless the
+    /// caller sets it, so the provider's own default applies.
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -165,7 +168,7 @@ impl ChatCompletionRequest {
             top_logprobs: params.top_logprobs,
             tools,
             tool_choice: tool_choice(params, has_tools),
-            parallel_tool_calls: if has_tools { Some(false) } else { None },
+            parallel_tool_calls: has_tools.then_some(params.parallel_tool_calls).flatten(),
             response_format: response_format(params),
             reasoning: reasoning(params),
             prompt_cache_key: params.prompt_cache_key.clone(),
@@ -271,6 +274,9 @@ struct JsonSchemaPayload {
 struct ReasoningPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     effort: Option<&'static str>,
+    /// Responses API only: requests reasoning summaries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<&'static str>,
 }
 
 pub async fn to_chat_messages(
@@ -509,7 +515,23 @@ fn response_format(params: &ParameterSnapshot) -> Option<ResponseFormatPayload> 
 fn reasoning(params: &ParameterSnapshot) -> Option<ReasoningPayload> {
     params.reasoning_effort.map(|effort| ReasoningPayload {
         effort: Some(effort.as_str()),
+        summary: None,
     })
+}
+
+/// Builds the Responses API `reasoning` config.
+///
+/// The Responses API returns reasoning summaries only when `summary` is
+/// requested. Without it the `response.reasoning_summary_text.*` events never
+/// arrive, so asking for reasoning without asking for the summary is silently
+/// a no-op.
+fn responses_reasoning(params: &ParameterSnapshot) -> Option<ReasoningPayload> {
+    let summary = params.include_reasoning.then_some("auto");
+    let effort = params.reasoning_effort.map(ReasoningEffort::as_str);
+    if effort.is_none() && summary.is_none() {
+        return None;
+    }
+    Some(ReasoningPayload { effort, summary })
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -744,9 +766,9 @@ impl ResponsesRequest {
             top_logprobs: params.top_logprobs,
             tools,
             tool_choice,
-            parallel_tool_calls: if has_tools { Some(false) } else { None },
+            parallel_tool_calls: has_tools.then_some(params.parallel_tool_calls).flatten(),
             text: responses_text(params),
-            reasoning: reasoning(params),
+            reasoning: responses_reasoning(params),
             include: responses_include(params),
             prompt_cache_key: params.prompt_cache_key.clone(),
             prompt_cache_retention: prompt_cache_retention(params),
@@ -1259,9 +1281,10 @@ mod tests {
         assert_eq!(value["stream_options"]["include_usage"], true);
     }
 
-    #[test]
-    fn chat_request_disables_parallel_tool_calls_when_tools_exist() {
-        let snapshot = ParameterSnapshot::from(&Parameters::default());
+    /// Builds a chat request carrying one function tool, so the
+    /// `parallel_tool_calls` field is in play.
+    fn chat_request_with_tool(params: &Parameters) -> serde_json::Value {
+        let snapshot = ParameterSnapshot::from(params);
         let req = ChatCompletionRequest::new(
             "gpt-5".into(),
             Vec::new(),
@@ -1279,13 +1302,38 @@ mod tests {
             }]),
             false,
         );
-        let value = serde_json::to_value(&req).expect("serialize chat request");
-        assert_eq!(value["parallel_tool_calls"], false);
+        serde_json::to_value(&req).expect("serialize chat request")
     }
 
     #[test]
-    fn responses_request_disables_parallel_tool_calls_when_tools_exist() {
-        let snapshot = ParameterSnapshot::from(&Parameters::default());
+    fn chat_request_omits_parallel_tool_calls_by_default() {
+        // Unset must stay off the wire so OpenAI applies its own default,
+        // rather than aither silently serializing every agent's tool calls.
+        let value = chat_request_with_tool(&Parameters::default());
+        assert_eq!(value.get("parallel_tool_calls"), None);
+    }
+
+    #[test]
+    fn chat_request_forwards_explicit_parallel_tool_calls() {
+        let enabled = chat_request_with_tool(&Parameters::default().parallel_tool_calls(true));
+        assert_eq!(enabled["parallel_tool_calls"], true);
+
+        let disabled = chat_request_with_tool(&Parameters::default().parallel_tool_calls(false));
+        assert_eq!(disabled["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn chat_request_omits_parallel_tool_calls_without_tools() {
+        let snapshot = ParameterSnapshot::from(&Parameters::default().parallel_tool_calls(true));
+        let req = ChatCompletionRequest::new("gpt-5".into(), Vec::new(), &snapshot, None, false);
+        let value = serde_json::to_value(&req).expect("serialize chat request");
+        assert_eq!(value.get("parallel_tool_calls"), None);
+    }
+
+    /// Builds a Responses request carrying one function tool, so the
+    /// `parallel_tool_calls` field is in play.
+    fn responses_request_with_tool(params: &Parameters) -> serde_json::Value {
+        let snapshot = ParameterSnapshot::from(params);
         let req = ResponsesRequest::new(
             "gpt-5".into(),
             vec![ResponsesInputItem::message(
@@ -1304,8 +1352,64 @@ mod tests {
             responses_tool_choice(&snapshot, true),
             false,
         );
-        let value = serde_json::to_value(&req).expect("serialize responses request");
-        assert_eq!(value["parallel_tool_calls"], false);
+        serde_json::to_value(&req).expect("serialize responses request")
+    }
+
+    #[test]
+    fn responses_request_omits_parallel_tool_calls_by_default() {
+        let value = responses_request_with_tool(&Parameters::default());
+        assert_eq!(value.get("parallel_tool_calls"), None);
+    }
+
+    #[test]
+    fn responses_request_forwards_explicit_parallel_tool_calls() {
+        let enabled = responses_request_with_tool(&Parameters::default().parallel_tool_calls(true));
+        assert_eq!(enabled["parallel_tool_calls"], true);
+
+        let disabled =
+            responses_request_with_tool(&Parameters::default().parallel_tool_calls(false));
+        assert_eq!(disabled["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn responses_reasoning_requests_a_summary_when_reasoning_is_included() {
+        // Without `summary`, the Responses API never emits
+        // `response.reasoning_summary_text.*`, so include_reasoning would be a
+        // silent no-op no matter what the response parser handles.
+        let snapshot = ParameterSnapshot::from(&Parameters::default().include_reasoning(true));
+        let payload = responses_reasoning(&snapshot).expect("reasoning payload");
+        let value = serde_json::to_value(payload).expect("serialize reasoning");
+        assert_eq!(value["summary"], "auto");
+    }
+
+    #[test]
+    fn responses_reasoning_carries_effort_without_a_summary() {
+        let snapshot =
+            ParameterSnapshot::from(&Parameters::default().reasoning_effort(ReasoningEffort::High));
+        let payload = responses_reasoning(&snapshot).expect("reasoning payload");
+        let value = serde_json::to_value(payload).expect("serialize reasoning");
+        assert_eq!(value["effort"], "high");
+        assert_eq!(value.get("summary"), None);
+    }
+
+    #[test]
+    fn responses_reasoning_is_absent_when_nothing_is_requested() {
+        let snapshot = ParameterSnapshot::from(&Parameters::default());
+        assert!(responses_reasoning(&snapshot).is_none());
+    }
+
+    /// Chat Completions has no `summary` field, so the shared payload must not
+    /// grow one just because the Responses builder needs it.
+    #[test]
+    fn chat_reasoning_never_carries_a_summary() {
+        let params = Parameters::default()
+            .include_reasoning(true)
+            .reasoning_effort(ReasoningEffort::Low);
+        let snapshot = ParameterSnapshot::from(&params);
+        let payload = reasoning(&snapshot).expect("reasoning payload");
+        let value = serde_json::to_value(payload).expect("serialize reasoning");
+        assert_eq!(value["effort"], "low");
+        assert_eq!(value.get("summary"), None);
     }
 
     #[test]

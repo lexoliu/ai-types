@@ -12,7 +12,7 @@ impl EmbeddingModel for DemoEmbedder {
         4
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    fn embed(&self, text: &str) -> impl std::future::Future<Output = Result<Vec<f32>>> + Send {
         let mut vector = vec![0.0; self.dim()];
         for (idx, byte) in text.bytes().enumerate() {
             let bucket = idx % self.dim();
@@ -25,7 +25,7 @@ impl EmbeddingModel for DemoEmbedder {
                 *v /= norm;
             }
         }
-        Ok(vector)
+        std::future::ready(Ok(vector))
     }
 }
 

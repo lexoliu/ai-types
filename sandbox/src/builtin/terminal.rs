@@ -22,7 +22,7 @@ impl KillTerminalTool {
     }
 }
 
-/// Arguments for [`KillTerminalTool`].
+/// Terminate a background terminal task by its task id.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct KillTerminalArgs {
     /// Task identifier returned by terminal when the task is backgrounded.
@@ -71,7 +71,7 @@ impl InputTerminalTool {
     }
 }
 
-/// Arguments for [`InputTerminalTool`].
+/// Send input to a background terminal task that is waiting on stdin.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InputTerminalArgs {
     /// Task identifier returned by terminal when the task is backgrounded.

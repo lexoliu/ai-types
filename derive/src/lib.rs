@@ -380,19 +380,27 @@ fn analyze_function_args(
                 }
             };
 
+            let params = inputs
+                .iter()
+                .map(|arg| match arg {
+                    FnArg::Typed(pat_type) => {
+                        let pat = &pat_type.pat;
+                        Ok(format_ident!("{}", quote! {#pat}.to_string()))
+                    }
+                    // A `self` receiver: point at it rather than panicking, so
+                    // the user gets a diagnostic on the offending argument
+                    // instead of "proc macro panicked".
+                    FnArg::Receiver(receiver) => Err(syn::Error::new_spanned(
+                        receiver,
+                        "#[tool] cannot be applied to a method taking `self`; \
+                         use a free function",
+                    )),
+                })
+                .collect::<Result<Vec<_>, syn::Error>>()?;
+
             Ok(AnalyzedArgs {
                 args_type: parse_quote! { #arg_struct_name },
-                params: inputs
-                    .iter()
-                    .map(|arg| {
-                        if let FnArg::Typed(pat_type) = arg {
-                            let pat = &pat_type.pat;
-                            format_ident!("{}", quote! {#pat}.to_string())
-                        } else {
-                            panic!("Expected typed argument")
-                        }
-                    })
-                    .collect(),
+                params,
                 stream: new_type_gen,
             })
         }

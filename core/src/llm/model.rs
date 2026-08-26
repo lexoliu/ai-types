@@ -127,6 +127,13 @@ pub struct Parameters {
     /// Controls whether tools are allowed, required, or constrained to a specific tool.
     pub tool_choice: ToolChoice,
 
+    /// Whether the model may request several tools in a single turn.
+    ///
+    /// `None` leaves the decision to the provider's own default. Set it only to
+    /// override that default — forcing `false` serializes an agent loop that
+    /// could otherwise fan its tool calls out concurrently.
+    pub parallel_tool_calls: Option<bool>,
+
     /// Preferred reasoning effort when supported.
     pub reasoning_effort: Option<ReasoningEffort>,
 
@@ -199,6 +206,7 @@ impl_with_methods! {
         logprobs: bool,
         top_logprobs: u8,
         stop: Vec<String>,
+        parallel_tool_calls: bool,
     }
 }
 

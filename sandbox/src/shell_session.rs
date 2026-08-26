@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 /// Outcome of a container execution request.
 #[derive(Debug)]
 pub enum ContainerExecOutcome {
-    /// Command completed with process output.
+    /// The command ran to completion; carries its exit status and output.
     Completed(std::process::Output),
-    /// Command was killed before completion.
+    /// The command was terminated before it finished.
     Killed,
 }
 
@@ -191,53 +191,55 @@ impl<T: ContainerExec> ContainerExecObject for T {
     }
 }
 
-/// Available shell execution backends.
+/// Where a shell command is executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellBackend {
-    /// Execute directly on the local host.
+    /// On this machine, inside the local sandbox.
     Local,
-    /// Execute inside a container.
+    /// Inside a container.
     Container,
-    /// Execute through SSH.
+    /// On a remote host over SSH.
     Ssh,
 }
 
-/// Named SSH server target.
+/// A named SSH destination the agent may run commands on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SshServer {
-    /// Server identifier.
+    /// Short name the agent uses to select this server.
     pub name: String,
-    /// SSH target string.
+    /// SSH target, as passed to `ssh` (for example `user@host`).
     pub target: String,
 }
 
 impl SshServer {
-    /// Returns the server identifier.
+    /// The name used to address this server.
     #[must_use]
     pub fn id(&self) -> &str {
         &self.name
     }
 }
 
-/// Runtime profile used after preparing an SSH target.
+/// How the sandbox runtime is available on a remote host.
 #[derive(Debug, Clone)]
 pub enum SshRuntimeProfile {
-    /// Heel-powered SSH runtime.
+    /// The `heel` sandbox binary is installed at the given path.
     Heel {
-        /// Remote heel binary path.
+        /// Absolute path to the `heel` binary on the remote host.
         binary: String,
     },
 }
 
-/// Availability flags for shell execution backends.
+/// Which shell backends are usable in the current deployment.
+///
+/// Reported to the model so it does not offer a backend that is not configured.
 #[derive(Debug, Clone, Serialize)]
 pub struct ShellRuntimeAvailability {
-    /// Local host execution is available.
+    /// Whether local execution is available. Always true in practice.
     pub local: bool,
-    /// Container execution is available.
+    /// Whether a container runtime has been wired up.
     pub container: bool,
-    /// SSH execution is available.
+    /// Whether any SSH servers are registered.
     pub ssh: bool,
 }
 
@@ -251,15 +253,20 @@ impl Default for ShellRuntimeAvailability {
     }
 }
 
-/// Authorizes SSH connection and runtime bootstrap actions.
+/// Approves remote actions before the sandbox performs them.
+///
+/// Connecting to a host and installing software on it are both decisions a user
+/// should make, so they are routed through this trait rather than assumed.
 pub trait SshSessionAuthorizer: Send + Sync {
-    /// Authorizes connecting to `target`.
+    /// Asks whether the agent may open an SSH connection to `target`.
     fn authorize_connect(
         &self,
         target: &str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
 
-    /// Authorizes installing or preparing heel on `target`.
+    /// Asks whether the agent may install the `heel` runtime on `target`.
+    ///
+    /// `details` describes the remote host so the user can judge the request.
     fn authorize_heel_install(
         &self,
         target: &str,
@@ -267,7 +274,10 @@ pub trait SshSessionAuthorizer: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
 }
 
-/// Registry for shell backend availability and session metadata.
+/// Tracks which shell backends are configured and how to reach them.
+///
+/// Cloning shares the same underlying state, so registering a container or SSH
+/// server is visible to every holder.
 #[derive(Clone)]
 pub struct ShellSessionRegistry {
     availability: ShellRuntimeAvailability,
@@ -284,7 +294,7 @@ impl std::fmt::Debug for ShellSessionRegistry {
 }
 
 impl ShellSessionRegistry {
-    /// Creates a shell session registry.
+    /// Creates a registry advertising the given backends.
     #[must_use]
     pub fn new(availability: ShellRuntimeAvailability) -> Self {
         Self {
@@ -302,7 +312,7 @@ impl ShellSessionRegistry {
         self
     }
 
-    /// Sets the SSH session authorizer.
+    /// The currently advertised backends.
     #[must_use]
     pub fn with_ssh_authorizer(mut self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
         self.ssh_authorizer = Some(authorizer);
@@ -345,6 +355,7 @@ impl ShellSessionRegistry {
         Ok(self)
     }
 
+    /// Every registered SSH server.
     #[must_use]
     /// Lists configured SSH servers.
     pub fn list_ssh_servers(&self) -> Vec<SshServer> {
@@ -369,10 +380,12 @@ impl ShellSessionRegistry {
         }
     }
 
-    /// Resolves a configured SSH server by id.
+    /// Looks up a registered server by name.
     ///
     /// # Errors
-    /// Returns an error when the id is empty or unknown.
+    ///
+    /// Returns an error if `server_id` is blank, names no registered server, or
+    /// the server lock was poisoned.
     pub fn resolve_ssh_server(&self, server_id: &str) -> Result<SshServer, String> {
         let wanted = server_id.trim();
         if wanted.is_empty() {
@@ -385,10 +398,14 @@ impl ShellSessionRegistry {
             .ok_or_else(|| format!("unknown ssh_server_id: {wanted}"))
     }
 
-    /// Selects the preferred local backend.
+    /// Picks the backend to use for a command that did not name one.
+    ///
+    /// Prefers a container when one is configured, since it isolates better
+    /// than running on the host.
     ///
     /// # Errors
-    /// Returns an error when neither container nor local execution is available.
+    ///
+    /// Returns an error if neither a container nor local execution is available.
     pub fn resolve_local_backend(&self) -> Result<ShellBackend, String> {
         let availability = self.availability();
         if availability.container {
@@ -400,10 +417,11 @@ impl ShellSessionRegistry {
         Err("no local backend available".to_string())
     }
 
-    /// Ensures SSH execution is available.
+    /// Confirms the SSH backend is configured.
     ///
     /// # Errors
-    /// Returns an error when SSH execution is unavailable.
+    ///
+    /// Returns an error if no SSH servers are registered.
     pub fn ensure_ssh_available(&self) -> Result<(), String> {
         if self.availability().ssh {
             Ok(())
@@ -419,10 +437,16 @@ impl ShellSessionRegistry {
     }
 }
 
-/// Bootstraps an SSH runtime profile.
+/// Prepares a remote host to run sandboxed commands.
+///
+/// Confirms the connection is authorized, probes for the `heel` runtime, and —
+/// with the user's approval — installs it if it is missing.
 ///
 /// # Errors
-/// Returns an error when authorization fails or the remote runtime cannot be prepared.
+///
+/// Returns an error if the authorizer denies the connection, the SSH probe
+/// fails, or `heel` is absent and either installation was declined or did not
+/// succeed.
 pub async fn bootstrap_ssh_runtime(
     target: &str,
     authorizer: &Option<Arc<dyn SshSessionAuthorizer>>,

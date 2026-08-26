@@ -66,7 +66,7 @@ impl Provider {
     ///
     /// # Errors
     ///
-    /// Returns an error when the provider API key is not present in the environment.
+    /// Returns an error if the provider's API-key environment variable is unset.
     pub fn create(self, model: &str, base_url: Option<&str>) -> Result<CloudProvider> {
         let api_key = std::env::var(self.env_var())
             .map_err(|_| anyhow::anyhow!("Set {} in your environment", self.env_var()))?;
@@ -127,7 +127,8 @@ impl std::str::FromStr for Provider {
 ///
 /// # Errors
 ///
-/// Returns an error when no matching provider API key is available.
+/// Returns an error if no provider's API-key environment variable is set, or if
+/// the detected provider cannot be constructed.
 pub fn auto_detect(model: Option<&str>, base_url: Option<&str>) -> Result<(CloudProvider, String)> {
     // Try to detect from model name
     if let Some(model) = model {

@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ContainerRuntimeKind {
-    /// `OrbStack` runtime.
+    /// `OrbStack`, a macOS-native Docker-compatible runtime.
     OrbStack,
-    /// Podman runtime.
+    /// Podman, the daemonless Docker-compatible runtime.
     Podman,
-    /// Docker runtime.
+    /// Docker Engine itself.
     Docker,
 }
 
@@ -34,7 +34,7 @@ impl std::fmt::Display for ContainerRuntimeKind {
 /// Runtime selection order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RuntimePreference {
-    /// Preferred runtime probing order.
+    /// Runtimes to try, most preferred first.
     pub order: Vec<ContainerRuntimeKind>,
 }
 
@@ -54,14 +54,14 @@ impl Default for RuntimePreference {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MountAccess {
-    /// Mount is read-only in the container.
+    /// The container may read the mount but not write to it.
     ReadOnly,
-    /// Mount is writable in the container.
+    /// The container may read and write the mount.
     ReadWrite,
 }
 
 impl MountAccess {
-    /// Returns true for read-only mounts.
+    /// Whether this policy forbids writes.
     #[must_use]
     pub const fn read_only(self) -> bool {
         matches!(self, Self::ReadOnly)
@@ -71,39 +71,42 @@ impl MountAccess {
 /// A host path mounted into a container path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MountSpec {
-    /// Host filesystem path.
+    /// Path on the host to expose.
     pub host_path: PathBuf,
-    /// Container filesystem path.
+    /// Path inside the container where it appears.
     pub container_path: PathBuf,
-    /// Mount access mode.
+    /// Whether the container may write to it.
     pub access: MountAccess,
 }
 
 /// Declarative host/container root pair used to create validated child mounts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct MountRoot {
-    /// Host root path.
+    /// Base directory on the host.
     pub host_root: PathBuf,
-    /// Container root path.
+    /// Directory the host root maps to inside the container.
     pub container_root: PathBuf,
 }
 
 /// Mount-root composition error.
 #[derive(Debug, thiserror::Error)]
 pub enum MountRootError {
+    /// The relative path was empty, which would mount the root itself.
     #[error("relative path must not be empty")]
     /// Relative path was empty.
     EmptyRelativePath,
+    /// An absolute path was given where a path relative to the root was expected.
     #[error("relative path must not be absolute: {0}")]
     /// Relative path was absolute.
     AbsoluteRelativePath(PathBuf),
+    /// The path contained `..`, which would escape the mount root.
     #[error("relative path must not contain parent traversal: {0}")]
     /// Relative path contained parent traversal.
     ParentTraversal(PathBuf),
 }
 
 impl MountRoot {
-    /// Creates a mount root mapping from host root to container root.
+    /// Pairs a host directory with the container path it maps to.
     #[must_use]
     pub fn new(host_root: impl Into<PathBuf>, container_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -112,10 +115,12 @@ impl MountRoot {
         }
     }
 
-    /// Creates a child mount under this root.
+    /// Derives a mount for a path beneath this root.
     ///
     /// # Errors
-    /// Returns an error when `relative` is empty, absolute, or contains parent traversal.
+    ///
+    /// Returns [`MountRootError`] if `relative` is empty, absolute, or contains
+    /// a `..` component — any of which would place the mount outside the root.
     pub fn child(
         &self,
         relative: impl AsRef<Path>,
@@ -132,18 +137,20 @@ impl MountRoot {
         })
     }
 
-    /// Creates a read-only child mount.
+    /// Derives a read-only mount beneath this root.
     ///
     /// # Errors
-    /// Returns an error when `relative` is empty, absolute, or contains parent traversal.
+    ///
+    /// Same conditions as [`Self::child`].
     pub fn read_only_child(&self, relative: impl AsRef<Path>) -> Result<MountSpec, MountRootError> {
         self.child(relative, MountAccess::ReadOnly)
     }
 
-    /// Creates a read-write child mount.
+    /// Derives a writable mount beneath this root.
     ///
     /// # Errors
-    /// Returns an error when `relative` is empty, absolute, or contains parent traversal.
+    ///
+    /// Same conditions as [`Self::child`].
     pub fn read_write_child(
         &self,
         relative: impl AsRef<Path>,
@@ -169,7 +176,7 @@ impl MountRoot {
 }
 
 impl MountSpec {
-    /// Creates a read-only mount specification.
+    /// Mounts a host path into the container without write access.
     #[must_use]
     pub fn read_only(host_path: impl Into<PathBuf>, container_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -179,7 +186,7 @@ impl MountSpec {
         }
     }
 
-    /// Creates a read-write mount specification.
+    /// Mounts a host path into the container with write access.
     #[must_use]
     pub fn read_write(host_path: impl Into<PathBuf>, container_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -193,17 +200,17 @@ impl MountSpec {
 /// Image build specification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ContainerImageSpec {
-    /// Image tag to build.
+    /// Tag to apply to the built image.
     pub tag: String,
-    /// Build context directory.
+    /// Directory used as the build context.
     pub context_dir: PathBuf,
-    /// Optional Dockerfile path.
+    /// Dockerfile to build, if not the default one in the context directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<PathBuf>,
 }
 
 impl ContainerImageSpec {
-    /// Creates an image build specification.
+    /// Describes an image built from `context_dir` and tagged `tag`.
     #[must_use]
     pub fn new(tag: impl Into<String>, context_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -213,7 +220,7 @@ impl ContainerImageSpec {
         }
     }
 
-    /// Sets a custom Dockerfile path.
+    /// Builds from a specific Dockerfile rather than the context default.
     #[must_use]
     pub fn with_dockerfile(mut self, dockerfile: impl Into<PathBuf>) -> Self {
         self.dockerfile = Some(dockerfile.into());
@@ -224,22 +231,22 @@ impl ContainerImageSpec {
 /// Container launch specification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ContainerLaunchSpec {
-    /// Container name.
+    /// Name to give the running container.
     pub name: String,
-    /// Image name.
+    /// Image to run.
     pub image: String,
-    /// Container workspace path.
+    /// Directory the container treats as its workspace.
     pub workspace: PathBuf,
-    /// Mounts to attach.
+    /// Additional host paths to expose.
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
-    /// Environment variables.
+    /// Environment entries, each formatted as `KEY=value`.
     #[serde(default)]
     pub env: Vec<String>,
 }
 
 impl ContainerLaunchSpec {
-    /// Creates a container launch specification.
+    /// Describes a container to launch from `image` in `workspace`.
     #[must_use]
     pub fn new(
         name: impl Into<String>,
@@ -255,14 +262,14 @@ impl ContainerLaunchSpec {
         }
     }
 
-    /// Adds a mount.
+    /// Exposes an additional host path inside the container.
     #[must_use]
     pub fn with_mount(mut self, mount: MountSpec) -> Self {
         self.mounts.push(mount);
         self
     }
 
-    /// Adds an environment variable.
+    /// Adds an environment entry, formatted as `KEY=value`.
     #[must_use]
     pub fn with_env(mut self, value: impl Into<String>) -> Self {
         self.env.push(value.into());

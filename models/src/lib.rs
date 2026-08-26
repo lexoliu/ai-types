@@ -1,6 +1,6 @@
 //! Model registry with capabilities, context windows, and metadata for popular LLMs.
 //!
-//! This crate provides a database of known AI models sourced from LiteLLM upstream,
+//! This crate provides a database of known AI models sourced from `LiteLLM` upstream,
 //! with their capabilities, context window sizes, pricing, and provider information.
 //!
 //! # Example
@@ -18,7 +18,7 @@ pub mod convert;
 mod registry;
 #[cfg(feature = "remote")]
 pub mod remote;
-mod tier;
+pub(crate) mod tier;
 pub mod types;
 
 pub use aither_core::llm::model::Ability;

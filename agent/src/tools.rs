@@ -48,8 +48,14 @@ impl AgentTools {
     }
 
     /// Registers an eager (always-loaded) tool.
-    pub fn register<T: Tool + 'static>(&mut self, tool: T) {
-        self.eager.register(tool);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegisterError`] if the name collides with a tool that is
+    /// already registered, or the tool has no description for the model to
+    /// read.
+    pub fn register<T: Tool + 'static>(&mut self, tool: T) -> Result<(), RegisterError> {
+        self.eager.register(tool)
     }
 
     /// Registers a dynamic terminal tool (type-erased).
@@ -200,6 +206,7 @@ mod tests {
         name: String,
     }
 
+    /// Arguments for the dummy test tool.
     #[derive(Debug, JsonSchema, Deserialize)]
     struct DummyArgs {}
 
@@ -220,9 +227,11 @@ mod tests {
     #[test]
     fn test_register_eager() {
         let mut tools = AgentTools::new();
-        tools.register(DummyTool {
-            name: "test".to_string(),
-        });
+        tools
+            .register(DummyTool {
+                name: "test".to_string(),
+            })
+            .expect("dummy tool should register");
 
         assert_eq!(tools.definitions().len(), 1);
     }

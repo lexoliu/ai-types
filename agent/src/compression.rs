@@ -61,6 +61,9 @@ impl Default for SmartCompressionConfig {
 }
 
 /// Configuration for what content to preserve during compression.
+// Each flag is an independent, orthogonal preservation choice; grouping them
+// into an enum would not describe the domain any better.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct PreserveConfig {
     /// Keep file paths verbatim.
@@ -244,6 +247,9 @@ impl SmartCompressionConfig {
                 format!("- Running background jobs:\n{jobs}")
             });
 
+        // The braces below are template placeholders for `str::replace`, not
+        // format arguments.
+        #[allow(clippy::literal_string_with_formatting_args)]
         let prompt = COMPRESSION_USER_TEMPLATE
             .replace(FILE_PATHS_PLACEHOLDER, &preserved.file_paths.join(", "))
             .replace(ERRORS_PLACEHOLDER, &preserved.errors.join("\n"))
@@ -293,6 +299,9 @@ impl SmartCompressionConfig {
                 format!("- Running background jobs:\n{jobs}")
             });
 
+        // The braces below are template placeholders for `str::replace`, not
+        // format arguments.
+        #[allow(clippy::literal_string_with_formatting_args)]
         let prompt = COMPRESSION_URLS_TEMPLATE
             .replace(CONTENT_WITH_URLS_PLACEHOLDER, &content_with_urls)
             .replace(FILE_PATHS_PLACEHOLDER, &preserved.file_paths.join(", "))
