@@ -618,20 +618,20 @@ fn strip_code_fences(raw: &str) -> Option<String> {
 }
 
 fn extract_json_block(raw: &str) -> Option<String> {
-    if let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}')) {
-        if end >= start {
-            let candidate = &raw[start..=end];
-            if !candidate.trim().is_empty() {
-                return Some(candidate.trim().to_string());
-            }
+    if let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}'))
+        && end >= start
+    {
+        let candidate = &raw[start..=end];
+        if !candidate.trim().is_empty() {
+            return Some(candidate.trim().to_string());
         }
     }
-    if let (Some(start), Some(end)) = (raw.find('['), raw.rfind(']')) {
-        if end >= start {
-            let candidate = &raw[start..=end];
-            if !candidate.trim().is_empty() {
-                return Some(candidate.trim().to_string());
-            }
+    if let (Some(start), Some(end)) = (raw.find('['), raw.rfind(']'))
+        && end >= start
+    {
+        let candidate = &raw[start..=end];
+        if !candidate.trim().is_empty() {
+            return Some(candidate.trim().to_string());
         }
     }
     None

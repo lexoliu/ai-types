@@ -34,11 +34,11 @@ impl Hook for DebugHook {
                 "\x1b[36m[tool]\x1b[0m {} \x1b[90m(turn {})\x1b[0m",
                 ctx.tool_name, ctx.turn
             );
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ctx.arguments) {
-                if let Ok(pretty) = serde_json::to_string_pretty(&parsed) {
-                    for line in pretty.lines() {
-                        println!("  \x1b[90m{line}\x1b[0m");
-                    }
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(ctx.arguments)
+                && let Ok(pretty) = serde_json::to_string_pretty(&parsed)
+            {
+                for line in pretty.lines() {
+                    println!("  \x1b[90m{line}\x1b[0m");
                 }
             }
         }
@@ -187,11 +187,11 @@ fn parse_terminal_result(result: &str) -> Option<TerminalOutput> {
 /// Print terminal output in human-friendly format.
 fn print_terminal_output(output: &TerminalOutput, duration_ms: u128) {
     // Background task
-    if let Some(ref task_id) = output.task_id {
-        if output.status.as_deref() == Some("running") {
-            println!("\x1b[33m⏳ Background task started:\x1b[0m {task_id}");
-            return;
-        }
+    if let Some(ref task_id) = output.task_id
+        && output.status.as_deref() == Some("running")
+    {
+        println!("\x1b[33m⏳ Background task started:\x1b[0m {task_id}");
+        return;
     }
 
     // Success indicator

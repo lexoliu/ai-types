@@ -783,13 +783,13 @@ fn maybe_automatic_cache_control(
         );
     }
 
-    if let Some(explicit_breakpoints) = explicit_breakpoints {
-        if explicit_breakpoints.is_full() {
-            return Err(
-                "Claude supports at most 4 cache breakpoints; automatic caching needs one free slot"
-                    .to_string(),
-            );
-        }
+    if let Some(explicit_breakpoints) = explicit_breakpoints
+        && explicit_breakpoints.is_full()
+    {
+        return Err(
+            "Claude supports at most 4 cache breakpoints; automatic caching needs one free slot"
+                .to_string(),
+        );
     }
 
     let cache_control = cache_control_payload_for_ttl(ttl);
@@ -839,15 +839,14 @@ fn find_last_cacheable_block(
         }
     }
 
-    if let Some(tools) = tools {
-        if let Some((tool_index, tool)) = tools
+    if let Some(tools) = tools
+        && let Some((tool_index, tool)) = tools
             .iter()
             .enumerate()
             .rev()
             .find_map(|(index, tool)| custom_tool(tool).map(|custom| (index, custom)))
-        {
-            return Some((PromptPosition::tool(tool_index), tool.cache_control.clone()));
-        }
+    {
+        return Some((PromptPosition::tool(tool_index), tool.cache_control.clone()));
     }
 
     None

@@ -377,11 +377,11 @@ fn collect_foldable_ranges(node: tree_sitter::Node, ranges: &mut Vec<(usize, usi
 fn merge_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for &(start, end) in ranges {
-        if let Some(last) = merged.last_mut() {
-            if start <= last.1 + 1 {
-                last.1 = last.1.max(end);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && start <= last.1 + 1
+        {
+            last.1 = last.1.max(end);
+            continue;
         }
         merged.push((start, end));
     }

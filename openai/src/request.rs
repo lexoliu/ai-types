@@ -1421,7 +1421,7 @@ mod tests {
 
     /// The Responses API is not Chat Completions. These five are Chat-only —
     /// verified against `ResponseCreateParamsBase` in the `openai-python` SDK,
-    /// which is generated from OpenAI's own spec and lists none of them.
+    /// which is generated from `OpenAI`'s own spec and lists none of them.
     /// Sending them is at best ignored and at worst a 400.
     #[test]
     fn responses_request_sends_no_chat_only_sampling_params() {

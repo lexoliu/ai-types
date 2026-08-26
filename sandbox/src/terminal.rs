@@ -2069,13 +2069,11 @@ async fn compressed_stdout_data<'a>(
         None
     };
 
-    if let Some(ref compressed) = compressed {
-        if let Some(ref raw_text) = compressed.raw_for_file {
-            if let Err(err) = crate::output::save_raw_to_file(store_dir, raw_text.as_bytes()).await
-            {
-                warn!(error = %err, "failed to save raw source code output");
-            }
-        }
+    if let Some(ref compressed) = compressed
+        && let Some(ref raw_text) = compressed.raw_for_file
+        && let Err(err) = crate::output::save_raw_to_file(store_dir, raw_text.as_bytes()).await
+    {
+        warn!(error = %err, "failed to save raw source code output");
     }
 
     compressed.map_or(Cow::Borrowed(stdout), |compressed| {

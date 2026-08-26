@@ -695,15 +695,14 @@ fn chat_completions_stream_inner(
                     tracing::debug!(sse_event = %data, "Received SSE event");
 
                     // Check for API error response
-                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(error) = error_obj.get("error") {
+                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data)
+                        && let Some(error) = error_obj.get("error") {
                             let msg = error.get("message")
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("Unknown API error");
                             yield Err(OpenAIError::Api(msg.to_string()));
                             return;
                         }
-                    }
 
                     match serde_json::from_str::<ChatCompletionChunk>(data) {
                         Ok(chunk) => {
@@ -713,26 +712,22 @@ fn chat_completions_stream_inner(
                             // Emit text events
                             for choice in &chunk.choices {
                                 // Check for malformed function call
-                                if let Some(ref reason) = choice.finish_reason {
-                                    if reason.contains("malformed_function_call") {
+                                if let Some(ref reason) = choice.finish_reason
+                                    && reason.contains("malformed_function_call") {
                                         yield Err(OpenAIError::Api("malformed function call".to_string()));
                                         return;
                                     }
-                                }
 
-                                if let Some(content) = &choice.delta.content {
-                                    if !content.is_empty() {
+                                if let Some(content) = &choice.delta.content
+                                    && !content.is_empty() {
                                         yield Ok(Event::Text(content.clone()));
                                     }
-                                }
                                 // Emit reasoning if enabled
-                                if include_reasoning {
-                                    if let Some(reasoning) = &choice.delta.reasoning_content {
-                                        if !reasoning.is_empty() {
+                                if include_reasoning
+                                    && let Some(reasoning) = &choice.delta.reasoning_content
+                                        && !reasoning.is_empty() {
                                             yield Ok(Event::Reasoning(reasoning.clone()));
                                         }
-                                    }
-                                }
                                 // Accumulate tool calls and emit deltas
                                 if let Some(calls) = &choice.delta.tool_calls {
                                     for call in calls {
@@ -1112,8 +1107,8 @@ fn responses_stream_inner(
                     tracing::trace!(sse_event = %data, "Received Responses API SSE event");
 
                     // Check for API error response
-                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(error) = error_obj.get("error") {
+                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data)
+                        && let Some(error) = error_obj.get("error") {
                             let msg = error.get("message")
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("Unknown API error");
@@ -1126,7 +1121,6 @@ fn responses_stream_inner(
                             }
                             return;
                         }
-                    }
 
                     match serde_json::from_str::<ResponsesStreamEvent>(data) {
                         Ok(stream_event) => {

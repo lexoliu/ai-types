@@ -364,10 +364,10 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, ClaudeError> {
     let response: ModelsResponse = req.json().await.map_err(ClaudeError::Http)?;
 
     for model in response.data {
-        if model.id == cfg.model {
-            if let Some(ctx) = model.context_length {
-                return Ok(ctx);
-            }
+        if model.id == cfg.model
+            && let Some(ctx) = model.context_length
+        {
+            return Ok(ctx);
         }
     }
 

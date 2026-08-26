@@ -168,10 +168,10 @@ impl TodoList {
         let total = items.len();
 
         let mut summary = format!("Progress: {completed}/{total} completed");
-        if in_progress > 0 {
-            if let Some(current) = items.iter().find(|i| i.status == TodoStatus::InProgress) {
-                let _ = write!(summary, " | Current: {}", current.active_form);
-            }
+        if in_progress > 0
+            && let Some(current) = items.iter().find(|i| i.status == TodoStatus::InProgress)
+        {
+            let _ = write!(summary, " | Current: {}", current.active_form);
         }
         if pending > 0 {
             let _ = write!(summary, " | {pending} pending");

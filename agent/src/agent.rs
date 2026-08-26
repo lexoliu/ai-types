@@ -1674,14 +1674,13 @@ where
 
         if !metrics.has_handoff
             && metrics.usage_fraction >= self.config.context_assembler.handoff_threshold
+            && let Some(handoff_ctx) = self.format_handoff_context(metrics.usage_fraction)
         {
-            if let Some(handoff_ctx) = self.format_handoff_context(metrics.usage_fraction) {
-                self.context.insert_reminder(&SystemReminder {
-                    content: handoff_ctx,
-                });
-                messages = self.context.build_messages();
-                metrics = self.estimate_context_window_metrics(&messages);
-            }
+            self.context.insert_reminder(&SystemReminder {
+                content: handoff_ctx,
+            });
+            messages = self.context.build_messages();
+            metrics = self.estimate_context_window_metrics(&messages);
         }
 
         ContextWindowSnapshot {

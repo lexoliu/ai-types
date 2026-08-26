@@ -611,10 +611,10 @@ fn detect_positional_args(schema: &Value) -> Vec<String> {
         .into_iter()
         .filter(|name| {
             // Exclude array-typed fields -- they require repeated --flag syntax
-            if let Some(props) = properties {
-                if let Some(prop_schema) = props.get(name) {
-                    return get_instance_type(prop_schema, prop_schema) != Some("array");
-                }
+            if let Some(props) = properties
+                && let Some(prop_schema) = props.get(name)
+            {
+                return get_instance_type(prop_schema, prop_schema) != Some("array");
             }
             true
         })
@@ -1159,22 +1159,21 @@ pub fn cli_to_json(schema: &Value, args: &[String]) -> anyhow::Result<Value> {
 /// Finds the serde tag field name from schema extensions.
 fn find_serde_tag(schema: &Value) -> Option<String> {
     // Check for discriminator property (OpenAPI style)
-    if let Some(disc) = schema.get("discriminator") {
-        if let Some(prop) = disc.get("propertyName").and_then(Value::as_str) {
-            return Some(prop.to_string());
-        }
+    if let Some(disc) = schema.get("discriminator")
+        && let Some(prop) = disc.get("propertyName").and_then(Value::as_str)
+    {
+        return Some(prop.to_string());
     }
 
     // Check oneOf variants for common const field (serde tag pattern)
-    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
-        if let Some(first) = variants.first() {
-            if let Some(props) = first.get("properties").and_then(Value::as_object) {
-                for (name, prop) in props {
-                    // If this property has a const value, it's likely the tag
-                    if prop.get("const").is_some() || prop.get("enum").is_some() {
-                        return Some(name.clone());
-                    }
-                }
+    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array)
+        && let Some(first) = variants.first()
+        && let Some(props) = first.get("properties").and_then(Value::as_object)
+    {
+        for (name, prop) in props {
+            // If this property has a const value, it's likely the tag
+            if prop.get("const").is_some() || prop.get("enum").is_some() {
+                return Some(name.clone());
             }
         }
     }
@@ -1208,20 +1207,20 @@ fn parse_tagged_enum(
 
     // Find matching variant
     for variant in variants {
-        if let Some(name) = get_variant_name(variant, tag) {
-            if name.eq_ignore_ascii_case(subcommand) {
-                let mut variant_schema = variant.clone();
-                remove_required_field(&mut variant_schema, tag);
-                // Parse the variant's fields
-                let mut result = parse_object(root_schema, &variant_schema, remaining)?;
+        if let Some(name) = get_variant_name(variant, tag)
+            && name.eq_ignore_ascii_case(subcommand)
+        {
+            let mut variant_schema = variant.clone();
+            remove_required_field(&mut variant_schema, tag);
+            // Parse the variant's fields
+            let mut result = parse_object(root_schema, &variant_schema, remaining)?;
 
-                // Add the tag field
-                if let Value::Object(ref mut map) = result {
-                    map.insert(tag.to_string(), Value::String(name));
-                }
-
-                return Ok(result);
+            // Add the tag field
+            if let Value::Object(ref mut map) = result {
+                map.insert(tag.to_string(), Value::String(name));
             }
+
+            return Ok(result);
         }
     }
 
@@ -1245,17 +1244,17 @@ fn remove_required_field(schema: &mut Value, field: &str) {
 /// Gets the variant name from a schema object.
 fn get_variant_name(schema: &Value, tag: &str) -> Option<String> {
     // Look for const value in tag property
-    if let Some(props) = schema.get("properties").and_then(Value::as_object) {
-        if let Some(prop) = props.get(tag) {
-            if let Some(const_val) = prop.get("const").and_then(Value::as_str) {
-                return Some(const_val.to_string());
-            }
-            // Also check enum with single value
-            if let Some(enum_vals) = prop.get("enum").and_then(Value::as_array) {
-                if enum_vals.len() == 1 {
-                    return enum_vals[0].as_str().map(String::from);
-                }
-            }
+    if let Some(props) = schema.get("properties").and_then(Value::as_object)
+        && let Some(prop) = props.get(tag)
+    {
+        if let Some(const_val) = prop.get("const").and_then(Value::as_str) {
+            return Some(const_val.to_string());
+        }
+        // Also check enum with single value
+        if let Some(enum_vals) = prop.get("enum").and_then(Value::as_array)
+            && enum_vals.len() == 1
+        {
+            return enum_vals[0].as_str().map(String::from);
         }
     }
 
@@ -1678,10 +1677,10 @@ fn get_instance_type<'a>(root_schema: &'a Value, schema: &'a Value) -> Option<&'
         Some(Value::Array(types)) => {
             // Find the non-null type
             for t in types {
-                if let Some(s) = t.as_str() {
-                    if s != "null" {
-                        return Some(s);
-                    }
+                if let Some(s) = t.as_str()
+                    && s != "null"
+                {
+                    return Some(s);
                 }
             }
             None
@@ -1695,10 +1694,10 @@ fn get_instance_type<'a>(root_schema: &'a Value, schema: &'a Value) -> Option<&'
                 .and_then(Value::as_array)?;
 
             for variant in variants {
-                if let Some(t) = variant.get("type").and_then(Value::as_str) {
-                    if t != "null" {
-                        return Some(t);
-                    }
+                if let Some(t) = variant.get("type").and_then(Value::as_str)
+                    && t != "null"
+                {
+                    return Some(t);
                 }
             }
             None
@@ -1777,25 +1776,25 @@ pub fn schema_to_help(schema: &Value) -> String {
     help.push_str("\nUsage:\n");
 
     // Check for tagged enum (subcommands)
-    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
-        if let Some(tag) = find_serde_tag(schema) {
-            help.push_str("  <subcommand> [options]\n\n");
-            help.push_str("Subcommands:\n");
+    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array)
+        && let Some(tag) = find_serde_tag(schema)
+    {
+        help.push_str("  <subcommand> [options]\n\n");
+        help.push_str("Subcommands:\n");
 
-            for variant in variants {
-                if let Some(name) = get_variant_name(variant, &tag) {
-                    help.push_str("  ");
-                    help.push_str(name.as_str());
-                    if let Some(desc) = variant.get("description").and_then(Value::as_str) {
-                        help.push_str(" - ");
-                        help.push_str(desc);
-                    }
-                    help.push('\n');
+        for variant in variants {
+            if let Some(name) = get_variant_name(variant, &tag) {
+                help.push_str("  ");
+                help.push_str(name.as_str());
+                if let Some(desc) = variant.get("description").and_then(Value::as_str) {
+                    help.push_str(" - ");
+                    help.push_str(desc);
                 }
+                help.push('\n');
             }
-            help.push_str("\nOptions:\n  -h, --help  Show help\n");
-            return help;
         }
+        help.push_str("\nOptions:\n  -h, --help  Show help\n");
+        return help;
     }
 
     // Simple object

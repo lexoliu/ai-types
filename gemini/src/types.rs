@@ -266,12 +266,11 @@ impl Part {
     }
 
     fn collect_thoughts(&self, output: &mut Vec<String>) {
-        if self.is_thought() {
-            if let Some(text) = &self.text {
-                if !text.is_empty() {
-                    output.push(text.clone());
-                }
-            }
+        if self.is_thought()
+            && let Some(text) = &self.text
+            && !text.is_empty()
+        {
+            output.push(text.clone());
         }
     }
 

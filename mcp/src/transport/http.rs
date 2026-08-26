@@ -111,11 +111,11 @@ impl Transport for HttpTransport {
             .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?;
 
         // Extract session ID from response headers
-        if let Some(session_id) = response.headers().get(MCP_SESSION_ID_HEADER) {
-            if let Ok(session_str) = session_id.to_str() {
-                debug!("MCP HTTP session ID: {}", session_str);
-                self.session_id = Some(session_str.to_string());
-            }
+        if let Some(session_id) = response.headers().get(MCP_SESSION_ID_HEADER)
+            && let Ok(session_str) = session_id.to_str()
+        {
+            debug!("MCP HTTP session ID: {}", session_str);
+            self.session_id = Some(session_str.to_string());
         }
 
         // Parse response body as JSON
