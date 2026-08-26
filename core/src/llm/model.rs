@@ -41,6 +41,7 @@
 
 use alloc::{string::String, vec::Vec};
 use schemars::Schema;
+use serde_json::Value;
 
 /// Parameters for configuring the behavior of a language model.
 ///
@@ -145,6 +146,12 @@ pub struct Parameters {
     pub websearch: bool,
     /// Whether to enable native Code Execution tool.
     pub code_execution: bool,
+    /// Provider-native tools that are not portable across API families.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "NativeTools::is_empty")
+    )]
+    pub native_tools: NativeTools,
     /// Provider-specific prompt cache controls.
     #[cfg_attr(
         feature = "serde",
@@ -221,6 +228,34 @@ impl Parameters {
     #[must_use]
     pub const fn code_execution(mut self, enabled: bool) -> Self {
         self.code_execution = enabled;
+        self
+    }
+
+    /// Sets provider-native tools.
+    #[must_use]
+    pub fn native_tools(mut self, tools: NativeTools) -> Self {
+        self.native_tools = tools;
+        self
+    }
+
+    /// Sets `OpenAI` Responses-native tools.
+    #[must_use]
+    pub fn openai_tools(mut self, tools: OpenAINativeTools) -> Self {
+        self.native_tools.openai = tools;
+        self
+    }
+
+    /// Sets Gemini-native tools.
+    #[must_use]
+    pub const fn gemini_tools(mut self, tools: GeminiNativeTools) -> Self {
+        self.native_tools.gemini = tools;
+        self
+    }
+
+    /// Sets Claude-native tools.
+    #[must_use]
+    pub const fn claude_tools(mut self, tools: ClaudeNativeTools) -> Self {
+        self.native_tools.claude = tools;
         self
     }
 
@@ -304,6 +339,553 @@ impl Parameters {
     #[must_use]
     pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
         self.tool_choice = choice;
+        self
+    }
+}
+
+/// Provider-native tool configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct NativeTools {
+    /// `OpenAI` Responses API hosted tools.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "OpenAINativeTools::is_empty")
+    )]
+    pub openai: OpenAINativeTools,
+    /// Gemini hosted and client-side tools.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "GeminiNativeTools::is_empty")
+    )]
+    pub gemini: GeminiNativeTools,
+    /// Claude Anthropic-defined and server tools.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "ClaudeNativeTools::is_empty")
+    )]
+    pub claude: ClaudeNativeTools,
+}
+
+impl NativeTools {
+    /// Returns true when no provider-native tools are configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.openai.is_empty() && self.gemini.is_empty() && self.claude.is_empty()
+    }
+}
+
+/// `OpenAI` Responses API native tools.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAINativeTools {
+    /// Hosted web search.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub web_search: Option<OpenAIWebSearchTool>,
+    /// Hosted file search over vector stores.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub file_search: Vec<OpenAIFileSearchTool>,
+    /// Hosted code interpreter.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub code_interpreter: Option<OpenAICodeInterpreterTool>,
+    /// Hosted image generation.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub image_generation: Option<OpenAIImageGenerationTool>,
+    /// Remote MCP servers.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub mcp: Vec<OpenAIMcpTool>,
+    /// Computer use preview.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub computer_use: Option<OpenAIComputerUseTool>,
+}
+
+impl OpenAINativeTools {
+    /// Returns true when no `OpenAI` native tools are configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.web_search.is_none()
+            && self.file_search.is_empty()
+            && self.code_interpreter.is_none()
+            && self.image_generation.is_none()
+            && self.mcp.is_empty()
+            && self.computer_use.is_none()
+    }
+
+    /// Enables hosted web search with default API settings.
+    #[must_use]
+    pub fn with_web_search(mut self, tool: OpenAIWebSearchTool) -> Self {
+        self.web_search = Some(tool);
+        self
+    }
+
+    /// Enables hosted web search with default API settings.
+    #[must_use]
+    pub fn enable_web_search(mut self) -> Self {
+        self.web_search = Some(OpenAIWebSearchTool::default());
+        self
+    }
+
+    /// Adds a file search tool.
+    #[must_use]
+    pub fn with_file_search(mut self, tool: OpenAIFileSearchTool) -> Self {
+        self.file_search.push(tool);
+        self
+    }
+
+    /// Enables hosted code interpreter.
+    #[must_use]
+    pub fn with_code_interpreter(mut self, tool: OpenAICodeInterpreterTool) -> Self {
+        self.code_interpreter = Some(tool);
+        self
+    }
+
+    /// Enables hosted image generation.
+    #[must_use]
+    pub const fn with_image_generation(mut self, tool: OpenAIImageGenerationTool) -> Self {
+        self.image_generation = Some(tool);
+        self
+    }
+
+    /// Adds a remote MCP server.
+    #[must_use]
+    pub fn with_mcp(mut self, tool: OpenAIMcpTool) -> Self {
+        self.mcp.push(tool);
+        self
+    }
+
+    /// Enables computer use preview.
+    #[must_use]
+    pub fn with_computer_use(mut self, tool: OpenAIComputerUseTool) -> Self {
+        self.computer_use = Some(tool);
+        self
+    }
+}
+
+/// `OpenAI` hosted web search configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAIWebSearchTool {
+    /// Whether live web access is allowed. `None` uses `OpenAI`'s default.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub external_web_access: Option<bool>,
+    /// Official filter object, such as `allowed_domains`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub filters: Option<Value>,
+    /// Official user location object.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub user_location: Option<Value>,
+}
+
+impl OpenAIWebSearchTool {
+    /// Sets whether live web access is allowed.
+    #[must_use]
+    pub const fn external_web_access(mut self, allowed: bool) -> Self {
+        self.external_web_access = Some(allowed);
+        self
+    }
+
+    /// Sets the official filter object.
+    #[must_use]
+    pub fn filters(mut self, filters: Value) -> Self {
+        self.filters = Some(filters);
+        self
+    }
+
+    /// Sets the official user location object.
+    #[must_use]
+    pub fn user_location(mut self, location: Value) -> Self {
+        self.user_location = Some(location);
+        self
+    }
+}
+
+/// `OpenAI` hosted file search configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAIFileSearchTool {
+    /// Vector stores to search.
+    pub vector_store_ids: Vec<String>,
+    /// Maximum number of search results.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub max_num_results: Option<u32>,
+    /// Whether to request `file_search_call.results` in the response include list.
+    pub include_results: bool,
+    /// Official filter object.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub filters: Option<Value>,
+}
+
+impl OpenAIFileSearchTool {
+    /// Creates file search over the provided vector stores.
+    #[must_use]
+    pub fn new(vector_store_ids: impl Into<Vec<String>>) -> Self {
+        Self {
+            vector_store_ids: vector_store_ids.into(),
+            max_num_results: None,
+            include_results: false,
+            filters: None,
+        }
+    }
+
+    /// Sets maximum result count.
+    #[must_use]
+    pub const fn max_num_results(mut self, value: u32) -> Self {
+        self.max_num_results = Some(value);
+        self
+    }
+
+    /// Requests file search result inclusion.
+    #[must_use]
+    pub const fn include_results(mut self, include: bool) -> Self {
+        self.include_results = include;
+        self
+    }
+
+    /// Sets the official filter object.
+    #[must_use]
+    pub fn filters(mut self, filters: Value) -> Self {
+        self.filters = Some(filters);
+        self
+    }
+}
+
+/// `OpenAI` code interpreter configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAICodeInterpreterTool {
+    /// Container selection.
+    pub container: OpenAICodeInterpreterContainer,
+}
+
+impl Default for OpenAICodeInterpreterTool {
+    fn default() -> Self {
+        Self {
+            container: OpenAICodeInterpreterContainer::Auto(OpenAIAutoContainer::default()),
+        }
+    }
+}
+
+impl OpenAICodeInterpreterTool {
+    /// Uses an automatically managed container.
+    #[must_use]
+    pub const fn auto() -> Self {
+        Self {
+            container: OpenAICodeInterpreterContainer::Auto(OpenAIAutoContainer::new()),
+        }
+    }
+
+    /// Uses an existing container ID.
+    #[must_use]
+    pub fn existing(container_id: impl Into<String>) -> Self {
+        Self {
+            container: OpenAICodeInterpreterContainer::Existing(container_id.into()),
+        }
+    }
+}
+
+/// `OpenAI` code interpreter container selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum OpenAICodeInterpreterContainer {
+    /// Automatically create or reuse a container.
+    Auto(OpenAIAutoContainer),
+    /// Use an existing container ID.
+    Existing(String),
+}
+
+/// `OpenAI` automatically managed code interpreter container.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAIAutoContainer {
+    /// Memory tier such as `1g`, `4g`, `16g`, or `64g`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub memory_limit: Option<String>,
+    /// File IDs to preload into the container.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub file_ids: Vec<String>,
+}
+
+impl OpenAIAutoContainer {
+    /// Creates an auto container with default API settings.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            memory_limit: None,
+            file_ids: Vec::new(),
+        }
+    }
+
+    /// Sets the memory tier.
+    #[must_use]
+    pub fn memory_limit(mut self, memory_limit: impl Into<String>) -> Self {
+        self.memory_limit = Some(memory_limit.into());
+        self
+    }
+
+    /// Preloads file IDs.
+    #[must_use]
+    pub fn file_ids(mut self, file_ids: impl Into<Vec<String>>) -> Self {
+        self.file_ids = file_ids.into();
+        self
+    }
+}
+
+/// `OpenAI` image generation tool configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAIImageGenerationTool {
+    /// Number of partial image events to stream.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub partial_images: Option<u8>,
+}
+
+impl OpenAIImageGenerationTool {
+    /// Sets partial image count.
+    #[must_use]
+    pub const fn partial_images(mut self, count: u8) -> Self {
+        self.partial_images = Some(count);
+        self
+    }
+}
+
+/// `OpenAI` remote MCP server configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAIMcpTool {
+    /// Label for the server.
+    pub server_label: String,
+    /// Server URL.
+    pub server_url: String,
+    /// Approval policy, such as `never` or `always`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub require_approval: Option<String>,
+    /// Optional allowlist of tool names.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub allowed_tools: Vec<String>,
+}
+
+impl OpenAIMcpTool {
+    /// Creates a remote MCP server tool.
+    #[must_use]
+    pub fn new(server_label: impl Into<String>, server_url: impl Into<String>) -> Self {
+        Self {
+            server_label: server_label.into(),
+            server_url: server_url.into(),
+            require_approval: None,
+            allowed_tools: Vec::new(),
+        }
+    }
+
+    /// Sets approval policy.
+    #[must_use]
+    pub fn require_approval(mut self, policy: impl Into<String>) -> Self {
+        self.require_approval = Some(policy.into());
+        self
+    }
+
+    /// Sets allowed tools.
+    #[must_use]
+    pub fn allowed_tools(mut self, tools: impl Into<Vec<String>>) -> Self {
+        self.allowed_tools = tools.into();
+        self
+    }
+}
+
+/// `OpenAI` computer use preview tool configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAIComputerUseTool {
+    /// Display width in pixels.
+    pub display_width: u32,
+    /// Display height in pixels.
+    pub display_height: u32,
+    /// Environment such as `browser`.
+    pub environment: String,
+}
+
+impl OpenAIComputerUseTool {
+    /// Creates a computer use preview tool.
+    #[must_use]
+    pub fn new(display_width: u32, display_height: u32, environment: impl Into<String>) -> Self {
+        Self {
+            display_width,
+            display_height,
+            environment: environment.into(),
+        }
+    }
+}
+
+/// Gemini-native tools.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GeminiNativeTools {
+    /// Grounding with Google Search.
+    pub google_search: bool,
+    /// Built-in code execution.
+    pub code_execution: bool,
+    /// URL Context tool.
+    pub url_context: bool,
+}
+
+impl GeminiNativeTools {
+    /// Returns true when no Gemini-native tools are configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.google_search && !self.code_execution && !self.url_context
+    }
+
+    /// Enables Grounding with Google Search.
+    #[must_use]
+    pub const fn google_search(mut self, enabled: bool) -> Self {
+        self.google_search = enabled;
+        self
+    }
+
+    /// Enables Code Execution.
+    #[must_use]
+    pub const fn code_execution(mut self, enabled: bool) -> Self {
+        self.code_execution = enabled;
+        self
+    }
+
+    /// Enables URL Context.
+    #[must_use]
+    pub const fn url_context(mut self, enabled: bool) -> Self {
+        self.url_context = enabled;
+        self
+    }
+}
+
+/// Claude-native tools.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ClaudeNativeTools {
+    /// Server-side web search.
+    pub web_search: bool,
+    /// Server-side web fetch.
+    pub web_fetch: bool,
+    /// Server-side code execution.
+    pub code_execution: bool,
+    /// Client-side bash tool.
+    pub bash: bool,
+    /// Client-side text editor tool.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub text_editor: Option<ClaudeTextEditorTool>,
+}
+
+impl ClaudeNativeTools {
+    /// Returns true when no Claude-native tools are configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.web_search
+            && !self.web_fetch
+            && !self.code_execution
+            && !self.bash
+            && self.text_editor.is_none()
+    }
+
+    /// Enables server-side web search.
+    #[must_use]
+    pub const fn web_search(mut self, enabled: bool) -> Self {
+        self.web_search = enabled;
+        self
+    }
+
+    /// Enables server-side web fetch.
+    #[must_use]
+    pub const fn web_fetch(mut self, enabled: bool) -> Self {
+        self.web_fetch = enabled;
+        self
+    }
+
+    /// Enables server-side code execution.
+    #[must_use]
+    pub const fn code_execution(mut self, enabled: bool) -> Self {
+        self.code_execution = enabled;
+        self
+    }
+
+    /// Enables client-side bash.
+    #[must_use]
+    pub const fn bash(mut self, enabled: bool) -> Self {
+        self.bash = enabled;
+        self
+    }
+
+    /// Enables client-side text editor.
+    #[must_use]
+    pub const fn text_editor(mut self, tool: ClaudeTextEditorTool) -> Self {
+        self.text_editor = Some(tool);
+        self
+    }
+}
+
+/// Claude text editor tool configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ClaudeTextEditorTool {
+    /// Optional maximum characters returned by the `view` command.
+    pub max_characters: Option<u32>,
+}
+
+impl ClaudeTextEditorTool {
+    /// Sets maximum characters for view results.
+    #[must_use]
+    pub const fn max_characters(mut self, value: u32) -> Self {
+        self.max_characters = Some(value);
         self
     }
 }

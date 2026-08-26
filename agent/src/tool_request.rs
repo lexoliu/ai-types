@@ -25,6 +25,10 @@ impl<Args, Response> ToolRequest<Args, Response> {
     }
 
     /// Respond to the request without blocking the UI thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unsent response if the request receiver is unavailable.
     pub fn respond(self, response: Response) -> Result<(), async_channel::TrySendError<Response>> {
         self.response_tx.try_send(response)
     }
@@ -38,6 +42,10 @@ pub struct ToolRequestBroker<Args, Response> {
 
 impl<Args, Response> ToolRequestBroker<Args, Response> {
     /// Send a request and await the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the queue is closed or the response is cancelled.
     pub async fn request(&self, args: Args) -> anyhow::Result<Response> {
         let (response_tx, response_rx) = async_channel::bounded(1);
         self.tx
@@ -82,6 +90,10 @@ pub fn channel<Args, Response>() -> (
 }
 
 /// Create a bounded request broker/queue pair with explicit backpressure.
+///
+/// # Panics
+///
+/// Panics if `capacity` is zero.
 #[must_use]
 pub fn bounded_channel<Args, Response>(
     capacity: usize,

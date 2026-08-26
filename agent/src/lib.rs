@@ -85,7 +85,7 @@ pub use compression::{
     CompressionLevel, ContextStrategy, PreserveConfig, PreservedContent, SmartCompressionConfig,
 };
 pub use config::{AgentConfig, AgentKind, ContextAssemblerConfig};
-pub use context::{Context, ContextCheckpoint};
+pub use context::{Context, ContextCheckpoint, ReassemblyReport};
 pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;
 pub use event::AgentEvent;

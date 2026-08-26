@@ -61,6 +61,12 @@ impl RetryConfig {
     }
 
     /// Calculate delay for a given attempt number (0-indexed).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
     fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let delay_ms =
             self.initial_delay.as_millis() as f64 * self.backoff_multiplier.powi(attempt as i32);
@@ -76,23 +82,16 @@ fn is_retryable_json_error(error: &serde_json::Error) -> bool {
 /// Check if an error is retryable.
 fn is_retryable_error(err: &OpenAIError) -> bool {
     match err {
-        // Network/transport errors are retryable
-        OpenAIError::Http(_) => true,
-        // Body errors (connection issues) may be retryable
-        OpenAIError::Body(_) => true,
-        // SSE stream errors may be retryable
-        OpenAIError::Stream(_) => true,
-        // Rate limit and server errors are retryable
-        OpenAIError::RateLimit { .. } => true,
-        OpenAIError::ServerError { .. } => true,
-        // Timeout is retryable
-        OpenAIError::Timeout => true,
-        // API errors are generally not retryable (bad request, auth, etc.)
-        OpenAIError::Api(_) => false,
+        OpenAIError::Http(_)
+        | OpenAIError::Body(_)
+        | OpenAIError::Stream(_)
+        | OpenAIError::RateLimit { .. }
+        | OpenAIError::ServerError { .. }
+        | OpenAIError::Timeout => true,
+        // API and decode errors are generally not retryable.
+        OpenAIError::Api(_) | OpenAIError::Decode(_) => false,
         // EOF while parsing JSON is typically a truncated/empty upstream body.
         OpenAIError::Json(error) => is_retryable_json_error(error),
-        // Decode errors are not retryable
-        OpenAIError::Decode(_) => false,
     }
 }
 
@@ -355,6 +354,17 @@ impl LanguageModel for OpenAI {
         let mut snapshot = ParameterSnapshot::from(&parameters);
         snapshot.legacy_max_tokens = cfg.legacy_max_tokens;
         let has_attachments = messages.iter().any(|msg| !msg.attachments().is_empty());
+        let has_audio = messages.iter().any(|message| {
+            message
+                .attachments()
+                .iter()
+                .any(|attachment| attachment.media_type().as_ref().starts_with("audio/"))
+        });
+        let effective_api_kind = if cfg.api_kind == ApiKind::Responses && has_audio {
+            ApiKind::ChatCompletions
+        } else {
+            cfg.api_kind
+        };
 
         async_stream::stream! {
             if parameters.cache.claude.is_some() || parameters.cache.gemini.is_some() {
@@ -364,14 +374,39 @@ impl LanguageModel for OpenAI {
                 return;
             }
 
-            if cfg.api_kind == ApiKind::ChatCompletions && has_attachments {
+            if effective_api_kind == ApiKind::ChatCompletions
+                && messages.iter().flat_map(|message| message.attachments()).any(|attachment| {
+                    let media_type = attachment.media_type().as_ref();
+                    !media_type.starts_with("image/") && !media_type.starts_with("audio/")
+                })
+            {
                 yield Err(OpenAIError::Api(
-                    "Chat Completions does not support file attachments; use Responses API".to_string(),
+                    "Chat Completions accepts only image and audio attachments".to_string(),
                 ));
                 return;
             }
 
-            let messages = if has_attachments {
+            if effective_api_kind == ApiKind::Responses
+                && messages.iter().flat_map(|message| message.attachments()).any(|attachment| {
+                    attachment.media_type().as_ref().starts_with("video/")
+                })
+            {
+                yield Err(OpenAIError::Api(
+                    "OpenAI Responses API does not support video attachments".to_string(),
+                ));
+                return;
+            }
+
+            if effective_api_kind == ApiKind::ChatCompletions
+                && (!snapshot.openai_tools.is_empty() || snapshot.websearch || snapshot.code_execution)
+            {
+                yield Err(OpenAIError::Api(
+                    "OpenAI native hosted tools require the Responses API".to_string(),
+                ));
+                return;
+            }
+
+            let messages = if has_attachments && effective_api_kind == ApiKind::Responses {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     match crate::attachments::resolve_messages(&cfg, messages).await {
@@ -393,9 +428,15 @@ impl LanguageModel for OpenAI {
                 messages
             };
 
-            match cfg.api_kind {
+            match effective_api_kind {
                 ApiKind::ChatCompletions => {
-                    let payload_messages = to_chat_messages(&messages).await;
+                    let payload_messages = match to_chat_messages(&messages).await {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    };
                     let openai_tools = if tool_defs.is_empty() {
                         None
                     } else {
@@ -452,14 +493,19 @@ impl LanguageModel for OpenAI {
                 Ok(len) => len,
                 Err(e) => {
                     tracing::debug!("API did not return context_length: {e}");
-                    // Fallback to models database
                     aither_models::lookup(&cfg.chat_model)
                         .and_then(aither_models::ModelEntry::max_input_tokens)
                         .unwrap_or_else(|| {
-                            panic!(
-                                "OpenAI model '{}' missing context metadata from provider and aither-models",
-                                cfg.chat_model
-                            )
+                            // Custom/self-hosted models are legitimately absent
+                            // from both the provider API and the registry, so
+                            // assume a conservative context window rather than
+                            // failing the whole conversation.
+                            tracing::warn!(
+                                model = %cfg.chat_model,
+                                assumed_context_length = UNKNOWN_MODEL_CONTEXT_LENGTH,
+                                "model missing context metadata from provider and aither-models"
+                            );
+                            UNKNOWN_MODEL_CONTEXT_LENGTH
                         })
                 }
             };
@@ -483,6 +529,12 @@ impl LanguageModel for OpenAI {
 }
 
 /// Fetch context window size from the models API.
+/// Context window assumed for models with no metadata from either the
+/// provider API or the aither-models registry (custom/self-hosted models).
+/// Conservative enough to be safe for compaction budgeting on any modern
+/// OpenAI-compatible backend.
+const UNKNOWN_MODEL_CONTEXT_LENGTH: u32 = 32_768;
+
 async fn fetch_model_context_length(cfg: &Config) -> Result<u32, OpenAIError> {
     use crate::response::ModelsListResponse;
 
@@ -576,17 +628,14 @@ async fn chat_completions_request(
             .map_err(OpenAIError::Http)?;
     }
 
-    match request_with_timeout(
+    request_with_timeout(
         cfg.request_timeout,
         builder.json_body(request).map_err(OpenAIError::Http)?.sse(),
     )
     .await
-    {
-        Ok(stream) => Ok(stream),
-        Err(error) => return Err(error),
-    }
 }
 
+#[allow(clippy::too_many_lines)]
 fn chat_completions_stream_inner(
     cfg: Arc<Config>,
     payload_messages: Vec<ChatMessagePayload>,
@@ -718,10 +767,11 @@ fn chat_completions_stream_inner(
         for (_, acc) in sorted_calls {
             if let (Some(id), Some(name)) = (acc.id, acc.name) {
                 let arguments = if acc.arguments.is_empty() {
-                    serde_json::Value::Object(Default::default())
+                    serde_json::Value::Object(serde_json::Map::default())
                 } else {
-                    serde_json::from_str(&acc.arguments)
-                        .unwrap_or(serde_json::Value::Object(Default::default()))
+                    serde_json::from_str(&acc.arguments).unwrap_or_else(|_| {
+                        serde_json::Value::Object(serde_json::Map::default())
+                    })
                 };
                 yield Ok(Event::ToolCall(ToolCall {
                     id,
@@ -778,9 +828,10 @@ fn fallback_response_item_id(output_index: usize) -> String {
 
 fn parse_tool_call_arguments(arguments: &str) -> serde_json::Value {
     if arguments.is_empty() {
-        serde_json::Value::Object(Default::default())
+        serde_json::Value::Object(serde_json::Map::default())
     } else {
-        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Object(Default::default()))
+        serde_json::from_str(arguments)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::default()))
     }
 }
 
@@ -829,7 +880,7 @@ fn mark_and_emit_done_function_call(
     response_id: String,
     call_id: Option<String>,
     name: String,
-    arguments: String,
+    arguments: &str,
 ) -> ToolCall {
     let fallback_id = non_empty_response_id(item_id.clone())
         .or_else(|| non_empty_response_id(Some(response_id.clone())))
@@ -841,13 +892,14 @@ fn mark_and_emit_done_function_call(
         non_empty_response_id(item_id).or_else(|| non_empty_response_id(Some(response_id)));
     acc.call_id = Some(resolved_call_id.clone());
     acc.name = Some(name.clone());
-    acc.arguments = arguments.clone();
+    acc.arguments.clear();
+    acc.arguments.push_str(arguments);
     acc.emitted = true;
 
     ToolCall {
         id: resolved_call_id,
         name,
-        arguments: parse_tool_call_arguments(&arguments),
+        arguments: parse_tool_call_arguments(arguments),
     }
 }
 
@@ -858,9 +910,7 @@ fn drain_pending_function_calls(
         .into_iter()
         .filter(|(_, acc)| !acc.emitted)
         .filter_map(|(output_index, acc)| {
-            let Some(name) = acc.name else {
-                return None;
-            };
+            let name = acc.name?;
             let fallback_id = acc
                 .item_id
                 .clone()
@@ -875,6 +925,7 @@ fn drain_pending_function_calls(
         .collect()
 }
 
+#[allow(clippy::items_after_statements)]
 fn validate_serialized_responses_request(request: &ResponsesRequest) -> Result<(), OpenAIError> {
     let request_value = serde_json::to_value(request).map_err(OpenAIError::Json)?;
     let Some(items) = request_value
@@ -967,6 +1018,7 @@ async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStrea
     }
 }
 
+#[allow(clippy::too_many_lines, clippy::collapsible_match)]
 fn responses_stream_inner(
     cfg: Arc<Config>,
     input: Vec<ResponsesInputItem>,
@@ -979,11 +1031,26 @@ fn responses_stream_inner(
         let mut response_tools = convert_responses_tools(tool_defs);
         let allow_builtins = matches!(snapshot.tool_choice, ToolChoice::Auto | ToolChoice::Required);
         if allow_builtins {
-            if snapshot.websearch {
-                response_tools.push(ResponsesTool::WebSearch);
+            let native_tools = snapshot.openai_tools.clone();
+            if snapshot.websearch || native_tools.web_search.is_some() {
+                let tool = native_tools.web_search.unwrap_or_default();
+                response_tools.push(ResponsesTool::from(tool));
             }
-            if snapshot.code_execution {
-                response_tools.push(ResponsesTool::CodeInterpreter);
+            for tool in native_tools.file_search {
+                response_tools.push(ResponsesTool::from(tool));
+            }
+            if snapshot.code_execution || native_tools.code_interpreter.is_some() {
+                let tool = native_tools.code_interpreter.unwrap_or_default();
+                response_tools.push(ResponsesTool::from(tool));
+            }
+            if let Some(tool) = native_tools.image_generation {
+                response_tools.push(ResponsesTool::from(tool));
+            }
+            for tool in native_tools.mcp {
+                response_tools.push(ResponsesTool::from(tool));
+            }
+            if let Some(tool) = native_tools.computer_use {
+                response_tools.push(ResponsesTool::from(tool));
             }
         }
         let response_tools = if response_tools.is_empty() {
@@ -1117,7 +1184,7 @@ fn responses_stream_inner(
                                             id,
                                             call_id,
                                             name,
-                                            arguments,
+                                            &arguments,
                                         );
                                         yield Ok(Event::ToolCall(tool_call));
                                     }
@@ -1187,7 +1254,6 @@ mod tests {
         ChatCompletionTokensDetails, ChatCompletionUsage, ChatPromptTokensDetails,
         ResponsesInputTokenDetails, ResponsesOutputTokenDetails, ResponsesUsage,
     };
-    use futures_lite::future::block_on;
     use std::time::Duration;
 
     #[test]
@@ -1200,7 +1266,7 @@ mod tests {
             "item_1".to_string(),
             Some("call_1".to_string()),
             "search".to_string(),
-            r#"{"q":"rust"}"#.to_string(),
+            r#"{"q":"rust"}"#,
         );
         assert_eq!(emitted.id, "call_1");
         assert_eq!(emitted.name, "search");
@@ -1236,7 +1302,7 @@ mod tests {
             "item_3".to_string(),
             Some(String::new()),
             "search".to_string(),
-            r#"{"q":"terminal first"}"#.to_string(),
+            r#"{"q":"terminal first"}"#,
         );
         assert_eq!(emitted.id, "item_3");
     }
@@ -1280,7 +1346,7 @@ mod tests {
             String::new(),
             Some(String::new()),
             "search".to_string(),
-            r#"{"q":"may"}"#.to_string(),
+            r#"{"q":"may"}"#,
         );
         assert_eq!(emitted.id, "response_output_12");
     }
@@ -1334,16 +1400,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn configured_timeout_is_enforced_for_sse_requests() {
-        block_on(async {
-            let timeout = request_with_timeout(
-                Duration::from_millis(20),
-                futures_lite::future::pending::<Result<(), zenwave::Error>>(),
-            )
-            .await;
-            assert!(matches!(timeout, Err(OpenAIError::Timeout)));
-        });
+    #[tokio::test]
+    async fn configured_timeout_is_enforced_for_sse_requests() {
+        let timeout = request_with_timeout(
+            Duration::from_millis(20),
+            futures_lite::future::pending::<Result<(), zenwave::Error>>(),
+        )
+        .await;
+        assert!(matches!(timeout, Err(OpenAIError::Timeout)));
     }
 
     #[test]

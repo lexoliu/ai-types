@@ -179,7 +179,7 @@ pub enum Event {
         /// Tool call identifier (available from the first delta).
         id: String,
         /// Tool name (available from the first delta for Claude;
-        /// may arrive incrementally for OpenAI).
+        /// may arrive incrementally for `OpenAI`).
         name: String,
         /// Partial JSON arguments accumulated so far.
         arguments_fragment: String,

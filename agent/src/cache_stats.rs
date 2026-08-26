@@ -67,7 +67,7 @@ impl CacheStats {
     }
 
     /// Resets all counters.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         *self = Self::new();
     }
 
@@ -153,8 +153,10 @@ mod tests {
     fn missing_fields_do_not_poison_totals() {
         let mut stats = CacheStats::new();
         // Provider that reports no cache fields at all.
-        let mut bare = Usage::default();
-        bare.prompt_tokens = Some(400);
+        let bare = Usage {
+            prompt_tokens: Some(400),
+            ..Usage::default()
+        };
         stats.record(&bare);
 
         assert_eq!(stats.requests(), 1);

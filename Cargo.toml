@@ -39,15 +39,16 @@ rust-version = "1.87"
 [workspace.lints]
 rust.missing_docs = "warn"
 rust.missing_debug_implementations = "warn"
-clippy.all = "warn"
-clippy.style = "warn"
-clippy.correctness = "warn"
-clippy.complexity = "warn"
-clippy.suspicious = "warn"
-clippy.perf = "warn"
-clippy.pedantic = "warn"
-clippy.nursery = "warn"
-clippy.cargo = "warn"
+clippy.all = { level = "warn", priority = -1 }
+clippy.style = { level = "warn", priority = -1 }
+clippy.correctness = { level = "warn", priority = -1 }
+clippy.complexity = { level = "warn", priority = -1 }
+clippy.suspicious = { level = "warn", priority = -1 }
+clippy.perf = { level = "warn", priority = -1 }
+clippy.pedantic = { level = "warn", priority = -1 }
+clippy.nursery = { level = "warn", priority = -1 }
+clippy.cargo = { level = "warn", priority = -1 }
+clippy.disallowed_methods = "deny"
 clippy.multiple_crate_versions = { level = "allow", priority = 1}
 
 [workspace.dependencies]
@@ -72,7 +73,6 @@ aither-openai = { path = "./openai" }
 aither-claude = { path = "./claude" }
 aither-cloud = { path = "./cloud" }
 aither-gemini = { path = "./gemini" }
-# aither-mistral = { path = "./mistral" }  # excluded: transitive dep conflicts
 aither-llama = { path = "./llama" }
 aither-copilot = { path = "./copilot" }
 aither-models = { path = "./models" }
@@ -94,7 +94,6 @@ url = { version = "2.5", default-features = false }
 aither-openai = { path = "./openai", optional = true }
 aither-claude = { path = "./claude", optional = true }
 aither-gemini = { path = "./gemini", optional = true }
-# aither-mistral = { path = "./mistral", optional = true }  # excluded: transitive dep conflicts
 aither-llama = { path = "./llama", optional = true }
 aither-ort = { workspace = true, optional = true }
 
@@ -165,7 +164,6 @@ derive = ["aither-derive"]
 openai = ["aither-openai"]
 claude = ["aither-claude"]
 gemini = ["aither-gemini"]
-# mistral = ["aither-mistral"]  # excluded: transitive dep conflicts
 llama = ["aither-llama"]
 ort = ["aither-ort"]
 

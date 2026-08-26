@@ -60,6 +60,10 @@ impl JsonRpcRequest {
     }
 
     /// Create a new JSON-RPC request with parameters.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `params` cannot be serialized to JSON.
     #[must_use]
     pub fn with_params(
         id: impl Into<RequestId>,
@@ -92,6 +96,10 @@ pub struct JsonRpcResponse {
 
 impl JsonRpcResponse {
     /// Create a successful response.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `result` cannot be serialized to JSON.
     #[must_use]
     pub fn success(id: RequestId, result: impl Serialize) -> Self {
         Self {
@@ -120,6 +128,10 @@ impl JsonRpcResponse {
     }
 
     /// Get the result, returning an error if this is an error response.
+    ///
+    /// # Errors
+    ///
+    /// Returns the JSON-RPC error when the response represents an error.
     pub fn into_result(self) -> Result<Value, JsonRpcError> {
         if let Some(error) = self.error {
             Err(error)
@@ -153,6 +165,10 @@ impl JsonRpcNotification {
     }
 
     /// Create a new notification with parameters.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `params` cannot be serialized to JSON.
     #[must_use]
     pub fn with_params(method: impl Into<String>, params: impl Serialize) -> Self {
         Self {

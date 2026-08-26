@@ -31,6 +31,9 @@ pub trait Chunker: Send + Sync {
     ///
     /// # Returns
     /// A vector of chunks, each with a unique ID derived from the document ID.
+    ///
+    /// # Errors
+    /// Returns an error when the chunker cannot parse or split the document.
     fn chunk(&self, doc: &Document) -> Result<Vec<Chunk>>;
 
     /// Returns the name of this chunking strategy.

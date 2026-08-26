@@ -180,7 +180,7 @@ where
             .field("tool_count", &self.tool_descriptions.len())
             .field("skill_count", &self.skills.len())
             .field("subagent_count", &self.subagents.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -355,6 +355,7 @@ where
     }
 
     /// Sets runtime shell backend availability for `terminal`.
+    #[must_use]
     pub fn shell_runtime_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
         self.shell_sessions = self.shell_sessions.with_availability(availability.clone());
         self.terminal_tool = self
@@ -365,6 +366,11 @@ where
     }
 
     /// Sets preconfigured SSH targets that can be used by `terminal` with ssh mode.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the SSH server configuration is invalid.
+    #[must_use]
     pub fn ssh_servers(mut self, servers: Vec<SshServer>) -> Self {
         self.shell_sessions = self
             .shell_sessions
@@ -377,6 +383,7 @@ where
     }
 
     /// Sets the SSH session authorizer for interactive connect/install consent prompts.
+    #[must_use]
     pub fn ssh_authorizer(mut self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
         self.shell_sessions = self.shell_sessions.with_ssh_authorizer(authorizer);
         self.terminal_tool = self
@@ -386,6 +393,7 @@ where
     }
 
     /// Sets the container runtime for container-backed shell sessions.
+    #[must_use]
     pub fn container_runtime(mut self, runtime: ContainerShellRuntime) -> Self {
         self.shell_sessions = self.shell_sessions.with_container_runtime(runtime.clone());
         self.terminal_tool = self.terminal_tool.with_container_runtime(runtime);
@@ -403,6 +411,7 @@ where
     /// builder.tool(WebSearchTool::default())
     /// // LLM can now call: terminal({ script: "websearch \"rust async\"" })
     /// ```
+    #[must_use]
     pub fn tool<T>(mut self, tool: T) -> Self
     where
         T: Tool + Send + Sync + 'static,
@@ -423,7 +432,8 @@ where
     /// This is the dynamic counterpart to [`Self::tool`]. The command wrapper
     /// is still derived entirely from the tool definition schema, so `--help`,
     /// positional arguments, and validation all stay automatic.
-    pub fn definition_handler<F>(mut self, definition: ToolDefinition, handler: F) -> Self
+    #[must_use]
+    pub fn definition_handler<F>(mut self, definition: &ToolDefinition, handler: F) -> Self
     where
         F: Fn(
                 serde_json::Value,
@@ -444,6 +454,7 @@ where
 
     /// Registers all tools from one MCP connection as terminal commands.
     #[cfg(feature = "mcp")]
+    #[must_use]
     pub fn mcp_connection(mut self, conn: McpConnection) -> Self {
         let definitions = aither_mcp::register_terminal_commands(&mut self.registry_builder, conn);
         self.tool_descriptions
@@ -457,6 +468,7 @@ where
     }
 
     /// Registers a tool with a custom description.
+    #[must_use]
     pub fn tool_with_desc<T>(mut self, tool: T, description: impl Into<String>) -> Self
     where
         T: Tool + Send + Sync + 'static,
@@ -471,6 +483,7 @@ where
     /// Adds a pre-configured tool description (for tools registered elsewhere).
     ///
     /// Use this when the tool was already registered on the registry builder.
+    #[must_use]
     pub fn tool_description(
         mut self,
         name: impl Into<String>,
@@ -482,42 +495,49 @@ where
     }
 
     /// Sets a custom system prompt (raw string, no template processing).
+    #[must_use]
     pub fn system_prompt_raw(mut self, prompt: impl Into<String>) -> Self {
         self.inner = self.inner.system_prompt(prompt.into());
         self
     }
 
     /// Sets an optional persona overlay prompt.
+    #[must_use]
     pub fn persona_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.inner = self.inner.persona_prompt(prompt.into());
         self
     }
 
     /// Sets agent kind (coding/chatbot).
+    #[must_use]
     pub fn agent_kind(mut self, kind: AgentKind) -> Self {
         self.inner = self.inner.agent_kind(kind);
         self
     }
 
     /// Sets transcript path for long-memory recovery guidance.
+    #[must_use]
     pub fn transcript_path(mut self, path: impl Into<String>) -> Self {
         self.inner = self.inner.transcript_path(path.into());
         self
     }
 
     /// Enables writing readable transcript entries to the given file path.
+    #[must_use]
     pub fn transcript(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.inner = self.inner.transcript(path);
         self
     }
 
     /// Inserts or replaces a typed persistent system block.
+    #[must_use]
     pub fn system<T: serde::Serialize>(mut self, value: T) -> Self {
         self.inner = self.inner.system(value);
         self
     }
 
     /// Inserts or replaces a persistent system block with an explicit tag.
+    #[must_use]
     pub fn system_named(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
         self.inner = self.inner.system_named(tag, content);
         self
@@ -530,6 +550,7 @@ where
     /// preferred entry point for prose system blocks (workspace descriptions,
     /// runtime metadata, environment hints) where XML structure adds tokens
     /// without providing semantic value.
+    #[must_use]
     pub fn system_text(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
         self.inner = self.inner.system_text(tag, content);
         self
@@ -538,6 +559,11 @@ where
     /// Generates and sets the default system prompt using the built-in template.
     ///
     /// This should be called after all tools are registered.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no shell backend is available.
+    #[must_use]
     pub fn with_default_prompt(mut self) -> Self {
         let availability = self.shell_sessions.availability();
         let host_profile = if availability.container {
@@ -673,6 +699,11 @@ where
     }
 
     #[cfg(feature = "skills")]
+    /// Loads skills and exposes the skill directory inside the sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when loading skills or creating the sandbox symlink fails.
     pub async fn with_skills(
         self,
         path: impl AsRef<std::path::Path>,
@@ -688,6 +719,10 @@ where
     /// directory without creating a `skills` symlink in the sandbox.
     ///
     /// Use this when the runtime already mounts `skills` inside the sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when loading skills or registering the readable directory fails.
     #[cfg(feature = "skills")]
     pub async fn with_skills_readable_only(
         self,
@@ -701,6 +736,7 @@ where
     }
 
     /// Adds a skill manually without loading from filesystem.
+    #[must_use]
     pub fn skill(mut self, name: impl Into<String>, description: impl Into<String>) -> Self {
         self.skills.push(SkillInfo {
             name: name.into(),
@@ -753,6 +789,11 @@ where
         Ok(self)
     }
 
+    /// Loads subagents and exposes the subagent directory inside the sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when loading subagents or creating the sandbox symlink fails.
     pub async fn with_subagents(
         self,
         path: impl AsRef<std::path::Path>,
@@ -768,6 +809,10 @@ where
     /// directory without creating a `subagents` symlink in the sandbox.
     ///
     /// Use this when the runtime already mounts `subagents` inside the sandbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when loading subagents or registering the readable directory fails.
     pub async fn with_subagents_readable_only(
         self,
         path: impl AsRef<std::path::Path>,
@@ -780,6 +825,7 @@ where
     }
 
     /// Sets the maximum number of iterations.
+    #[must_use]
     pub fn max_iterations(mut self, limit: usize) -> Self {
         self.inner = self.inner.max_iterations(limit);
         self

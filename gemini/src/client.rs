@@ -77,7 +77,7 @@ pub async fn stream_generate(
             Err(e) => {
                 let err = GeminiError::from_http(e);
                 if err.is_retryable() && attempt < MAX_RETRIES {
-                    let delay_secs = err.retry_delay_secs().unwrap_or(2u64.pow(attempt));
+                    let delay_secs = err.retry_delay_secs().unwrap_or_else(|| 2u64.pow(attempt));
                     if debug {
                         tracing::info!(
                             "Gemini streaming error (attempt {}/{}), retrying in {}s: {}",
@@ -122,7 +122,6 @@ pub async fn stream_generate(
                             Ok(response) => return Some((Ok(response), stream)),
                             Err(e) => {
                                 tracing::debug!("SSE parse error: {} for data: {}", e, data);
-                                continue;
                             }
                         }
                     }
@@ -213,7 +212,7 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
             Err(e) => {
                 let err = GeminiError::from_http(e);
                 if err.is_retryable() && attempt < MAX_RETRIES {
-                    let delay_secs = err.retry_delay_secs().unwrap_or(2u64.pow(attempt));
+                    let delay_secs = err.retry_delay_secs().unwrap_or_else(|| 2u64.pow(attempt));
                     if debug {
                         tracing::info!(
                             "Gemini POST error (attempt {}/{}), retrying in {}s: {}",

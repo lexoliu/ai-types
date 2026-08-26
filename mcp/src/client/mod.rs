@@ -3,10 +3,11 @@
 //! The client connects to MCP servers and provides methods to
 //! list and call tools, read resources, etc.
 
-mod client;
+#[path = "client.rs"]
+mod client_impl;
 mod toolset;
 
-pub use client::McpClient;
+pub use client_impl::McpClient;
 pub use toolset::{
     McpConnection, McpServerConfig, McpServersConfig, McpToolService, register_terminal_commands,
 };

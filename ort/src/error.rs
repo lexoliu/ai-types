@@ -56,10 +56,10 @@ impl From<ort::Error> for OrtError {
 
 impl OrtError {
     /// Creates a tokenizer error from a path and error message.
-    pub fn tokenizer(path: impl Into<PathBuf>, message: impl ToString) -> Self {
+    pub fn tokenizer(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
         Self::Tokenizer {
             path: path.into(),
-            message: message.to_string(),
+            message: message.into(),
         }
     }
 }

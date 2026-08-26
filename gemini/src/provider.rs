@@ -128,6 +128,7 @@ struct ModelListResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
 struct ModelDescriptor {
     name: String,

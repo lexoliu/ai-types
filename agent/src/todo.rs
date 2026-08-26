@@ -4,6 +4,7 @@
 //! Designed to work like Claude Code's `TodoWrite` for tracking multi-step work.
 
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -149,11 +150,11 @@ impl TodoList {
         let mut summary = format!("Progress: {completed}/{total} completed");
         if in_progress > 0 {
             if let Some(current) = items.iter().find(|i| i.status == TodoStatus::InProgress) {
-                summary.push_str(&format!(" | Current: {}", current.active_form));
+                let _ = write!(summary, " | Current: {}", current.active_form);
             }
         }
         if pending > 0 {
-            summary.push_str(&format!(" | {pending} pending"));
+            let _ = write!(summary, " | {pending} pending");
         }
         summary
     }

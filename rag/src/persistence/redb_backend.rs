@@ -58,10 +58,8 @@ impl RedbPersistence {
 
         Ok(Self { path, db })
     }
-}
 
-impl Persistence for RedbPersistence {
-    fn save(&self, entries: &[IndexEntry]) -> Result<()> {
+    fn save_entries(&self, entries: &[IndexEntry]) -> Result<()> {
         let write_txn = self
             .db
             .begin_write()
@@ -94,7 +92,7 @@ impl Persistence for RedbPersistence {
         Ok(())
     }
 
-    fn load(&self) -> Result<Vec<IndexEntry>> {
+    fn load_entries(&self) -> Result<Vec<IndexEntry>> {
         let read_txn = self
             .db
             .begin_read()
@@ -120,6 +118,19 @@ impl Persistence for RedbPersistence {
 
         Ok(entries)
     }
+}
+
+impl Persistence for RedbPersistence {
+    fn save<'a>(
+        &'a self,
+        entries: &'a [IndexEntry],
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        std::future::ready(self.save_entries(entries))
+    }
+
+    fn load(&self) -> impl std::future::Future<Output = Result<Vec<IndexEntry>>> + Send + '_ {
+        std::future::ready(self.load_entries())
+    }
 
     fn extension(&self) -> &'static str {
         "redb"
@@ -141,17 +152,17 @@ mod tests {
         IndexEntry::new(chunk, vec![1.0, 2.0, 3.0, 4.0])
     }
 
-    #[test]
-    fn save_and_load() {
+    #[tokio::test]
+    async fn save_and_load() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.redb");
         let persistence = RedbPersistence::new(&path).unwrap();
 
         let entries = vec![make_entry("c1", "hello"), make_entry("c2", "world")];
 
-        persistence.save(&entries).unwrap();
+        persistence.save(&entries).await.unwrap();
 
-        let loaded = persistence.load().unwrap();
+        let loaded = persistence.load().await.unwrap();
         assert_eq!(loaded.len(), 2);
 
         // Entries might not be in the same order
@@ -160,42 +171,42 @@ mod tests {
         assert!(ids.contains(&"c2"));
     }
 
-    #[test]
-    fn load_empty_db() {
+    #[tokio::test]
+    async fn load_empty_db() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("empty.redb");
         let persistence = RedbPersistence::new(&path).unwrap();
 
-        let loaded = persistence.load().unwrap();
+        let loaded = persistence.load().await.unwrap();
         assert!(loaded.is_empty());
     }
 
-    #[test]
-    fn save_empty() {
+    #[tokio::test]
+    async fn save_empty() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("empty.redb");
         let persistence = RedbPersistence::new(&path).unwrap();
 
-        persistence.save(&[]).unwrap();
-        let loaded = persistence.load().unwrap();
+        persistence.save(&[]).await.unwrap();
+        let loaded = persistence.load().await.unwrap();
         assert!(loaded.is_empty());
     }
 
-    #[test]
-    fn overwrite_entries() {
+    #[tokio::test]
+    async fn overwrite_entries() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.redb");
         let persistence = RedbPersistence::new(&path).unwrap();
 
         // Save initial entries
         let entries1 = vec![make_entry("c1", "hello")];
-        persistence.save(&entries1).unwrap();
+        persistence.save(&entries1).await.unwrap();
 
         // Save updated entries with same ID
         let entries2 = vec![make_entry("c1", "world")];
-        persistence.save(&entries2).unwrap();
+        persistence.save(&entries2).await.unwrap();
 
-        let loaded = persistence.load().unwrap();
+        let loaded = persistence.load().await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].chunk.text, "world");
     }

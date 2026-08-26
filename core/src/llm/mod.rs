@@ -103,7 +103,7 @@ use core::{any::TypeId, future::Future};
 pub use event::{Event, ToolCall, Usage};
 use futures_core::Stream;
 use futures_lite::{StreamExt, pin};
-pub use message::{Message, Role};
+pub use message::{Attachment, Message, Role};
 pub use provider::LanguageModelProvider;
 pub use researcher::{
     ResearchCitation, ResearchEvent, ResearchFinding, ResearchOptions, ResearchReport,

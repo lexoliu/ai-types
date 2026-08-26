@@ -91,21 +91,7 @@ mod tests {
 
     #[test]
     fn test_parse_skill() {
-        let content = r#"---
-name: code-review
-description: Reviews code for security and best practices
-tools:
-  - Read
-  - Grep
----
-
-# Code Review Skill
-
-When reviewing code, follow these steps:
-1. First scan for security vulnerabilities
-2. Check for common anti-patterns
-"#;
-
+        let content = include_str!("../tests/fixtures/code_review_skill.md");
         let skill = Skill::parse(content).unwrap();
         assert_eq!(skill.name, "code-review");
         assert_eq!(
@@ -122,14 +108,7 @@ When reviewing code, follow these steps:
 
     #[test]
     fn test_parse_skill_no_tools() {
-        let content = r"---
-name: simple
-description: A simple skill
----
-
-Instructions here.
-";
-
+        let content = include_str!("../tests/fixtures/simple_skill.md");
         let skill = Skill::parse(content).unwrap();
         assert_eq!(skill.name, "simple");
         assert!(skill.allowed_tools.is_none());

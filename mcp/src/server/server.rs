@@ -28,6 +28,7 @@ pub struct McpServer<T: BidirectionalTransport> {
     transport: T,
     tools: Tools,
     info: ServerInfo,
+    instructions: Option<String>,
     initialized: bool,
 }
 
@@ -68,12 +69,13 @@ impl McpServer<StdioTransport> {
                 name: name.into(),
                 version: Some(version.into()),
             },
+            instructions: None,
             initialized: false,
         })
     }
 }
 
-impl<T: BidirectionalTransport> McpServer<T> {
+impl<T: BidirectionalTransport + Sync> McpServer<T> {
     /// Create a new MCP server with a custom transport.
     ///
     /// For most use cases, prefer `McpServer::stdio()` instead.
@@ -85,7 +87,7 @@ impl<T: BidirectionalTransport> McpServer<T> {
     /// * `name` - The server name.
     /// * `version` - The server version.
     #[must_use]
-    pub(crate) fn new(
+    pub fn new(
         transport: T,
         tools: Tools,
         name: impl Into<String>,
@@ -98,8 +100,16 @@ impl<T: BidirectionalTransport> McpServer<T> {
                 name: name.into(),
                 version: Some(version.into()),
             },
+            instructions: None,
             initialized: false,
         }
+    }
+
+    /// Adds server-wide instructions returned during MCP initialization.
+    #[must_use]
+    pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = Some(instructions.into());
+        self
     }
 
     /// Run the server main loop.
@@ -178,7 +188,7 @@ impl<T: BidirectionalTransport> McpServer<T> {
                 ..Default::default()
             },
             server_info: self.info.clone(),
-            instructions: None,
+            instructions: self.instructions.clone(),
         };
 
         JsonRpcResponse::success(req.id, result)
@@ -206,7 +216,7 @@ impl<T: BidirectionalTransport> McpServer<T> {
     }
 
     /// Handle tools/call request.
-    async fn handle_call_tool(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
+    async fn handle_call_tool(&self, req: JsonRpcRequest) -> JsonRpcResponse {
         let params: CallToolParams = match req.params.map(serde_json::from_value).transpose() {
             Ok(Some(p)) => p,
             Ok(None) => {

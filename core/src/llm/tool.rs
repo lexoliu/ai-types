@@ -150,7 +150,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::BTreeMap};
 use core::any::Any;
-use core::fmt::Debug;
+use core::fmt::{Debug, Display};
 use core::{future::Future, pin::Pin};
 pub use mime::Mime;
 use schemars::{JsonSchema, Schema, schema_for};
@@ -174,7 +174,7 @@ use serde::{Serialize, de::DeserializeOwned};
 ///     ToolResult::Done
 /// }
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "snake_case"))]
 pub enum ToolResult {
@@ -182,13 +182,22 @@ pub enum ToolResult {
     Done,
 
     /// UTF-8 plain text output.
-    Text { text: String },
+    Text {
+        /// Plain text content.
+        text: String,
+    },
 
     /// Tab-separated tabular output.
-    Tsv { text: String },
+    Tsv {
+        /// TSV content.
+        text: String,
+    },
 
     /// Structured JSON output.
-    Json { value: Value },
+    Json {
+        /// JSON content.
+        value: Value,
+    },
 
     /// Binary or media payload.
     Binary {
@@ -199,7 +208,10 @@ pub enum ToolResult {
     },
 
     /// Tool-level error. This is distinct from transport/runtime failures.
-    Error { message: String },
+    Error {
+        /// Tool-level error message.
+        message: String,
+    },
 }
 
 impl ToolResult {
@@ -421,17 +433,14 @@ where
     T: IntoToolResult,
 {
     fn into_tool_result(self) -> Result<ToolResult> {
-        match self {
-            Some(value) => value.into_tool_result(),
-            None => Ok(ToolResult::Done),
-        }
+        self.map_or_else(|| Ok(ToolResult::Done), IntoToolResult::into_tool_result)
     }
 }
 
 impl<T, E> IntoToolResult for core::result::Result<T, E>
 where
     T: Serialize,
-    E: core::error::Error,
+    E: Display,
 {
     fn into_tool_result(self) -> Result<ToolResult> {
         match self {
@@ -555,10 +564,7 @@ fn flatten_json_value(value: &Value, prefix: &str) -> Vec<(String, String)> {
 }
 
 fn escape_tsv_field(value: &str) -> String {
-    value
-        .replace('\t', " ")
-        .replace('\n', " ")
-        .replace('\r', " ")
+    value.replace(['\t', '\n', '\r'], " ")
 }
 
 /// Tools that can be called by language models.

@@ -128,7 +128,7 @@ pub fn channel() -> (AskUserBroker, AskUserQueue) {
 }
 
 /// Tool implementation for asking the user questions.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct AskUserTool {
     broker: AskUserBroker,
     session_id: String,

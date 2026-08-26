@@ -11,6 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use askama::Template;
 use async_fs as fs;
 use image::{GenericImageView, ImageFormat, ImageReader, imageops::FilterType};
 use schemars::JsonSchema;
@@ -129,12 +130,7 @@ impl Serialize for OutputEntry {
                 let map = serializer.serialize_map(Some(0))?;
                 map.end()
             }
-            Self::Inline { content } => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("content", content)?;
-                map.end()
-            }
-            Self::Loaded { content, .. } => {
+            Self::Inline { content } | Self::Loaded { content, .. } => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("content", content)?;
                 map.end()
@@ -251,10 +247,73 @@ pub struct OutputRef {
     pub size: usize,
 }
 
-/// Maximum output size to show inline (roughly what fits in a terminal without scrolling).
-/// Outputs exceeding this are saved to file, and only the file path is returned.
+/// Maximum output size (in bytes) delivered inline to the model.
+/// Outputs exceeding this are saved to file; the model still receives a head
+/// preview capped at this budget together with the file reference, so it can
+/// always make progress without an extra read round-trip.
 /// This is the single source of truth for output size limits.
-pub const INLINE_OUTPUT_LIMIT: usize = 4000;
+pub const INLINE_OUTPUT_LIMIT: usize = 16_000;
+
+#[derive(Template)]
+#[template(path = "stored_output_preview.txt", escape = "none")]
+struct StoredOutputPreviewTemplate<'a> {
+    preview: &'a str,
+    reason: &'a str,
+    line_count: usize,
+    byte_count: usize,
+    url: &'a str,
+}
+
+/// Renders the model-facing content for a stored text output: a head preview
+/// within the caller's budget plus the file reference and read guidance.
+fn stored_text_content(
+    text: &str,
+    reason: &str,
+    line_count: usize,
+    byte_count: usize,
+    url: &str,
+    max_lines: usize,
+    byte_budget: usize,
+) -> Content {
+    let preview = head_preview(text, max_lines, byte_budget);
+    let rendered = StoredOutputPreviewTemplate {
+        preview: preview.trim_end_matches('\n'),
+        reason,
+        line_count,
+        byte_count,
+        url,
+    }
+    .render()
+    .expect("stored output preview template must render");
+    Content::Text {
+        text: rendered,
+        truncated: true,
+    }
+}
+
+/// Returns the longest prefix of `text` spanning at most `max_lines` lines and
+/// `byte_budget` bytes, cutting at a line boundary when possible and never
+/// splitting a UTF-8 character.
+pub fn head_preview(text: &str, max_lines: usize, byte_budget: usize) -> &str {
+    let mut end = 0;
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        if index == max_lines || end + line.len() > byte_budget {
+            break;
+        }
+        end += line.len();
+    }
+    if end == 0 {
+        // The first line alone exceeds the byte budget: cut inside it at a
+        // character boundary.
+        let mut cut = byte_budget.min(text.len());
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        end = cut;
+    }
+    text.get(..end)
+        .expect("prefix end is aligned to a line or char boundary")
+}
 
 /// A pending URL allocation that hasn't been written to disk yet.
 ///
@@ -461,7 +520,7 @@ impl OutputStore {
     pub fn allocate_url(&self, entry: &OutputEntry) -> Option<PendingUrl> {
         match entry {
             OutputEntry::Loaded { raw, format, .. } => {
-                let ext = format_extension(*format);
+                let ext = extension_for_data(raw, *format);
                 let name = generate_word_filename();
                 let url = format!("outputs/{name}.{ext}");
                 Some(PendingUrl {
@@ -569,46 +628,28 @@ pub async fn save_raw_to_file(dir: &Path, data: &[u8]) -> std::io::Result<String
 /// Saves text output with simple size-based classification.
 ///
 /// - Below `INLINE_OUTPUT_LIMIT` → show inline
-/// - Above `INLINE_OUTPUT_LIMIT` → save to file, return only file reference
+/// - Above `INLINE_OUTPUT_LIMIT` → save to file, return head preview plus file reference
 async fn save_text_output(
     dir: &Path,
     data: &[u8],
     format: OutputFormat,
 ) -> std::io::Result<OutputEntry> {
-    let text = String::from_utf8_lossy(data);
-
     if data.len() <= INLINE_OUTPUT_LIMIT {
-        // Small enough to show inline
         let content = Content::Text {
-            text: text.into_owned(),
+            text: String::from_utf8_lossy(data).into_owned(),
             truncated: false,
         };
         Ok(OutputEntry::Inline { content })
     } else {
-        // Large - save to file, return only reference
-        let (url, path) = create_file(dir, data, format).await?;
-        let line_count = text.lines().count();
-        let content = Content::Text {
-            text: format!(
-                "Output saved to {} ({} lines, {} bytes)",
-                url,
-                line_count,
-                data.len()
-            ),
-            truncated: true,
-        };
-        Ok(OutputEntry::Stored {
-            path: path.display().to_string(),
-            url,
-            content: Some(content),
-        })
+        save_large_output(dir, data, format).await
     }
 }
 
 /// Saves text output with a line-count limit.
 ///
-/// When the output exceeds `max_lines`, the full content is saved to a file
-/// and a message indicating the truncation reason is returned.
+/// When the output exceeds `max_lines` (or the byte limit), the full content
+/// is saved to a file and the returned content carries a head preview within
+/// the caller's budget plus the file reference and read guidance.
 pub async fn save_text_with_line_limit(
     dir: &Path,
     data: &[u8],
@@ -648,34 +689,35 @@ pub async fn save_text_with_line_limit(
         return Ok(OutputEntry::Inline { content });
     }
 
-    // Save full output to file
+    // Save full output to file, but still hand the model a head preview
+    // within its requested budget so it never has to re-read blind.
     let (url, path) = create_file(dir, data, format).await?;
 
-    let message = if exceeds_lines {
-        format!(
-            "Output exceeded max_lines limit ({line_count} lines > {max_lines} max), \
-             so full output was saved to {url} ({} bytes). \
-             Use head/tail/grep/sed to read the file.",
-            data.len()
-        )
+    let byte_budget = byte_limit.unwrap_or(INLINE_OUTPUT_LIMIT);
+    let reason = if exceeds_lines {
+        format!("output exceeded max_lines limit ({line_count} lines > {max_lines} max)")
     } else {
-        format!(
-            "Output saved to {url} ({line_count} lines, {} bytes)",
-            data.len()
-        )
+        format!("output exceeded the {byte_budget}-byte inline limit")
     };
+    let content = stored_text_content(
+        &text,
+        &reason,
+        line_count,
+        data.len(),
+        &url,
+        max_lines,
+        byte_budget,
+    );
 
     Ok(OutputEntry::Stored {
         path: path.display().to_string(),
         url,
-        content: Some(Content::Text {
-            text: message,
-            truncated: true,
-        }),
+        content: Some(content),
     })
 }
 
-/// Saves output that exceeds limit - stores full content, returns only file reference.
+/// Saves output that exceeds limit - stores full content, returning a head
+/// preview plus the file reference for text formats.
 async fn save_large_output(
     dir: &Path,
     data: &[u8],
@@ -684,20 +726,20 @@ async fn save_large_output(
     // Store full content to file
     let (url, path) = create_file(dir, data, format).await?;
 
-    // Return just the file reference (no preview - LLM must read file like a human)
     let content = match format {
         OutputFormat::Text | OutputFormat::Auto => {
             let text = String::from_utf8_lossy(data);
             let line_count = text.lines().count();
-            Some(Content::Text {
-                text: format!(
-                    "Output saved to {} ({} lines, {} bytes)",
-                    url,
-                    line_count,
-                    data.len()
-                ),
-                truncated: true,
-            })
+            let reason = format!("output exceeded the {INLINE_OUTPUT_LIMIT}-byte inline limit");
+            Some(stored_text_content(
+                &text,
+                &reason,
+                line_count,
+                data.len(),
+                &url,
+                usize::MAX,
+                INLINE_OUTPUT_LIMIT,
+            ))
         }
         _ => None, // Binary/video/image just get file path
     };
@@ -762,7 +804,7 @@ async fn create_file(
     data: &[u8],
     format: OutputFormat,
 ) -> std::io::Result<(String, PathBuf)> {
-    let ext = format_extension(format);
+    let ext = extension_for_data(data, format);
     let name = generate_word_filename();
     let filename = format!("{name}.{ext}");
     let url = format!("outputs/{filename}");
@@ -824,10 +866,30 @@ fn detect_format(data: &[u8]) -> OutputFormat {
 const fn format_extension(format: OutputFormat) -> &'static str {
     match format {
         OutputFormat::Text | OutputFormat::Auto => "txt",
-        OutputFormat::Image => "bin", // Generic, actual type detected from content
+        OutputFormat::Image | OutputFormat::Binary => "bin",
         OutputFormat::Video => "mp4",
-        OutputFormat::Binary => "bin",
     }
+}
+
+fn image_extension(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        Some("png")
+    } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if data.starts_with(b"RIFF") && data.len() > 12 && &data[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
+fn extension_for_data(data: &[u8], format: OutputFormat) -> &'static str {
+    if matches!(format, OutputFormat::Image) {
+        return image_extension(data).unwrap_or_else(|| format_extension(format));
+    }
+    format_extension(format)
 }
 
 /// Detects image MIME type from data.
@@ -925,8 +987,7 @@ mod tests {
     #[test]
     fn test_generate_word_filename() {
         let name = generate_word_filename();
-        let parts: Vec<&str> = name.split('-').collect();
-        assert_eq!(parts.len(), 4, "Should have 4 words: {}", name);
+        assert_eq!(name.split('-').count(), 4, "Should have 4 words: {name}");
     }
 
     #[tokio::test]
@@ -993,7 +1054,12 @@ mod tests {
         };
 
         assert_eq!(media_type, "image/jpeg");
-        assert!(path.ends_with(".jpg") || path.ends_with(".jpeg"));
+        assert!(
+            std::path::Path::new(&path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("jpg")
+                    || extension.eq_ignore_ascii_case("jpeg"))
+        );
         assert!(dir.path().join(url.trim_start_matches("outputs/")).exists());
 
         let preview_bytes = base64::engine::general_purpose::STANDARD
@@ -1010,14 +1076,108 @@ mod tests {
 
     fn encode_test_image(width: u32, height: u32, format: ImageFormat) -> Vec<u8> {
         let image = ImageBuffer::from_fn(width, height, |x, y| {
-            let r = ((x * 255) / width.max(1)) as u8;
-            let g = ((y * 255) / height.max(1)) as u8;
-            let b = (((x + y) * 255) / (width + height).max(1)) as u8;
+            let r = u8::try_from((x * 255) / width.max(1)).expect("red channel fits in u8");
+            let g = u8::try_from((y * 255) / height.max(1)).expect("green channel fits in u8");
+            let b = u8::try_from(((x + y) * 255) / (width + height).max(1))
+                .expect("blue channel fits in u8");
             Rgba([r, g, b, 255])
         });
         let dynamic = DynamicImage::ImageRgba8(image);
         let mut cursor = Cursor::new(Vec::new());
         dynamic.write_to(&mut cursor, format).unwrap();
         cursor.into_inner()
+    }
+
+    #[test]
+    fn head_preview_respects_line_budget() {
+        let text = "one\ntwo\nthree\n";
+        assert_eq!(head_preview(text, 2, usize::MAX), "one\ntwo\n");
+        assert_eq!(head_preview(text, 10, usize::MAX), text);
+    }
+
+    #[test]
+    fn head_preview_cuts_at_line_boundary_within_byte_budget() {
+        let text = "aaaa\nbbbb\ncccc\n";
+        // Budget of 12 fits "aaaa\n" + "bbbb\n" (10 bytes) but not the next line.
+        assert_eq!(head_preview(text, usize::MAX, 12), "aaaa\nbbbb\n");
+    }
+
+    #[test]
+    fn head_preview_never_splits_multibyte_chars() {
+        // Each '界' is 3 bytes; a 500-byte budget must cut on a char boundary.
+        let text = "界".repeat(400);
+        let preview = head_preview(&text, usize::MAX, 500);
+        assert!(!preview.is_empty());
+        assert!(preview.len() <= 500);
+        assert!(preview.chars().all(|c| c == '界'));
+    }
+
+    #[tokio::test]
+    async fn stored_text_output_includes_head_preview_and_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut data = String::new();
+        for i in 0..2000 {
+            data.push_str(&format!("line number {i} with some padding text\n"));
+        }
+        assert!(data.len() > INLINE_OUTPUT_LIMIT);
+
+        let entry = save_text_with_line_limit(
+            dir.path(),
+            data.as_bytes(),
+            OutputFormat::Text,
+            MediaResolution::Auto,
+            10_000,
+            Some(INLINE_OUTPUT_LIMIT),
+        )
+        .await
+        .unwrap();
+
+        let OutputEntry::Stored {
+            content: Some(Content::Text { text, truncated }),
+            url,
+            ..
+        } = entry
+        else {
+            panic!("expected stored entry with text content");
+        };
+        assert!(truncated);
+        assert!(
+            text.starts_with("line number 0 "),
+            "preview must lead with real content: {text}"
+        );
+        assert!(
+            text.contains(&url),
+            "guidance must reference the saved file"
+        );
+        assert!(text.contains("Use head/tail/grep/sed"));
+    }
+
+    #[tokio::test]
+    async fn stored_text_output_preview_honors_max_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = "alpha\nbeta\ngamma\ndelta\n".repeat(2);
+
+        let entry = save_text_with_line_limit(
+            dir.path(),
+            data.as_bytes(),
+            OutputFormat::Text,
+            MediaResolution::Auto,
+            3,
+            Some(INLINE_OUTPUT_LIMIT),
+        )
+        .await
+        .unwrap();
+
+        let OutputEntry::Stored {
+            content: Some(Content::Text { text, .. }),
+            ..
+        } = entry
+        else {
+            panic!("expected stored entry with text content");
+        };
+        assert!(
+            text.starts_with("alpha\nbeta\ngamma\n[Preview only:"),
+            "preview must stop at max_lines: {text}"
+        );
     }
 }

@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aither_core::llm::Usage;
+use num_traits::ToPrimitive;
 
 /// Budget limit for a model.
 #[derive(Debug, Clone)]
@@ -75,7 +76,7 @@ impl<M> BudgetedModel<M> {
         }
         if let Some(cost) = usage.cost_usd {
             // Convert to microdollars
-            let micro = (cost * 1_000_000.0) as u64;
+            let micro = (cost * 1_000_000.0).round().to_u64().unwrap_or(u64::MAX);
             self.cost_used_micro.fetch_add(micro, Ordering::Relaxed);
         }
     }
@@ -96,7 +97,7 @@ impl<M> BudgetedModel<M> {
             Budget::Unlimited => false,
             Budget::Tokens(limit) => self.tokens_used.load(Ordering::Relaxed) >= *limit,
             Budget::Cost(limit) => {
-                let micro_limit = (*limit * 1_000_000.0) as u64;
+                let micro_limit = (*limit * 1_000_000.0).round().to_u64().unwrap_or(u64::MAX);
                 self.cost_used_micro.load(Ordering::Relaxed) >= micro_limit
             }
         }
@@ -111,7 +112,11 @@ impl<M> BudgetedModel<M> {
     /// Returns the current cost usage in USD.
     #[must_use]
     pub fn cost_used(&self) -> f64 {
-        self.cost_used_micro.load(Ordering::Relaxed) as f64 / 1_000_000.0
+        self.cost_used_micro
+            .load(Ordering::Relaxed)
+            .to_f64()
+            .unwrap_or(f64::MAX)
+            / 1_000_000.0
     }
 
     /// Resets the usage counters (but not the exhausted flag).
@@ -162,6 +167,7 @@ impl<M> ModelGroup<M> {
     }
 
     /// Adds a fallback model to the group.
+    #[must_use]
     pub fn with_fallback(mut self, model: BudgetedModel<M>) -> Self {
         self.models.push(model);
         self
@@ -253,9 +259,10 @@ impl<M> ModelGroup<M> {
 }
 
 /// Model tier classification for organizing models.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum ModelTier {
     /// High-capability models (e.g., GPT-4, Claude Opus)
+    #[default]
     Advanced,
     /// Balanced capability/cost models (e.g., GPT-4o, Claude Sonnet)
     Balanced,
@@ -411,16 +418,19 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 /// Stream wrapper for `ModelGroup` that tracks usage and detects quota errors.
+type BoxedModelStream<'a, M> =
+    Pin<Box<dyn Stream<Item = Result<Event, <M as LanguageModel>::Error>> + Send + 'a>>;
+
 struct ModelGroupStream<'a, M: LanguageModel> {
     group: &'a ModelGroup<M>,
-    inner: Option<Pin<Box<dyn Stream<Item = Result<Event, M::Error>> + Send + 'a>>>,
+    inner: Option<BoxedModelStream<'a, M>>,
 }
 
 impl<'a, M: LanguageModel> ModelGroupStream<'a, M> {
     fn new(group: &'a ModelGroup<M>, request: LLMRequest) -> Self {
         let inner = group.current().map(|m| {
             let stream = m.inner().respond(request);
-            Box::pin(stream) as Pin<Box<dyn Stream<Item = Result<Event, M::Error>> + Send + 'a>>
+            Box::pin(stream) as BoxedModelStream<'a, M>
         });
         Self { group, inner }
     }
@@ -586,8 +596,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stream_uses_fallback_after_primary_is_exhausted() {
+    #[tokio::test]
+    async fn stream_uses_fallback_after_primary_is_exhausted() {
         let group = ModelGroup::from_models(vec![
             BudgetedModel::new(DummyModel { name: "primary" }, Budget::tokens(1)),
             BudgetedModel::new(DummyModel { name: "fallback" }, Budget::tokens(100)),
@@ -596,7 +606,7 @@ mod tests {
 
         let request = LLMRequest::new([aither_core::llm::Message::user("hello")]);
         let mut stream = group.respond(request);
-        let first = futures_lite::future::block_on(async { stream.next().await });
+        let first = stream.next().await;
 
         match first {
             Some(Ok(Event::Text(text))) => assert_eq!(text, "fallback"),

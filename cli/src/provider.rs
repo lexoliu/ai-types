@@ -63,6 +63,10 @@ impl Provider {
     }
 
     /// Create a cloud provider from this provider type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider API key is not present in the environment.
     pub fn create(self, model: &str, base_url: Option<&str>) -> Result<CloudProvider> {
         let api_key = std::env::var(self.env_var())
             .map_err(|_| anyhow::anyhow!("Set {} in your environment", self.env_var()))?;
@@ -120,6 +124,10 @@ impl std::str::FromStr for Provider {
 /// Priority:
 /// 1. If model prefix matches a provider, use that provider
 /// 2. Otherwise, check available API keys in order: Gemini, `OpenAI`, Claude
+///
+/// # Errors
+///
+/// Returns an error when no matching provider API key is available.
 pub fn auto_detect(model: Option<&str>, base_url: Option<&str>) -> Result<(CloudProvider, String)> {
     // Try to detect from model name
     if let Some(model) = model {
@@ -133,7 +141,7 @@ pub fn auto_detect(model: Option<&str>, base_url: Option<&str>) -> Result<(Cloud
 
     for provider in providers {
         if std::env::var(provider.env_var()).is_ok() {
-            let model = model.unwrap_or(provider.default_model());
+            let model = model.unwrap_or_else(|| provider.default_model());
             return Ok((provider.create(model, base_url)?, model.to_string()));
         }
     }

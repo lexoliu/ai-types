@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use aither_core::{
     LanguageModel,
-    llm::{Event, LLMRequest, Message, ToolCall, model::Profile as ModelProfile},
+    llm::{Attachment, Event, LLMRequest, Message, ToolCall, model::Profile as ModelProfile},
 };
 #[cfg(feature = "skills")]
 use aither_skills::Skill;
@@ -33,6 +33,7 @@ use crate::{
         CheckpointContext, CheckpointReason, Hook, PostToolAction, PreToolAction, StopContext,
         StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
     },
+    model_group::ModelTier,
     todo::{TodoItem, TodoList, TodoStatus},
     tools::AgentTools,
     transcript::Transcript,
@@ -40,12 +41,143 @@ use crate::{
 };
 
 use aither_sandbox::{
-    BackgroundReason, BackgroundTaskReceiver, JobRegistry, OutputStore, PermissionEvent,
+    BackgroundReason, BackgroundTaskReceiver, JobRegistry, PermissionEvent,
     PermissionEventReceiver, PermissionEventStage, TERMINAL_STDIN_BLOCKED_NOTICE, TerminalArgs,
     TerminalExecutionMode, TerminalMode,
 };
 use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "skills")]
 use std::sync::Arc;
+
+const BACKGROUND_TASK_MAX_WAIT: Duration = Duration::from_secs(300);
+const BACKGROUND_TASK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const FOCUS_INSTRUCTION_PLACEHOLDER: &str = "{focus_instruction}";
+
+enum ExecutionSignal<T> {
+    Tool(T),
+    Permission(PermissionEvent),
+}
+
+struct ModelTurn {
+    response_text: String,
+    tool_calls: Vec<ToolCall>,
+    malformed_function_call: bool,
+}
+
+/// Streams agent events to the consumer as they happen.
+///
+/// Wraps an unbounded channel: emitting never blocks, and events emitted
+/// after the consumer dropped the stream are discarded.
+#[derive(Clone)]
+struct EventSink {
+    sender: async_channel::Sender<AgentEvent>,
+}
+
+impl EventSink {
+    fn emit(&self, event: AgentEvent) {
+        let _ = self.sender.try_send(event);
+    }
+}
+
+/// One step of the merged run/event stream in [`Agent::run`].
+enum RunStep {
+    Event(Option<AgentEvent>),
+    Finished(Result<(), AgentError>),
+}
+
+struct RunLoopOutcome {
+    final_text: String,
+    stop_reason: StopReason,
+    iteration: usize,
+}
+
+enum TurnControl {
+    Continue,
+    Break {
+        final_text: String,
+        stop_reason: StopReason,
+    },
+}
+
+enum ModelEventAction {
+    Emit(AgentEvent),
+    Continue,
+    RetryMalformed,
+}
+
+type ToolExecutionResult = Result<(String, String, aither_core::llm::ToolResult), AgentError>;
+type ToolExecutionSignal = ExecutionSignal<ToolExecutionResult>;
+
+macro_rules! drain_model_stream {
+    ($stream:expr, $hooks:expr, $cache_stats:expr, $events:expr, $text_chunks:expr, $tool_calls:expr, $malformed:expr) => {{
+        let stream = $stream;
+        futures_lite::pin!(stream);
+        while let Some(event) = stream.next().await {
+            match handle_model_event(
+                $hooks,
+                $cache_stats,
+                event.map_err(|error| error.to_string()),
+                $text_chunks,
+                $tool_calls,
+            )
+            .await?
+            {
+                ModelEventAction::Emit(event) => $events.emit(event),
+                ModelEventAction::Continue => {}
+                ModelEventAction::RetryMalformed => {
+                    $malformed = true;
+                    break;
+                }
+            }
+        }
+    }};
+}
+
+async fn handle_model_event<H: Hook>(
+    hooks: &H,
+    cache_stats: &mut crate::CacheStats,
+    event: Result<Event, String>,
+    text_chunks: &mut Vec<String>,
+    tool_calls: &mut Vec<ToolCall>,
+) -> Result<ModelEventAction, AgentError> {
+    match event {
+        Ok(Event::Text(text)) => {
+            hooks.on_text(&text).await;
+            text_chunks.push(text.clone());
+            Ok(ModelEventAction::Emit(AgentEvent::Text(text)))
+        }
+        Ok(Event::Reasoning(reasoning)) => {
+            Ok(ModelEventAction::Emit(AgentEvent::Reasoning(reasoning)))
+        }
+        Ok(Event::ToolCallDelta {
+            id,
+            name,
+            arguments_fragment,
+        }) => Ok(ModelEventAction::Emit(AgentEvent::ToolCallDelta {
+            id,
+            name,
+            arguments_fragment,
+        })),
+        Ok(Event::ToolCall(call)) => {
+            tool_calls.push(call);
+            Ok(ModelEventAction::Continue)
+        }
+        Ok(Event::BuiltInToolResult { tool, result }) => {
+            let formatted = format_builtin_tool_result(&tool, &result);
+            text_chunks.push(formatted.clone());
+            Ok(ModelEventAction::Emit(AgentEvent::Text(formatted)))
+        }
+        Ok(Event::Usage(usage)) => {
+            cache_stats.record(&usage);
+            Ok(ModelEventAction::Emit(AgentEvent::Usage(usage)))
+        }
+        Err(error) if error.contains("malformed function call") => {
+            tracing::warn!("Model generated malformed function call, retrying...");
+            Ok(ModelEventAction::RetryMalformed)
+        }
+        Err(error) => Err(AgentError::Llm(error)),
+    }
+}
 
 fn ensure_non_empty_tool_call_ids(
     tool_calls: &[ToolCall],
@@ -221,23 +353,6 @@ struct SkillInstructionXml {
     resource_paths: Option<Vec<String>>,
 }
 
-/// Which model tier to use for the agent's main reasoning loop.
-///
-/// This allows creating agents that use different capability levels:
-/// - Main agent: typically uses `Advanced`
-/// - Explore subagent: uses `Balanced` (cheaper, still capable)
-/// - Quick tasks: uses `Fast`
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ModelTier {
-    /// Use the most capable model (default for main agent).
-    #[default]
-    Advanced,
-    /// Use the balanced model (good for subagents).
-    Balanced,
-    /// Use the fast model (for quick, simple tasks).
-    Fast,
-}
-
 /// An autonomous agent that processes tasks using tiered language models.
 ///
 /// The agent manages conversation context, handles tool execution in a loop,
@@ -319,9 +434,6 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     /// Todo list for tracking long tasks.
     pub(crate) todo_list: Option<TodoList>,
 
-    /// Output store for lazy URL allocation during compression.
-    pub(crate) output_store: Option<Arc<OutputStore>>,
-
     /// Receiver for completed background terminal tasks.
     pub(crate) background_receiver: Option<BackgroundTaskReceiver>,
     /// Receiver for permission wait/resume events emitted by terminal execution.
@@ -394,7 +506,6 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
             fast_profile: None,
             initialized: false,
             todo_list: None,
-            output_store: None,
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
@@ -416,7 +527,6 @@ impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
 
 impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
     /// Returns a builder for more complex agent construction.
-    #[must_use]
     pub fn builder(llm: LLM) -> crate::builder::AgentBuilder<LLM, LLM, LLM, ()> {
         crate::builder::AgentBuilder::new(llm)
     }
@@ -429,6 +539,579 @@ where
     Fast: LanguageModel,
     H: Hook,
 {
+    async fn collect_model_turn(
+        &mut self,
+        request: LLMRequest,
+        events: &EventSink,
+    ) -> Result<ModelTurn, AgentError> {
+        let mut text_chunks = Vec::new();
+        let mut tool_calls = Vec::new();
+        let mut malformed_function_call = false;
+
+        match self.tier {
+            ModelTier::Advanced => {
+                drain_model_stream!(
+                    self.advanced.respond(request),
+                    &self.hooks,
+                    &mut self.cache_stats,
+                    events,
+                    &mut text_chunks,
+                    &mut tool_calls,
+                    malformed_function_call
+                );
+            }
+            ModelTier::Balanced => {
+                drain_model_stream!(
+                    self.balanced.respond(request),
+                    &self.hooks,
+                    &mut self.cache_stats,
+                    events,
+                    &mut text_chunks,
+                    &mut tool_calls,
+                    malformed_function_call
+                );
+            }
+            ModelTier::Fast => {
+                drain_model_stream!(
+                    self.fast.respond(request),
+                    &self.hooks,
+                    &mut self.cache_stats,
+                    events,
+                    &mut text_chunks,
+                    &mut tool_calls,
+                    malformed_function_call
+                );
+            }
+        }
+
+        Ok(ModelTurn {
+            response_text: text_chunks.join(""),
+            tool_calls,
+            malformed_function_call,
+        })
+    }
+
+    async fn run_streaming(
+        &mut self,
+        prompt: String,
+        attachments: Vec<Attachment>,
+        events: &EventSink,
+    ) -> Result<(), AgentError> {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        events.emit(AgentEvent::run_start(
+            run_id.clone(),
+            self.config.max_iterations,
+        ));
+        self.ensure_initialized().await;
+        #[cfg(feature = "skills")]
+        for event in self.activate_skills_for_prompt(&prompt) {
+            events.emit(event);
+        }
+        self.maybe_compress().await?;
+
+        self.context
+            .push(Message::user(&prompt).with_attachments(attachments));
+        if let Some(transcript) = &self.transcript {
+            transcript.write_user_message(&prompt).await;
+        }
+
+        let outcome = self.run_agent_loop(run_id.as_str(), 0, events).await?;
+        if outcome.stop_reason != StopReason::EndTurn
+            && self
+                .collect_final_background_events(run_id.as_str(), outcome.iteration, events)
+                .await?
+        {
+            return Ok(());
+        }
+        self.push_stop_events(run_id.as_str(), outcome, events)
+            .await?;
+        Ok(())
+    }
+
+    async fn run_agent_loop(
+        &mut self,
+        run_id: &str,
+        turn_offset: usize,
+        events: &EventSink,
+    ) -> Result<RunLoopOutcome, AgentError> {
+        let mut iteration = 0;
+        loop {
+            iteration += 1;
+            let turn = turn_offset + iteration;
+            if turn > self.config.max_iterations {
+                return Err(AgentError::MaxIterations {
+                    limit: self.config.max_iterations,
+                });
+            }
+            match self.run_agent_turn(run_id, turn, events).await? {
+                TurnControl::Continue => {}
+                TurnControl::Break {
+                    final_text,
+                    stop_reason,
+                } => {
+                    return Ok(RunLoopOutcome {
+                        final_text,
+                        stop_reason,
+                        iteration: turn,
+                    });
+                }
+            }
+        }
+    }
+
+    async fn run_agent_turn(
+        &mut self,
+        run_id: &str,
+        turn: usize,
+        events: &EventSink,
+    ) -> Result<TurnControl, AgentError> {
+        let messages = self.build_live_request_messages().await;
+        let request =
+            LLMRequest::new(messages).with_tool_definitions(self.tools.active_definitions());
+        let model_turn = self.collect_model_turn(request, events).await?;
+
+        if model_turn.malformed_function_call {
+            return Ok(TurnControl::Continue);
+        }
+        let response_text = model_turn.response_text;
+        let tool_calls = model_turn.tool_calls;
+        ensure_non_empty_tool_call_ids(&tool_calls, &response_text)?;
+
+        if tool_calls.is_empty() {
+            return self.finish_no_tool_turn(response_text, turn, events).await;
+        }
+
+        self.context.push(Message::assistant_with_tool_calls(
+            &response_text,
+            tool_calls.clone(),
+        ));
+        let old_todo_items = self
+            .todo_list
+            .as_ref()
+            .map(super::todo::TodoList::items)
+            .unwrap_or_default();
+        let tool_names = tool_calls
+            .iter()
+            .map(|call| call.name.clone())
+            .collect::<Vec<_>>();
+
+        self.push_tool_start_events(&tool_calls, events).await;
+        let results = self.execute_tool_calls(&tool_calls, turn, events).await;
+        self.apply_tool_results(results, &tool_names, &old_todo_items, events)
+            .await?;
+        self.push_turn_boundary_events(run_id, turn, &response_text, events)
+            .await
+    }
+
+    async fn finish_no_tool_turn(
+        &mut self,
+        response_text: String,
+        turn: usize,
+        events: &EventSink,
+    ) -> Result<TurnControl, AgentError> {
+        if !response_text.is_empty() {
+            self.context.push(Message::assistant(&response_text));
+            if let Some(transcript) = &self.transcript {
+                transcript.write_assistant_text(&response_text).await;
+            }
+        }
+        events.emit(AgentEvent::turn_complete(turn, false));
+        if self.inject_working_doc_continue_reminder().await {
+            return Ok(TurnControl::Continue);
+        }
+        Ok(TurnControl::Break {
+            final_text: response_text,
+            stop_reason: StopReason::NoToolCalls,
+        })
+    }
+
+    async fn push_tool_start_events(&self, tool_calls: &[ToolCall], events: &EventSink) {
+        for call in tool_calls {
+            let args = call.arguments.to_string();
+            if let Some(transcript) = &self.transcript {
+                transcript.write_tool_call(&call.name, &args).await;
+            }
+            events.emit(AgentEvent::ToolCallStart {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                arguments: args,
+            });
+            if let Some(reason) = pause_reason_for_tool(call.name.as_str()) {
+                events.emit(AgentEvent::run_paused(reason, call.id.clone()));
+            }
+        }
+    }
+
+    async fn execute_tool_calls(
+        &self,
+        tool_calls: &[ToolCall],
+        turn: usize,
+        events: &EventSink,
+    ) -> Vec<Result<(String, String, aither_core::llm::ToolResult), AgentError>> {
+        let permission_receiver = self.permission_receiver.clone();
+        let mut permission_pause_tracker = PermissionPauseTracker::from_tool_calls(tool_calls);
+        let tool_futures = tool_calls.iter().map(|call| {
+            let args_json = call.arguments.to_string();
+            let message_count = self.context.len_recent();
+            async move {
+                let tool_ctx = ToolUseContext {
+                    tool_name: &call.name,
+                    arguments: &args_json,
+                    turn,
+                    message_count,
+                };
+                let (result, duration) = self
+                    .call_tool_with_hooks(call, &args_json, &tool_ctx)
+                    .await?;
+                let result_ctx = ToolResultContext {
+                    tool_name: &call.name,
+                    arguments: &args_json,
+                    result: &result,
+                    duration,
+                };
+                let tool_result = match self.hooks.post_tool_use(&result_ctx).await {
+                    PostToolAction::Abort(reason) => {
+                        return Err(AgentError::HookRejected {
+                            hook: "post_tool_use",
+                            reason,
+                        });
+                    }
+                    PostToolAction::Replace(replacement) => replacement,
+                    PostToolAction::Keep => result,
+                };
+                Ok((call.id.clone(), call.name.clone(), tool_result))
+            }
+        });
+
+        let mut pending = tool_futures.collect::<futures::stream::FuturesUnordered<_>>();
+        let mut results = Vec::new();
+        while !pending.is_empty() {
+            let next = match &permission_receiver {
+                Some(receiver) => {
+                    futures_lite::future::or(
+                        async { pending.next().await.map(ExecutionSignal::Tool) },
+                        async { receiver.recv().await.map(ExecutionSignal::Permission) },
+                    )
+                    .await
+                }
+                None => pending.next().await.map(ExecutionSignal::Tool),
+            };
+            Self::handle_execution_signal(
+                next,
+                &mut permission_pause_tracker,
+                &mut results,
+                events,
+            );
+        }
+        if let Some(receiver) = &permission_receiver {
+            for event in receiver.take_pending() {
+                emit_permission_event(&mut permission_pause_tracker, &event, events);
+            }
+        }
+        results
+    }
+
+    async fn call_tool_with_hooks(
+        &self,
+        call: &ToolCall,
+        args_json: &str,
+        tool_ctx: &ToolUseContext<'_>,
+    ) -> Result<(aither_core::llm::ToolResult, Duration), AgentError> {
+        match self.hooks.pre_tool_use(tool_ctx).await {
+            PreToolAction::Abort(reason) => Err(AgentError::HookRejected {
+                hook: "pre_tool_use",
+                reason,
+            }),
+            PreToolAction::Deny(reason) => {
+                Ok((aither_core::llm::ToolResult::error(reason), Duration::ZERO))
+            }
+            PreToolAction::Allow => {
+                let start = Instant::now();
+                let result = self
+                    .tools
+                    .call(&call.name, args_json)
+                    .await
+                    .unwrap_or_else(|error| {
+                        let mut message = String::from("Error: ");
+                        message.push_str(error.to_string().as_str());
+                        aither_core::llm::ToolResult::error(message)
+                    });
+                Ok((result, start.elapsed()))
+            }
+        }
+    }
+
+    fn handle_execution_signal(
+        signal: Option<ToolExecutionSignal>,
+        tracker: &mut PermissionPauseTracker,
+        results: &mut Vec<ToolExecutionResult>,
+        events: &EventSink,
+    ) {
+        match signal {
+            Some(ExecutionSignal::Tool(result)) => results.push(result),
+            Some(ExecutionSignal::Permission(event)) => {
+                emit_permission_event(tracker, &event, events);
+            }
+            None => {}
+        }
+    }
+
+    async fn apply_tool_results(
+        &mut self,
+        results: Vec<Result<(String, String, aither_core::llm::ToolResult), AgentError>>,
+        tool_names: &[String],
+        old_todo_items: &[TodoItem],
+        events: &EventSink,
+    ) -> Result<(), AgentError> {
+        let mut has_tool_error = false;
+        let mut unknown_tools: Vec<String> = Vec::new();
+        let known_tools: Vec<String> = self
+            .tools
+            .active_definitions()
+            .into_iter()
+            .map(|definition| definition.name().to_string())
+            .collect();
+        for result in results {
+            let (call_id, call_name, tool_result) = result?;
+            let is_terminal_call = call_name == "terminal";
+            if !known_tools.iter().any(|name| *name == call_name)
+                && !unknown_tools.contains(&call_name)
+            {
+                unknown_tools.push(call_name.clone());
+            }
+            if let Some(transcript) = &self.transcript {
+                transcript.write_tool_result(&call_name, &tool_result).await;
+            }
+            events.emit(AgentEvent::ToolCallEnd {
+                id: call_id.clone(),
+                name: call_name.clone(),
+                result: tool_result.clone(),
+            });
+            if let Some(reason) = pause_reason_for_tool(call_name.as_str()) {
+                events.emit(AgentEvent::run_resumed(reason, call_id.clone()));
+            }
+            let content = tool_result.render_for_model()?;
+            has_tool_error |= tool_result_is_error(&tool_result, &content);
+            self.push_terminal_followup_events(is_terminal_call, &tool_result, &content, events);
+            self.context.push(Message::tool(&call_id, content));
+        }
+        let has_terminal_tool = known_tools.iter().any(|name| name == "terminal");
+        if has_terminal_tool && !unknown_tools.is_empty() {
+            // Terminal-first architecture: non-native capabilities are CLI
+            // commands, and models trained on native tool calling routinely
+            // reach for them as tools. Redirect immediately instead of letting
+            // the model retry the same wrong call.
+            for name in &unknown_tools {
+                self.context.insert_reminder(&SystemReminder {
+                    content: format!(
+                        "There is no native tool named '{name}'. This runtime is terminal-first: the only native tools are terminal, terminal_kill, terminal_input, and terminal_read; every other capability is a CLI command executed through the `terminal` tool. If '{name}' is a capability, run it as a command (check with `{name} --help`)."
+                    ),
+                });
+            }
+        } else if has_tool_error {
+            self.context.insert_reminder(&SystemReminder {
+                content: "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain terminal, terminal_kill, terminal_input, and terminal_read.".to_string(),
+            });
+        }
+        self.push_todo_followup(tool_names, old_todo_items);
+        self.push_completed_background_events(events);
+        Ok(())
+    }
+
+    fn push_terminal_followup_events(
+        &mut self,
+        is_terminal_call: bool,
+        tool_result: &aither_core::llm::ToolResult,
+        content: &str,
+        events: &EventSink,
+    ) {
+        if !is_terminal_call || tool_result.is_error() {
+            return;
+        }
+        if let Some(started) = Self::format_background_started_event(content) {
+            self.context.push(Message::system(&started.reminder));
+            events.emit(AgentEvent::background_task_started(
+                started.task_id,
+                started.output_preview,
+                started.output_file,
+                started.reason,
+            ));
+        }
+        if let Some(waiting) = Self::detect_terminal_input_needed(content) {
+            events.emit(AgentEvent::terminal_input_needed(
+                waiting.task_id,
+                waiting.notice,
+            ));
+        }
+    }
+
+    fn push_todo_followup(&mut self, tool_names: &[String], old_todo_items: &[TodoItem]) {
+        if !tool_names.iter().any(|name| name == "todo") {
+            return;
+        }
+        let new_items = self
+            .todo_list
+            .as_ref()
+            .map(super::todo::TodoList::items)
+            .unwrap_or_default();
+        let newly_completed = new_items.iter().find(|new_item| {
+            new_item.status == TodoStatus::Completed
+                && old_todo_items.iter().any(|old| {
+                    old.content == new_item.content && old.status != TodoStatus::Completed
+                })
+        });
+        let reminder = newly_completed
+            .and_then(|completed| self.format_next_task_reminder(&completed.content))
+            .or_else(|| self.format_todo_reminder());
+        if let Some(reminder) = reminder {
+            self.context.push(Message::system(&reminder));
+        }
+    }
+
+    fn push_completed_background_events(&mut self, events: &EventSink) {
+        if let Some(ref receiver) = self.background_receiver {
+            for task in receiver.take_completed() {
+                tracing::info!(task_id = %task.task_id, "background task completed");
+                let result_msg = Self::format_background_task_result(&task);
+                self.context.push(Message::system(&result_msg));
+                events.emit(AgentEvent::background_task_completed(
+                    task.task_id.clone(),
+                    result_msg,
+                ));
+            }
+        }
+    }
+
+    async fn push_turn_boundary_events(
+        &mut self,
+        run_id: &str,
+        turn: usize,
+        response_text: &str,
+        events: &EventSink,
+    ) -> Result<TurnControl, AgentError> {
+        let boundary_ctx = TurnBoundaryContext {
+            assistant_text: response_text,
+            turn,
+            message_count: self.context.len_recent(),
+        };
+        let checkpoint = self
+            .emit_checkpoint(CheckpointReason::TurnBoundary, response_text, turn)
+            .await?;
+        events.emit(AgentEvent::checkpoint(
+            run_id.to_string(),
+            CheckpointReason::TurnBoundary,
+            turn,
+            checkpoint.phase,
+            checkpoint.message_count,
+        ));
+        events.emit(AgentEvent::turn_complete(turn, true));
+        if self.hooks.on_turn_boundary(&boundary_ctx).await == TurnBoundaryAction::EndTurn {
+            Ok(TurnControl::Break {
+                final_text: response_text.to_string(),
+                stop_reason: StopReason::EndTurn,
+            })
+        } else {
+            Ok(TurnControl::Continue)
+        }
+    }
+
+    async fn collect_final_background_events(
+        &mut self,
+        run_id: &str,
+        iteration: usize,
+        events: &EventSink,
+    ) -> Result<bool, AgentError> {
+        let Some(receiver) = self.background_receiver.clone() else {
+            return Ok(false);
+        };
+        let mut had_completed = self.drain_background_receiver(&receiver, events);
+        let start = Instant::now();
+        while start.elapsed() < BACKGROUND_TASK_MAX_WAIT {
+            if let Some(task) = receiver.recv_timeout(BACKGROUND_TASK_POLL_INTERVAL).await {
+                tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
+                self.push_completed_task_event(task, events);
+                had_completed = true;
+            } else if !self
+                .background_receiver
+                .as_ref()
+                .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running)
+            {
+                break;
+            }
+        }
+        if !had_completed {
+            return Ok(false);
+        }
+        let outcome = self.run_agent_loop(run_id, iteration, events).await?;
+        self.push_stop_events(run_id, outcome, events).await?;
+        Ok(true)
+    }
+
+    fn drain_background_receiver(
+        &mut self,
+        receiver: &BackgroundTaskReceiver,
+        events: &EventSink,
+    ) -> bool {
+        let completed_tasks = receiver.take_completed();
+        let had_completed = !completed_tasks.is_empty();
+        for task in completed_tasks {
+            tracing::info!(task_id = %task.task_id, "background task completed (final check)");
+            self.push_completed_task_event(task, events);
+        }
+        had_completed
+    }
+
+    fn push_completed_task_event(
+        &mut self,
+        task: aither_sandbox::CompletedTask,
+        events: &EventSink,
+    ) {
+        let result_msg = Self::format_background_task_result(&task);
+        self.context.push(Message::system(&result_msg));
+        events.emit(AgentEvent::background_task_completed(
+            task.task_id,
+            result_msg,
+        ));
+    }
+
+    async fn push_stop_events(
+        &mut self,
+        run_id: &str,
+        outcome: RunLoopOutcome,
+        events: &EventSink,
+    ) -> Result<(), AgentError> {
+        let checkpoint = self
+            .emit_checkpoint(
+                CheckpointReason::Stop,
+                &outcome.final_text,
+                outcome.iteration,
+            )
+            .await?;
+        events.emit(AgentEvent::checkpoint(
+            run_id.to_string(),
+            CheckpointReason::Stop,
+            outcome.iteration,
+            checkpoint.phase,
+            checkpoint.message_count,
+        ));
+        let stop_ctx = StopContext {
+            final_text: &outcome.final_text,
+            turns: outcome.iteration,
+            reason: outcome.stop_reason,
+        };
+        if let Some(reason) = self.hooks.on_stop(&stop_ctx).await {
+            return Err(AgentError::HookRejected {
+                hook: "on_stop",
+                reason,
+            });
+        }
+        events.emit(AgentEvent::Complete {
+            final_text: outcome.final_text,
+            turns: outcome.iteration,
+        });
+        Ok(())
+    }
+
     /// Performs a one-shot query and returns the final response.
     ///
     /// This is the simplest way to use the agent. The agent handles tool
@@ -481,566 +1164,45 @@ where
     ///     }
     /// }
     /// ```
-    #[must_use]
     pub fn run(
         &mut self,
         prompt: &str,
-        attachments: impl IntoIterator<Item = url::Url>,
+        attachments: impl IntoIterator<Item = Attachment>,
     ) -> impl Stream<Item = Result<AgentEvent, AgentError>> + '_ {
         let prompt = prompt.to_string();
-        let attachments: Vec<url::Url> = attachments.into_iter().collect();
+        let attachments: Vec<Attachment> = attachments.into_iter().collect();
 
-        async_stream::try_stream! {
-            let run_id = uuid::Uuid::new_v4().to_string();
-            self.ensure_initialized().await;
-            yield AgentEvent::run_start(run_id.clone(), self.config.max_iterations);
-            #[cfg(feature = "skills")]
-            for event in self.activate_skills_for_prompt(&prompt) {
-                yield event;
-            }
-
-            // Apply context compression if needed
-            self.maybe_compress().await?;
-
-            // Add user message with attachments
-            let user_msg = Message::user(&prompt).with_attachments(attachments);
-            self.context.push(user_msg);
-            if let Some(transcript) = &self.transcript {
-                transcript.write_user_message(&prompt).await;
-            }
-
-            // Run the tool loop
-            let mut iteration = 0;
-            let mut all_text_chunks: Vec<String> = Vec::new();
-
-            let (final_text, stop_reason) = loop {
-                iteration += 1;
-                if iteration > self.config.max_iterations {
-                    Err(AgentError::MaxIterations {
-                        limit: self.config.max_iterations,
-                    })?;
-                }
-
-                // Build messages
-                let messages = self.build_live_request_messages().await;
-
-                // Create request with tool definitions
-                let tool_defs = self.tools.active_definitions();
-                let request = LLMRequest::new(messages).with_tool_definitions(tool_defs);
-
-                // Stream the response and yield text events as they arrive
-                let mut text_chunks: Vec<String> = Vec::new();
-                let mut tool_calls = Vec::new();
-                let mut malformed_function_call = false;
-                let mut error: Option<String> = None;
-
-                // Process stream based on tier
-                match self.tier {
-                    ModelTier::Advanced => {
-                        let stream = self.advanced.respond(request);
-                        futures_lite::pin!(stream);
-
-                        while let Some(event) = stream.next().await {
-                            match event {
-                                Ok(Event::Text(text)) => {
-                                    self.hooks.on_text(&text).await;
-                                    // Yield text event for streaming display
-                                    yield AgentEvent::Text(text.clone());
-                                    text_chunks.push(text);
-                                }
-                                Ok(Event::Reasoning(r)) => {
-                                    yield AgentEvent::Reasoning(r);
-                                }
-                                Ok(Event::ToolCallDelta { id, name, arguments_fragment }) => {
-                                    yield AgentEvent::ToolCallDelta { id, name, arguments_fragment };
-                                }
-                                Ok(Event::ToolCall(call)) => tool_calls.push(call),
-                                Ok(Event::BuiltInToolResult { tool, result }) => {
-                                    let formatted = format_builtin_tool_result(&tool, &result);
-                                    yield AgentEvent::Text(formatted.clone());
-                                    text_chunks.push(formatted);
-                                }
-                                Ok(Event::Usage(u)) => {
-                                    self.cache_stats.record(&u);
-                                    yield AgentEvent::Usage(u);
-                                }
-                                Err(e) => {
-                                    let error_msg = e.to_string();
-                                    if error_msg.contains("malformed function call") {
-                                        tracing::warn!("Model generated malformed function call, retrying...");
-                                        malformed_function_call = true;
-                                        break;
-                                    }
-                                    error = Some(error_msg);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    ModelTier::Balanced => {
-                        let stream = self.balanced.respond(request);
-                        futures_lite::pin!(stream);
-
-                        while let Some(event) = stream.next().await {
-                            match event {
-                                Ok(Event::Text(text)) => {
-                                    self.hooks.on_text(&text).await;
-                                    yield AgentEvent::Text(text.clone());
-                                    text_chunks.push(text);
-                                }
-                                Ok(Event::Reasoning(r)) => {
-                                    yield AgentEvent::Reasoning(r);
-                                }
-                                Ok(Event::ToolCallDelta { id, name, arguments_fragment }) => {
-                                    yield AgentEvent::ToolCallDelta { id, name, arguments_fragment };
-                                }
-                                Ok(Event::ToolCall(call)) => tool_calls.push(call),
-                                Ok(Event::BuiltInToolResult { tool, result }) => {
-                                    let formatted = format_builtin_tool_result(&tool, &result);
-                                    yield AgentEvent::Text(formatted.clone());
-                                    text_chunks.push(formatted);
-                                }
-                                Ok(Event::Usage(u)) => {
-                                    self.cache_stats.record(&u);
-                                    yield AgentEvent::Usage(u);
-                                }
-                                Err(e) => {
-                                    let error_msg = e.to_string();
-                                    if error_msg.contains("malformed function call") {
-                                        tracing::warn!("Model generated malformed function call, retrying...");
-                                        malformed_function_call = true;
-                                        break;
-                                    }
-                                    error = Some(error_msg);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    ModelTier::Fast => {
-                        let stream = self.fast.respond(request);
-                        futures_lite::pin!(stream);
-
-                        while let Some(event) = stream.next().await {
-                            match event {
-                                Ok(Event::Text(text)) => {
-                                    self.hooks.on_text(&text).await;
-                                    yield AgentEvent::Text(text.clone());
-                                    text_chunks.push(text);
-                                }
-                                Ok(Event::Reasoning(r)) => {
-                                    yield AgentEvent::Reasoning(r);
-                                }
-                                Ok(Event::ToolCallDelta { id, name, arguments_fragment }) => {
-                                    yield AgentEvent::ToolCallDelta { id, name, arguments_fragment };
-                                }
-                                Ok(Event::ToolCall(call)) => tool_calls.push(call),
-                                Ok(Event::BuiltInToolResult { tool, result }) => {
-                                    let formatted = format_builtin_tool_result(&tool, &result);
-                                    yield AgentEvent::Text(formatted.clone());
-                                    text_chunks.push(formatted);
-                                }
-                                Ok(Event::Usage(u)) => {
-                                    self.cache_stats.record(&u);
-                                    yield AgentEvent::Usage(u);
-                                }
-                                Err(e) => {
-                                    let error_msg = e.to_string();
-                                    if error_msg.contains("malformed function call") {
-                                        tracing::warn!("Model generated malformed function call, retrying...");
-                                        malformed_function_call = true;
-                                        break;
-                                    }
-                                    error = Some(error_msg);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let Some(e) = error {
-                    Err(AgentError::Llm(e))?;
-                }
-
-                // If malformed function call, retry this iteration
-                if malformed_function_call {
-                    continue;
-                }
-
-                let response_text = text_chunks.join("");
-                all_text_chunks.extend(text_chunks);
-                ensure_non_empty_tool_call_ids(&tool_calls, &response_text)?;
-
-                // If no tool calls, we're done unless working-doc supervision requires continuation.
-                if tool_calls.is_empty() {
-                    if !response_text.is_empty() {
-                        self.context.push(Message::assistant(&response_text));
-                        if let Some(transcript) = &self.transcript {
-                            transcript.write_assistant_text(&response_text).await;
-                        }
-                    }
-                    yield AgentEvent::turn_complete(iteration, false);
-                    if self.inject_working_doc_continue_reminder().await {
-                        continue;
-                    }
-                    break (response_text, StopReason::NoToolCalls);
-                }
-
-                // Store assistant response with tool calls in memory
-                self.context.push(Message::assistant_with_tool_calls(
-                    &response_text,
-                    tool_calls.clone(),
-                ));
-
-                // Snapshot todo state BEFORE executing tool calls
-                let old_todo_items: Vec<TodoItem> = self
-                    .todo_list
-                    .as_ref()
-                    .map(super::todo::TodoList::items)
-                    .unwrap_or_default();
-
-                // Track tool names for later todo detection
-                let tool_names: Vec<_> = tool_calls.iter().map(|c| c.name.clone()).collect();
-
-                // Yield tool call start events
-                for call in &tool_calls {
-                    let args = call.arguments.to_string();
-                    if let Some(transcript) = &self.transcript {
-                        transcript.write_tool_call(&call.name, &args).await;
-                    }
-                    yield AgentEvent::ToolCallStart {
-                        id: call.id.clone(),
-                        name: call.name.clone(),
-                        arguments: args,
-                    };
-                    if let Some(reason) = pause_reason_for_tool(call.name.as_str()) {
-                        yield AgentEvent::run_paused(reason, call.id.clone());
-                    }
-                }
-
-                // Execute tool calls in parallel
-                let tools = &self.tools;
-                let hooks = &self.hooks;
-                let permission_receiver = self.permission_receiver.clone();
-                let mut permission_pause_tracker = PermissionPauseTracker::from_tool_calls(&tool_calls);
-                let tool_futures = tool_calls.iter().map(|call| {
-                    let args_json = call.arguments.to_string();
-                    let message_count = self.context.len_recent();
-
-                    async move {
-                        let tool_ctx = ToolUseContext {
-                            tool_name: &call.name,
-                            arguments: &args_json,
-                            turn: iteration,
-                            message_count,
-                        };
-
-                        let (result, duration) = match hooks.pre_tool_use(&tool_ctx).await {
-                            PreToolAction::Abort(reason) => {
-                                return Err(AgentError::HookRejected {
-                                    hook: "pre_tool_use",
-                                    reason,
-                                });
-                            }
-                            PreToolAction::Deny(reason) => {
-                                (aither_core::llm::ToolResult::error(reason), Duration::ZERO)
-                            }
-                            PreToolAction::Allow => {
-                                let start = Instant::now();
-                                let result = match tools.call(&call.name, &args_json).await {
-                                    Ok(result) => result,
-                                    Err(error) => {
-                                        let error_text = error.to_string();
-                                        let mut message = String::from("Error: ");
-                                        message.push_str(error_text.as_str());
-                                        aither_core::llm::ToolResult::error(message)
-                                    }
-                                };
-                                (result, start.elapsed())
-                            }
-                        };
-
-                        let result_ctx = ToolResultContext {
-                            tool_name: &call.name,
-                            arguments: &args_json,
-                            result: &result,
-                            duration,
-                        };
-
-                        let tool_result = match hooks.post_tool_use(&result_ctx).await {
-                            PostToolAction::Abort(reason) => {
-                                return Err(AgentError::HookRejected {
-                                    hook: "post_tool_use",
-                                    reason,
-                                });
-                            }
-                            PostToolAction::Replace(replacement) => replacement,
-                            PostToolAction::Keep => result,
-                        };
-
-                        Ok((call.id.clone(), call.name.clone(), tool_result))
-                    }
-                });
-
-                enum ExecutionSignal {
-                    Tool(Result<(String, String, aither_core::llm::ToolResult), AgentError>),
-                    Permission(PermissionEvent),
-                }
-
-                let mut pending_tool_futures =
-                    tool_futures.collect::<futures::stream::FuturesUnordered<_>>();
-                let mut results = Vec::new();
-                while !pending_tool_futures.is_empty() {
-                    let next = match &permission_receiver {
-                        Some(receiver) => {
-                            futures_lite::future::or(
-                                async { pending_tool_futures.next().await.map(ExecutionSignal::Tool) },
-                                async { receiver.recv().await.map(ExecutionSignal::Permission) },
-                            )
-                            .await
-                        }
-                        None => pending_tool_futures.next().await.map(ExecutionSignal::Tool),
-                    };
-                    let Some(signal) = next else {
-                        break;
-                    };
-                    match signal {
-                        ExecutionSignal::Tool(result) => results.push(result),
-                        ExecutionSignal::Permission(event) => {
-                            if let Some((reason, tool_call_id)) =
-                                permission_pause_tracker.event_for(event.clone())
-                            {
-                                match event.stage {
-                                    PermissionEventStage::Waiting => {
-                                        yield AgentEvent::run_paused(reason, tool_call_id);
-                                    }
-                                    PermissionEventStage::Resolved => {
-                                        yield AgentEvent::run_resumed(reason, tool_call_id);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(receiver) = &permission_receiver {
-                    for event in receiver.take_pending() {
-                        if let Some((reason, tool_call_id)) =
-                            permission_pause_tracker.event_for(event.clone())
-                        {
-                            match event.stage {
-                                PermissionEventStage::Waiting => {
-                                    yield AgentEvent::run_paused(reason, tool_call_id);
-                                }
-                                PermissionEventStage::Resolved => {
-                                    yield AgentEvent::run_resumed(reason, tool_call_id);
-                                }
-                            }
-                        }
-                    }
-                }
-                drop(pending_tool_futures);
-
-                // Check if todo tool was called
-                let todo_tool_called = tool_names.iter().any(|name| name == "todo");
-
-                // Add results to memory and yield tool end events
-                let mut has_tool_error = false;
-                for result in results {
-                    let (call_id, call_name, tool_result) = result?;
-                    let is_terminal_call = call_name == "terminal";
-
-                    if let Some(transcript) = &self.transcript {
-                        transcript.write_tool_result(&call_name, &tool_result).await;
-                    }
-
-                    // Yield tool call end event
-                    yield AgentEvent::ToolCallEnd {
-                        id: call_id.clone(),
-                        name: call_name.clone(),
-                        result: tool_result.clone(),
-                    };
-                    if let Some(reason) = pause_reason_for_tool(call_name.as_str()) {
-                        yield AgentEvent::run_resumed(reason, call_id.clone());
-                    }
-
-                    let content = tool_result.render_for_model()?;
-
-                    if tool_result.is_error()
-                        || content.contains("ssh_server_id is required")
-                        || content.contains("unknown ssh_server_id")
-                        || content.contains("not found")
-                        || content.contains("Invalid arguments")
-                    {
-                        has_tool_error = true;
-                    }
-                    let processed_content = self.process_reload_marker(&content);
-                    self.context.push(Message::tool(&call_id, processed_content));
-                    if is_terminal_call
-                        && !tool_result.is_error()
-                        && let Some(started) = self.format_background_started_event(&content)
-                    {
-                        self.context.push(Message::system(&started.reminder));
-                        yield AgentEvent::background_task_started(
-                            started.task_id,
-                            started.output_preview,
-                            started.output_file,
-                            started.reason,
-                        );
-                    }
-                    if is_terminal_call
-                        && !tool_result.is_error()
-                        && let Some(waiting) = self.detect_terminal_input_needed(&content)
-                    {
-                        yield AgentEvent::terminal_input_needed(waiting.task_id, waiting.notice);
-                    }
-                }
-
-                // If there was a tool error, inject a reminder
-                if has_tool_error {
-                    self.context.insert_reminder(&SystemReminder {
-                        content: "A tool call failed. Re-assess the current state, inspect the latest tool result carefully, and choose the next action deliberately. Native tools remain terminal, terminal_kill, terminal_input, and terminal_read.".to_string(),
-                    });
-                }
-
-                // If todo tool was called, inject updated todo list
-                if todo_tool_called {
-                    let new_items = self
-                        .todo_list
-                        .as_ref()
-                        .map(super::todo::TodoList::items)
-                        .unwrap_or_default();
-
-                    let newly_completed: Vec<_> = new_items
-                        .iter()
-                        .filter(|new_item| {
-                            new_item.status == TodoStatus::Completed
-                                && old_todo_items.iter().any(|old| {
-                                    old.content == new_item.content
-                                        && old.status != TodoStatus::Completed
-                                })
-                        })
-                        .collect();
-
-                    if let Some(completed) = newly_completed.first() {
-                        if let Some(reminder) = self.format_next_task_reminder(&completed.content) {
-                            self.context.push(Message::system(&reminder));
-                        }
-                    } else if let Some(reminder) = self.format_todo_reminder() {
-                        self.context.push(Message::system(&reminder));
-                    }
-                }
-
-                // Poll for completed background tasks
-                if let Some(ref receiver) = self.background_receiver {
-                    let completed_tasks = receiver.take_completed();
-                    for task in completed_tasks {
-                        tracing::info!(task_id = %task.task_id, "background task completed");
-                        let result_msg = self.format_background_task_result(&task);
-                        self.context.push(Message::system(&result_msg));
-                        yield AgentEvent::background_task_completed(task.task_id.clone(), result_msg);
-                    }
-                }
-
-                let boundary_ctx = TurnBoundaryContext {
-                    assistant_text: &response_text,
-                    turn: iteration,
-                    message_count: self.context.len_recent(),
-                };
-                let checkpoint = self
-                    .emit_checkpoint(CheckpointReason::TurnBoundary, &response_text, iteration)
-                    .await?;
-                yield AgentEvent::checkpoint(
-                    run_id.clone(),
-                    CheckpointReason::TurnBoundary,
-                    iteration,
-                    checkpoint.phase,
-                    checkpoint.message_count,
-                );
-                yield AgentEvent::turn_complete(iteration, true);
-                if self.hooks.on_turn_boundary(&boundary_ctx).await == TurnBoundaryAction::EndTurn
-                {
-                    break (response_text, StopReason::EndTurn);
-                }
+        async_stream::stream! {
+            let (sender, receiver) = async_channel::unbounded();
+            let sink = EventSink { sender };
+            let run = async {
+                let result = self.run_streaming(prompt, attachments, &sink).await;
+                drop(sink);
+                result
             };
+            futures_lite::pin!(run);
 
-            // Handle background tasks before completing
-            if stop_reason != StopReason::EndTurn
-                && let Some(ref receiver) = self.background_receiver
-            {
-                let completed_tasks = receiver.take_completed();
-                let mut had_completed = !completed_tasks.is_empty();
-                for task in completed_tasks {
-                    tracing::info!(task_id = %task.task_id, "background task completed (final check)");
-                    let result_msg = self.format_background_task_result(&task);
-                    self.context.push(Message::system(&result_msg));
-                    yield AgentEvent::background_task_completed(task.task_id.clone(), result_msg);
-                }
-
-                const MAX_WAIT: Duration = Duration::from_secs(300);
-                const POLL_INTERVAL: Duration = Duration::from_millis(100);
-                let start = Instant::now();
-
-                while start.elapsed() < MAX_WAIT {
-                    if let Some(task) = receiver.recv_timeout(POLL_INTERVAL).await {
-                        tracing::info!(task_id = %task.task_id, "background task completed (waiting)");
-                        let result_msg = self.format_background_task_result(&task);
-                        self.context.push(Message::system(&result_msg));
-                        yield AgentEvent::background_task_completed(task.task_id.clone(), result_msg);
-                        had_completed = true;
-                    } else {
-                        let has_running = self
-                            .background_receiver
-                            .as_ref()
-                            .is_some_and(aither_sandbox::BackgroundTaskReceiver::has_running);
-                        if !has_running {
-                            break;
-                        }
-                    }
-                }
-
-                if had_completed {
-                    // Continue processing with background results
-                    let continuation = self
-                        .continue_after_background_streaming(run_id.as_str(), iteration)
-                        .await;
-                    for event in continuation {
-                        yield event?;
-                    }
-                    return;
+            let mut outcome = None;
+            while outcome.is_none() {
+                let step = futures_lite::future::or(
+                    async { RunStep::Event(receiver.recv().await.ok()) },
+                    async { RunStep::Finished((&mut run).await) },
+                )
+                .await;
+                match step {
+                    RunStep::Event(Some(event)) => yield Ok(event),
+                    // Sink dropped: the run is wrapping up — await its outcome.
+                    RunStep::Event(None) => outcome = Some((&mut run).await),
+                    RunStep::Finished(result) => outcome = Some(result),
                 }
             }
-
-            let checkpoint = self
-                .emit_checkpoint(CheckpointReason::Stop, &final_text, iteration)
-                .await?;
-            yield AgentEvent::checkpoint(
-                run_id.clone(),
-                CheckpointReason::Stop,
-                iteration,
-                checkpoint.phase,
-                checkpoint.message_count,
-            );
-
-            // Notify hooks
-            let stop_ctx = StopContext {
-                final_text: &final_text,
-                turns: iteration,
-                reason: stop_reason,
-            };
-
-            if let Some(reason) = self.hooks.on_stop(&stop_ctx).await {
-                Err(AgentError::HookRejected {
-                    hook: "on_stop",
-                    reason,
-                })?;
+            // Deliver events that raced with run completion.
+            while let Ok(event) = receiver.try_recv() {
+                yield Ok(event);
             }
-
-            // Yield completion event
-            yield AgentEvent::Complete {
-                final_text,
-                turns: iteration,
-            };
+            if let Some(Err(error)) = outcome {
+                yield Err(error);
+            }
         }
     }
 
@@ -1051,14 +1213,14 @@ where
 
     /// Returns a reference to the unified context manager.
     #[must_use]
-    pub fn context(&self) -> &Context {
+    pub const fn context(&self) -> &Context {
         &self.context
     }
 
     /// Returns a mutable reference to the unified context manager.
     ///
     /// Use this to insert/update system blocks, push messages, etc.
-    pub fn context_mut(&mut self) -> &mut Context {
+    pub const fn context_mut(&mut self) -> &mut Context {
         &mut self.context
     }
 
@@ -1103,6 +1265,16 @@ where
         &mut self.cache_stats
     }
 
+    /// Stops every terminal task that is still running for this agent.
+    ///
+    /// Returns the number of tasks that received a stop request.
+    pub async fn kill_running_terminal_jobs(&self) -> usize {
+        match &self.job_registry {
+            Some(job_registry) => job_registry.kill_running().await,
+            None => 0,
+        }
+    }
+
     /// Clears the conversation history.
     pub fn clear_history(&mut self) {
         self.context.clear_history();
@@ -1125,7 +1297,11 @@ where
         }
 
         let messages_compacted = messages.len();
-        let handoff = self.generate_handoff_document(focus).await?;
+        let mut handoff = self.generate_handoff_document(focus).await?;
+        // The file index is built mechanically from the conversation: prompting
+        // the model for it is unreliable, and missing entries directly cause
+        // post-compaction re-reads.
+        handoff.file_index = crate::handoff::build_file_index(&messages);
         let summary = handoff.render_markdown();
 
         if let Some(transcript) = &self.transcript {
@@ -1148,17 +1324,17 @@ where
         &self,
         focus: Option<&str>,
     ) -> Result<HandoffDocument, AgentError> {
-        let focus_instruction = match focus.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(f) => {
+        let focus_instruction = focus.map(str::trim).filter(|s| !s.is_empty()).map_or_else(
+            || "No additional focus hint was provided.".to_string(),
+            |f| {
                 let mut instruction = String::with_capacity(f.len() + 22);
                 instruction.push_str("Focus the handoff on: ");
                 instruction.push_str(f);
                 instruction
-            }
-            None => "No additional focus hint was provided.".to_string(),
-        };
+            },
+        );
         let handoff_prompt = include_str!("prompts/compact_handoff.txt")
-            .replace("{focus_instruction}", &focus_instruction);
+            .replace(FOCUS_INSTRUCTION_PLACEHOLDER, &focus_instruction);
 
         let mut messages = self.context.conversation_messages();
         messages.push(Message::user(handoff_prompt));
@@ -1261,6 +1437,10 @@ where
     }
 
     /// Export a checkpoint bundle for restart-safe persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when checkpoint construction or checkpoint hooks fail.
     pub async fn export_checkpoint(&mut self) -> Result<AgentCheckpoint, AgentError> {
         self.ensure_initialized().await;
         let context_window = self.snapshot_context_window().await;
@@ -1282,6 +1462,10 @@ where
     }
 
     /// Restore a previously exported checkpoint bundle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the checkpoint cannot be restored into this agent.
     pub fn restore_checkpoint(&mut self, checkpoint: AgentCheckpoint) -> Result<(), AgentError> {
         self.context.restore(checkpoint.context);
         if !checkpoint.todo_items.is_empty() {
@@ -1334,7 +1518,7 @@ where
         self.initialized = true;
     }
 
-    /// Populates the Context's system blocks from AgentConfig.
+    /// Populates the Context's system blocks from `AgentConfig`.
     ///
     /// Called once during initialization. These blocks form the stable
     /// cacheable prefix of the system message.
@@ -1423,6 +1607,7 @@ where
 
     #[cfg(feature = "skills")]
     pub(crate) fn activate_skills_for_prompt(&mut self, _prompt: &str) -> Vec<AgentEvent> {
+        let _ = self.skill_registry.as_ref();
         self.active_skills.clear();
         self.active_allowed_tools = None;
         Vec::new()
@@ -1475,15 +1660,16 @@ where
         }
     }
 
-    fn maybe_reassemble_after_idle_gap(&mut self) -> usize {
+    fn maybe_reassemble_after_idle_gap(&mut self) -> crate::context::ReassemblyReport {
+        let unchanged = crate::context::ReassemblyReport::default();
         if self.context.handoff().is_some() {
-            return 0;
+            return unchanged;
         }
         let Some(last_request_started_at) = self.last_request_started_at else {
-            return 0;
+            return unchanged;
         };
         if last_request_started_at.elapsed() < self.config.context_assembler.idle_reassemble_after {
-            return 0;
+            return unchanged;
         }
         self.reassemble_context()
     }
@@ -1518,7 +1704,6 @@ where
         }
 
         match &self.config.context {
-            ContextStrategy::Unlimited => ContextWindowPhase::Stable,
             ContextStrategy::Smart(config)
                 if metrics.usage_fraction >= config.effective_trigger()
                     && metrics.recent_system_message_count > 0 =>
@@ -1526,12 +1711,11 @@ where
                 ContextWindowPhase::ReassemblyDue
             }
             ContextStrategy::Smart(config)
-                if metrics.usage_fraction >= config.effective_trigger()
-                    && metrics.recent_message_count > config.preserve_recent =>
+                if metrics.usage_fraction >= config.effective_trigger() =>
             {
                 ContextWindowPhase::CompressionDue
             }
-            ContextStrategy::Smart(_) => ContextWindowPhase::Stable,
+            ContextStrategy::Unlimited | ContextStrategy::Smart(_) => ContextWindowPhase::Stable,
         }
     }
 
@@ -1554,7 +1738,7 @@ where
     pub async fn preview_request_messages(
         &mut self,
         prompt: &str,
-        attachments: impl IntoIterator<Item = url::Url>,
+        attachments: impl IntoIterator<Item = Attachment>,
     ) -> Vec<Message> {
         self.ensure_initialized().await;
         // Fork context, add the user message, build messages
@@ -1600,377 +1784,6 @@ where
         lines.join("\n")
     }
 
-    /// Continues agent processing after background tasks complete (streaming version).
-    async fn continue_after_background_streaming(
-        &mut self,
-        run_id: &str,
-        turn_offset: usize,
-    ) -> Vec<Result<AgentEvent, AgentError>> {
-        let mut events = Vec::new();
-        let mut iteration = 0;
-
-        loop {
-            iteration += 1;
-            let turns = turn_offset + iteration;
-            if turns > self.config.max_iterations {
-                events.push(Err(AgentError::MaxIterations {
-                    limit: self.config.max_iterations,
-                }));
-                return events;
-            }
-
-            let messages = self.build_live_request_messages().await;
-            let tool_defs = self.tools.active_definitions();
-            let request = LLMRequest::new(messages).with_tool_definitions(tool_defs);
-
-            let mut text_chunks = Vec::new();
-            let mut tool_calls = Vec::new();
-            let mut error: Option<String> = None;
-
-            // Process stream based on tier
-            match self.tier {
-                ModelTier::Advanced => {
-                    let stream = self.advanced.respond(request);
-                    futures_lite::pin!(stream);
-                    while let Some(event) = stream.next().await {
-                        match event {
-                            Ok(Event::Text(text)) => {
-                                self.hooks.on_text(&text).await;
-                                events.push(Ok(AgentEvent::Text(text.clone())));
-                                text_chunks.push(text);
-                            }
-                            Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
-                            Ok(Event::ToolCallDelta {
-                                id,
-                                name,
-                                arguments_fragment,
-                            }) => {
-                                events.push(Ok(AgentEvent::ToolCallDelta {
-                                    id,
-                                    name,
-                                    arguments_fragment,
-                                }));
-                            }
-                            Ok(Event::ToolCall(call)) => tool_calls.push(call),
-                            Ok(Event::BuiltInToolResult { tool, result }) => {
-                                let formatted = format_builtin_tool_result(&tool, &result);
-                                events.push(Ok(AgentEvent::Text(formatted.clone())));
-                                text_chunks.push(formatted);
-                            }
-                            Ok(Event::Usage(u)) => {
-                                self.cache_stats.record(&u);
-                                events.push(Ok(AgentEvent::Usage(u)));
-                            }
-                            Err(e) => {
-                                error = Some(e.to_string());
-                                break;
-                            }
-                        }
-                    }
-                }
-                ModelTier::Balanced => {
-                    let stream = self.balanced.respond(request);
-                    futures_lite::pin!(stream);
-                    while let Some(event) = stream.next().await {
-                        match event {
-                            Ok(Event::Text(text)) => {
-                                self.hooks.on_text(&text).await;
-                                events.push(Ok(AgentEvent::Text(text.clone())));
-                                text_chunks.push(text);
-                            }
-                            Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
-                            Ok(Event::ToolCallDelta {
-                                id,
-                                name,
-                                arguments_fragment,
-                            }) => {
-                                events.push(Ok(AgentEvent::ToolCallDelta {
-                                    id,
-                                    name,
-                                    arguments_fragment,
-                                }));
-                            }
-                            Ok(Event::ToolCall(call)) => tool_calls.push(call),
-                            Ok(Event::BuiltInToolResult { tool, result }) => {
-                                let formatted = format_builtin_tool_result(&tool, &result);
-                                events.push(Ok(AgentEvent::Text(formatted.clone())));
-                                text_chunks.push(formatted);
-                            }
-                            Ok(Event::Usage(u)) => {
-                                self.cache_stats.record(&u);
-                                events.push(Ok(AgentEvent::Usage(u)));
-                            }
-                            Err(e) => {
-                                error = Some(e.to_string());
-                                break;
-                            }
-                        }
-                    }
-                }
-                ModelTier::Fast => {
-                    let stream = self.fast.respond(request);
-                    futures_lite::pin!(stream);
-                    while let Some(event) = stream.next().await {
-                        match event {
-                            Ok(Event::Text(text)) => {
-                                self.hooks.on_text(&text).await;
-                                events.push(Ok(AgentEvent::Text(text.clone())));
-                                text_chunks.push(text);
-                            }
-                            Ok(Event::Reasoning(r)) => events.push(Ok(AgentEvent::Reasoning(r))),
-                            Ok(Event::ToolCallDelta {
-                                id,
-                                name,
-                                arguments_fragment,
-                            }) => {
-                                events.push(Ok(AgentEvent::ToolCallDelta {
-                                    id,
-                                    name,
-                                    arguments_fragment,
-                                }));
-                            }
-                            Ok(Event::ToolCall(call)) => tool_calls.push(call),
-                            Ok(Event::BuiltInToolResult { tool, result }) => {
-                                let formatted = format_builtin_tool_result(&tool, &result);
-                                events.push(Ok(AgentEvent::Text(formatted.clone())));
-                                text_chunks.push(formatted);
-                            }
-                            Ok(Event::Usage(u)) => {
-                                self.cache_stats.record(&u);
-                                events.push(Ok(AgentEvent::Usage(u)));
-                            }
-                            Err(e) => {
-                                error = Some(e.to_string());
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Some(e) = error {
-                events.push(Err(AgentError::Llm(e)));
-                return events;
-            }
-
-            let response_text = text_chunks.join("");
-            if let Err(error) = ensure_non_empty_tool_call_ids(&tool_calls, &response_text) {
-                events.push(Err(error));
-                return events;
-            }
-
-            if tool_calls.is_empty() {
-                if !response_text.is_empty() {
-                    self.context.push(Message::assistant(&response_text));
-                }
-                let checkpoint = match self
-                    .emit_checkpoint(CheckpointReason::Stop, &response_text, turns)
-                    .await
-                {
-                    Ok(checkpoint) => checkpoint,
-                    Err(error) => {
-                        events.push(Err(error));
-                        return events;
-                    }
-                };
-                events.push(Ok(AgentEvent::checkpoint(
-                    run_id.to_string(),
-                    CheckpointReason::Stop,
-                    turns,
-                    checkpoint.phase,
-                    checkpoint.message_count,
-                )));
-                events.push(Ok(AgentEvent::turn_complete(turns, false)));
-                let stop_ctx = StopContext {
-                    final_text: &response_text,
-                    turns,
-                    reason: StopReason::NoToolCalls,
-                };
-                if let Some(reason) = self.hooks.on_stop(&stop_ctx).await {
-                    events.push(Err(AgentError::HookRejected {
-                        hook: "on_stop",
-                        reason,
-                    }));
-                    return events;
-                }
-                events.push(Ok(AgentEvent::Complete {
-                    final_text: response_text,
-                    turns,
-                }));
-                return events;
-            }
-
-            self.context.push(Message::assistant_with_tool_calls(
-                &response_text,
-                tool_calls.clone(),
-            ));
-
-            for call in &tool_calls {
-                let args = call.arguments.to_string();
-                events.push(Ok(AgentEvent::ToolCallStart {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: args,
-                }));
-                if let Some(reason) = pause_reason_for_tool(call.name.as_str()) {
-                    events.push(Ok(AgentEvent::run_paused(reason, call.id.clone())));
-                }
-            }
-
-            // Execute tool calls
-            let tools = &self.tools;
-            let permission_receiver = self.permission_receiver.clone();
-            let mut permission_pause_tracker = PermissionPauseTracker::from_tool_calls(&tool_calls);
-            let tool_futures = tool_calls.iter().map(|call| {
-                let args_json = call.arguments.to_string();
-                async move {
-                    let result = match tools.call(&call.name, &args_json).await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            let error_text = error.to_string();
-                            let mut text = String::from("Error: ");
-                            text.push_str(error_text.as_str());
-                            aither_core::llm::ToolResult::error(text)
-                        }
-                    };
-                    (call.id.clone(), call.name.clone(), result)
-                }
-            });
-
-            enum ExecutionSignal {
-                Tool((String, String, aither_core::llm::ToolResult)),
-                Permission(PermissionEvent),
-            }
-
-            let mut pending_tool_futures =
-                tool_futures.collect::<futures::stream::FuturesUnordered<_>>();
-            let mut results = Vec::new();
-            while !pending_tool_futures.is_empty() {
-                let next = match &permission_receiver {
-                    Some(receiver) => {
-                        futures_lite::future::or(
-                            async { pending_tool_futures.next().await.map(ExecutionSignal::Tool) },
-                            async { receiver.recv().await.map(ExecutionSignal::Permission) },
-                        )
-                        .await
-                    }
-                    None => pending_tool_futures.next().await.map(ExecutionSignal::Tool),
-                };
-                let Some(signal) = next else {
-                    break;
-                };
-                match signal {
-                    ExecutionSignal::Tool(result) => results.push(result),
-                    ExecutionSignal::Permission(event) => {
-                        if let Some((reason, tool_call_id)) =
-                            permission_pause_tracker.event_for(event.clone())
-                        {
-                            match event.stage {
-                                PermissionEventStage::Waiting => {
-                                    events.push(Ok(AgentEvent::run_paused(reason, tool_call_id)));
-                                }
-                                PermissionEventStage::Resolved => {
-                                    events.push(Ok(AgentEvent::run_resumed(reason, tool_call_id)));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if let Some(receiver) = &permission_receiver {
-                for event in receiver.take_pending() {
-                    if let Some((reason, tool_call_id)) =
-                        permission_pause_tracker.event_for(event.clone())
-                    {
-                        match event.stage {
-                            PermissionEventStage::Waiting => {
-                                events.push(Ok(AgentEvent::run_paused(reason, tool_call_id)));
-                            }
-                            PermissionEventStage::Resolved => {
-                                events.push(Ok(AgentEvent::run_resumed(reason, tool_call_id)));
-                            }
-                        }
-                    }
-                }
-            }
-            drop(pending_tool_futures);
-
-            for (call_id, call_name, tool_result) in results {
-                if let Some(reason) = pause_reason_for_tool(call_name.as_str()) {
-                    events.push(Ok(AgentEvent::run_resumed(reason, call_id.clone())));
-                }
-                let is_terminal_call = call_name == "terminal";
-                events.push(Ok(AgentEvent::ToolCallEnd {
-                    id: call_id.clone(),
-                    name: call_name,
-                    result: tool_result.clone(),
-                }));
-                let content = match tool_result.render_for_model() {
-                    Ok(content) => content,
-                    Err(error) => {
-                        events.push(Err(error.into()));
-                        return events;
-                    }
-                };
-                let processed_content = self.process_reload_marker(&content);
-                self.context
-                    .push(Message::tool(&call_id, processed_content));
-                if is_terminal_call
-                    && !tool_result.is_error()
-                    && let Some(started) = self.format_background_started_event(&content)
-                {
-                    self.context.push(Message::system(&started.reminder));
-                    events.push(Ok(AgentEvent::background_task_started(
-                        started.task_id,
-                        started.output_preview,
-                        started.output_file,
-                        started.reason,
-                    )));
-                }
-                if is_terminal_call
-                    && !tool_result.is_error()
-                    && let Some(waiting) = self.detect_terminal_input_needed(&content)
-                {
-                    events.push(Ok(AgentEvent::terminal_input_needed(
-                        waiting.task_id,
-                        waiting.notice,
-                    )));
-                }
-            }
-
-            if let Some(ref receiver) = self.background_receiver {
-                let completed_tasks = receiver.take_completed();
-                for task in completed_tasks {
-                    let result_msg = self.format_background_task_result(&task);
-                    self.context.push(Message::system(&result_msg));
-                    events.push(Ok(AgentEvent::background_task_completed(
-                        task.task_id.clone(),
-                        result_msg,
-                    )));
-                }
-            }
-
-            let checkpoint = match self
-                .emit_checkpoint(CheckpointReason::TurnBoundary, &response_text, turns)
-                .await
-            {
-                Ok(checkpoint) => checkpoint,
-                Err(error) => {
-                    events.push(Err(error));
-                    return events;
-                }
-            };
-            events.push(Ok(AgentEvent::checkpoint(
-                run_id.to_string(),
-                CheckpointReason::TurnBoundary,
-                turns,
-                checkpoint.phase,
-                checkpoint.message_count,
-            )));
-            events.push(Ok(AgentEvent::turn_complete(turns, true)));
-        }
-    }
-
     /// Compresses context if needed.
     ///
     /// Considers BOTH the selected tier's context window AND the fast model's
@@ -1981,43 +1794,70 @@ where
     /// Uses `effective_trigger()` which accounts for a 20% context reservation
     /// to ensure there's room for the fast LLM during compaction.
     ///
-    /// When an `OutputStore` is available, uses lazy URL allocation:
-    /// 1. Allocates URLs for large tool outputs before compression
-    /// 2. Lets the fast LLM decide which URLs to reference in the summary
-    /// 3. Only writes files for URLs actually referenced in the summary
     async fn maybe_compress(&mut self) -> Result<(), AgentError> {
         self.ensure_initialized().await;
-        let mut snapshot = self.assemble_context_window().await;
+        let snapshot = self.assemble_context_window().await;
         let context_strategy = self.config.context.clone();
 
         match context_strategy {
             ContextStrategy::Unlimited => Ok(()),
             ContextStrategy::Smart(config) => {
-                if snapshot.phase == ContextWindowPhase::ReassemblyDue {
-                    let _ = self.reassemble_context();
-                    snapshot = self.assemble_context_window().await;
+                if !matches!(
+                    snapshot.phase,
+                    ContextWindowPhase::ReassemblyDue | ContextWindowPhase::CompressionDue
+                ) {
+                    return Ok(());
                 }
-                if snapshot.phase == ContextWindowPhase::CompressionDue {
-                    let preserve_recent = config.preserve_recent;
-                    if self.context.len_recent() > preserve_recent {
-                        let _ = self.compact(None).await?;
+
+                // Reassembly alone is preferred only when it frees enough of
+                // the window to leave the danger zone; a marginal saving is
+                // not worth the cache invalidation on top of a compaction
+                // that would follow anyway.
+                use num_traits::ToPrimitive as _;
+                let window = self.effective_context_window();
+                let savings_tokens = self.context.estimate_reassembly_savings() / 4;
+                let savings_fraction =
+                    savings_tokens.to_f32().unwrap_or(0.0) / window.to_f32().unwrap_or(f32::MAX);
+                let usage_after_reassembly = snapshot.metrics.usage_fraction - savings_fraction;
+
+                if usage_after_reassembly < config.effective_trigger() {
+                    let report = self.reassemble_context();
+                    tracing::debug!(
+                        reminders = report.reminders_cleared,
+                        system_messages = report.system_messages_pruned,
+                        deduped = report.tool_results_deduped,
+                        bytes_freed = report.bytes_freed,
+                        "context reassembly freed enough window; compaction skipped"
+                    );
+                    return Ok(());
+                }
+
+                if self.context.len_recent() > config.preserve_recent {
+                    // Compress directly; if compaction itself fails (for
+                    // example the compaction request overflows the window),
+                    // fall back to reassembly and retry once.
+                    if let Err(error) = self.compact(None).await {
+                        let report = self.reassemble_context();
+                        if !report.changed() {
+                            return Err(error);
+                        }
+                        tracing::warn!(
+                            %error,
+                            bytes_freed = report.bytes_freed,
+                            "compaction failed; retrying after context reassembly"
+                        );
+                        self.compact(None).await?;
                     }
+                } else {
+                    let _ = self.reassemble_context();
                 }
                 Ok(())
             }
         }
     }
 
-    /// Processes a tool result (currently passthrough).
-    ///
-    /// Previously handled reload markers, now just returns the content as-is.
-    fn process_reload_marker(&self, result: &str) -> String {
-        result.to_string()
-    }
-
-    fn reassemble_context(&mut self) -> usize {
-        self.context.clear_reminders();
-        self.context.prune_recent_system_messages()
+    fn reassemble_context(&mut self) -> crate::context::ReassemblyReport {
+        self.context.reassemble()
     }
 
     async fn emit_checkpoint(
@@ -2094,10 +1934,7 @@ where
     }
 
     /// Formats a reminder and event payload when `terminal` has been auto-promoted to background.
-    fn format_background_started_event(
-        &self,
-        tool_content: &str,
-    ) -> Option<BackgroundTaskStartedEvent> {
+    fn format_background_started_event(tool_content: &str) -> Option<BackgroundTaskStartedEvent> {
         let payload: serde_json::Value = serde_json::from_str(tool_content).ok()?;
         let status = payload.get("status")?.as_str()?;
         if status != "running" {
@@ -2147,7 +1984,7 @@ where
         })
     }
 
-    fn detect_terminal_input_needed(&self, tool_content: &str) -> Option<TerminalInputNeededEvent> {
+    fn detect_terminal_input_needed(tool_content: &str) -> Option<TerminalInputNeededEvent> {
         let payload: aither_sandbox::TerminalResult = serde_json::from_str(tool_content).ok()?;
         if payload.status.as_deref() != Some("running") {
             return None;
@@ -2174,7 +2011,7 @@ where
     }
 
     /// Formats a completed background task result as a system message.
-    fn format_background_task_result(&self, task: &aither_sandbox::CompletedTask) -> String {
+    fn format_background_task_result(task: &aither_sandbox::CompletedTask) -> String {
         let mut xml = BackgroundTerminalResultXml {
             task_id: task.task_id.clone(),
             script: truncate_script(&task.script, 100).to_string(),
@@ -2216,21 +2053,28 @@ where
             .iter()
             .find(|item| matches!(item.status, TodoStatus::Pending | TodoStatus::InProgress));
 
-        if let Some(task) = next_task {
-            NextTaskReminderTemplate {
-                completed_task,
-                next_task: &task.content,
-                active_form: &task.active_form,
-            }
-            .render()
-            .ok()
-        } else if items.iter().all(|i| i.status == TodoStatus::Completed) {
-            AllTasksCompleteReminderTemplate { completed_task }
+        next_task.map_or_else(
+            || {
+                items
+                    .iter()
+                    .all(|i| i.status == TodoStatus::Completed)
+                    .then(|| {
+                        AllTasksCompleteReminderTemplate { completed_task }
+                            .render()
+                            .ok()
+                    })
+                    .flatten()
+            },
+            |task| {
+                NextTaskReminderTemplate {
+                    completed_task,
+                    next_task: &task.content,
+                    active_form: &task.active_form,
+                }
                 .render()
                 .ok()
-        } else {
-            None
-        }
+            },
+        )
     }
 }
 
@@ -2256,9 +2100,10 @@ fn permission_event_key_for_call(
     }
     let args: TerminalArgs = serde_json::from_value(arguments.clone()).ok()?;
     let mode = match args.mode {
-        TerminalExecutionMode::Sandboxed => return None,
+        TerminalExecutionMode::Sandboxed
+        | TerminalExecutionMode::Default
+        | TerminalExecutionMode::Ssh => return None,
         TerminalExecutionMode::Unsafe => TerminalMode::Unsafe,
-        TerminalExecutionMode::Default | TerminalExecutionMode::Ssh => TerminalMode::Network,
     };
     Some(PermissionEventKey {
         mode,
@@ -2272,6 +2117,31 @@ fn pause_reason_for_tool(tool_name: &str) -> Option<RunPauseReason> {
         "request_workspace" => Some(RunPauseReason::WorkspaceRequest),
         _ => None,
     }
+}
+
+fn emit_permission_event(
+    tracker: &mut PermissionPauseTracker,
+    event: &PermissionEvent,
+    events: &EventSink,
+) {
+    if let Some((reason, tool_call_id)) = tracker.event_for(event.clone()) {
+        match event.stage {
+            PermissionEventStage::Waiting => {
+                events.emit(AgentEvent::run_paused(reason, tool_call_id));
+            }
+            PermissionEventStage::Resolved => {
+                events.emit(AgentEvent::run_resumed(reason, tool_call_id));
+            }
+        }
+    }
+}
+
+fn tool_result_is_error(tool_result: &aither_core::llm::ToolResult, content: &str) -> bool {
+    tool_result.is_error()
+        || content.contains("ssh_server_id is required")
+        || content.contains("unknown ssh_server_id")
+        || content.contains("not found")
+        || content.contains("Invalid arguments")
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -2314,6 +2184,7 @@ mod tests {
     use futures_core::Stream;
 
     use crate::compression::{CompressionLevel, PreserveConfig, SmartCompressionConfig};
+    use crate::config::ContextAssemblerConfig;
     #[cfg(feature = "skills")]
     use crate::{AgentCheckpoint, ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
     #[cfg(feature = "skills")]
@@ -2360,176 +2231,153 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "skills")]
-    #[derive(Clone)]
-    struct ScriptedLlm {
-        context_length: u32,
-        events: Vec<Event>,
-    }
-
-    #[cfg(feature = "skills")]
-    impl LanguageModel for ScriptedLlm {
-        type Error = MockError;
-
-        fn respond(
-            &self,
-            _request: LLMRequest,
-        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
-            futures_lite::stream::iter(self.events.clone().into_iter().map(Ok))
-        }
-
-        async fn profile(&self) -> ModelProfile {
-            ModelProfile::new(
-                "mock",
-                "test",
-                "mock-model",
-                "mock model",
-                self.context_length,
-            )
-        }
-    }
-
-    #[test]
-    fn snapshot_phase_accounts_for_system_blocks() {
-        futures_lite::future::block_on(async {
-            let mut config = AgentConfig::default();
-            config.system_prompt = Some("x".repeat(120));
-            config.context = ContextStrategy::Smart(SmartCompressionConfig {
+    #[tokio::test]
+    async fn snapshot_phase_accounts_for_system_blocks() {
+        let config = AgentConfig {
+            system_prompt: Some("x".repeat(120)),
+            context: ContextStrategy::Smart(SmartCompressionConfig {
                 trigger_threshold: 0.4,
                 emergency_threshold: 0.9,
                 preserve_recent: 0,
                 preserve: PreserveConfig::default(),
                 level: CompressionLevel::Standard,
-            });
-            config.context_assembler.handoff_threshold = 10.0;
+            }),
+            context_assembler: ContextAssemblerConfig {
+                handoff_threshold: 10.0,
+                ..ContextAssemblerConfig::default()
+            },
+            ..AgentConfig::default()
+        };
 
-            let mut agent = Agent::with_config(
-                MockLlm {
-                    context_length: 100,
-                },
-                config,
-            );
-            agent.push_message(Message::user("hello"));
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 100,
+            },
+            config,
+        );
+        agent.push_message(Message::user("hello"));
 
-            let snapshot = agent.snapshot_context_window().await;
+        let snapshot = agent.snapshot_context_window().await;
 
-            assert_eq!(snapshot.phase, ContextWindowPhase::CompressionDue);
-            assert!(snapshot.metrics.system_block_count > 0);
-            assert!(snapshot.metrics.usage_fraction >= 0.4);
-            assert_eq!(snapshot.metrics.recent_message_count, 1);
-        });
+        assert_eq!(snapshot.phase, ContextWindowPhase::CompressionDue);
+        assert!(snapshot.metrics.system_block_count > 0);
+        assert!(snapshot.metrics.usage_fraction >= 0.4);
+        assert_eq!(snapshot.metrics.recent_message_count, 1);
     }
 
-    #[test]
-    fn snapshot_phase_reports_handoff_active() {
-        futures_lite::future::block_on(async {
-            let mut agent = Agent::new(MockLlm {
-                context_length: 1_000,
-            });
-            agent.context_mut().set_handoff("resume here");
-
-            let snapshot = agent.snapshot_context_window().await;
-
-            assert_eq!(snapshot.phase, ContextWindowPhase::HandoffActive);
-            assert!(snapshot.metrics.has_handoff);
+    #[tokio::test]
+    async fn snapshot_phase_reports_handoff_active() {
+        let mut agent = Agent::new(MockLlm {
+            context_length: 1_000,
         });
+        agent.context_mut().set_handoff("resume here");
+
+        let snapshot = agent.snapshot_context_window().await;
+
+        assert_eq!(snapshot.phase, ContextWindowPhase::HandoffActive);
+        assert!(snapshot.metrics.has_handoff);
     }
 
-    #[test]
-    fn handoff_due_does_not_trigger_automatic_compaction() {
-        futures_lite::future::block_on(async {
-            let mut config = AgentConfig::default();
-            config.system_prompt = Some("x".repeat(120));
-            config.context = ContextStrategy::Smart(SmartCompressionConfig {
+    #[tokio::test]
+    async fn handoff_due_does_not_trigger_automatic_compaction() {
+        let config = AgentConfig {
+            system_prompt: Some("x".repeat(120)),
+            context: ContextStrategy::Smart(SmartCompressionConfig {
                 trigger_threshold: 0.2,
                 emergency_threshold: 0.9,
                 preserve_recent: 0,
                 preserve: PreserveConfig::default(),
                 level: CompressionLevel::Standard,
-            });
-            config.context_assembler.handoff_threshold = 0.1;
+            }),
+            context_assembler: ContextAssemblerConfig {
+                handoff_threshold: 0.1,
+                ..ContextAssemblerConfig::default()
+            },
+            ..AgentConfig::default()
+        };
 
-            let mut agent = Agent::with_config(
-                MockLlm {
-                    context_length: 100,
-                },
-                config,
-            );
-            agent.push_message(Message::user("hello"));
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 100,
+            },
+            config,
+        );
+        agent.push_message(Message::user("hello"));
 
-            let before_recent = agent.context().len_recent();
-            agent.maybe_compress().await.unwrap_or_else(|error| {
-                panic!("handoff_due must not compact automatically: {error}")
-            });
+        let before_recent = agent.context().len_recent();
+        agent
+            .maybe_compress()
+            .await
+            .unwrap_or_else(|error| panic!("handoff_due must not compact automatically: {error}"));
 
-            assert_eq!(agent.context().len_recent(), before_recent);
-            assert!(agent.context().handoff().is_none());
-        });
+        assert_eq!(agent.context().len_recent(), before_recent);
+        assert!(agent.context().handoff().is_none());
     }
 
-    #[test]
-    fn reassembly_due_prunes_recent_system_messages_before_compaction() {
-        futures_lite::future::block_on(async {
-            let mut config = AgentConfig::default();
-            config.context = ContextStrategy::Smart(SmartCompressionConfig {
+    #[tokio::test]
+    async fn reassembly_due_prunes_recent_system_messages_before_compaction() {
+        let config = AgentConfig {
+            context: ContextStrategy::Smart(SmartCompressionConfig {
                 trigger_threshold: 0.05,
                 emergency_threshold: 0.9,
                 preserve_recent: 100,
                 preserve: PreserveConfig::default(),
                 level: CompressionLevel::Standard,
-            });
-            config.context_assembler.handoff_threshold = 10.0;
+            }),
+            context_assembler: ContextAssemblerConfig {
+                handoff_threshold: 10.0,
+                ..ContextAssemblerConfig::default()
+            },
+            ..AgentConfig::default()
+        };
 
-            let mut agent = Agent::with_config(
-                MockLlm {
-                    context_length: 100,
-                },
-                config,
-            );
-            agent.push_message(Message::user("hello"));
-            agent.push_message(Message::system(
-                "<system-reminder>ephemeral</system-reminder>",
-            ));
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 100,
+            },
+            config,
+        );
+        agent.push_message(Message::user("hello"));
+        agent.push_message(Message::system(
+            "<system-reminder>ephemeral</system-reminder>",
+        ));
 
-            let snapshot = agent.snapshot_context_window().await;
-            assert_eq!(snapshot.phase, ContextWindowPhase::ReassemblyDue);
+        let snapshot = agent.snapshot_context_window().await;
+        assert_eq!(snapshot.phase, ContextWindowPhase::ReassemblyDue);
 
-            agent
-                .maybe_compress()
-                .await
-                .unwrap_or_else(|error| panic!("reassembly_due must not fail: {error}"));
+        agent
+            .maybe_compress()
+            .await
+            .unwrap_or_else(|error| panic!("reassembly_due must not fail: {error}"));
 
-            assert_eq!(agent.context().count_recent_system_messages(), 0);
-            assert_eq!(agent.context().len_recent(), 1);
-            assert_eq!(agent.context().recent()[0].content(), "hello");
-        });
+        assert_eq!(agent.context().count_recent_system_messages(), 0);
+        assert_eq!(agent.context().len_recent(), 1);
+        assert_eq!(agent.context().recent()[0].content(), "hello");
     }
 
-    #[test]
-    fn idle_gap_reassembles_before_next_live_request() {
-        futures_lite::future::block_on(async {
-            let mut config = AgentConfig::default();
-            config.context_assembler.idle_reassemble_after = Duration::from_secs(1);
+    #[tokio::test]
+    async fn idle_gap_reassembles_before_next_live_request() {
+        let mut config = AgentConfig::default();
+        config.context_assembler.idle_reassemble_after = Duration::from_secs(1);
 
-            let mut agent = Agent::with_config(
-                MockLlm {
-                    context_length: 1_000,
-                },
-                config,
-            );
-            agent.push_message(Message::user("hello"));
-            agent.push_message(Message::system(
-                "<system-reminder>ephemeral</system-reminder>",
-            ));
-            agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(5));
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 1_000,
+            },
+            config,
+        );
+        agent.push_message(Message::user("hello"));
+        agent.push_message(Message::system(
+            "<system-reminder>ephemeral</system-reminder>",
+        ));
+        agent.last_request_started_at = Instant::now().checked_sub(Duration::from_secs(5));
 
-            let _ = agent.build_live_request_messages().await;
+        let _ = agent.build_live_request_messages().await;
 
-            assert_eq!(agent.context().count_recent_system_messages(), 0);
-            assert_eq!(agent.context().len_recent(), 1);
-            assert_eq!(agent.context().recent()[0].content(), "hello");
-            assert!(agent.last_request_started_at.is_some());
-        });
+        assert_eq!(agent.context().count_recent_system_messages(), 0);
+        assert_eq!(agent.context().len_recent(), 1);
+        assert_eq!(agent.context().recent()[0].content(), "hello");
+        assert!(agent.last_request_started_at.is_some());
     }
 
     #[test]
@@ -2571,13 +2419,12 @@ mod tests {
         })
         .expect("sandboxed args should serialize");
 
-        let default_key = permission_event_key_for_call("terminal", &default_args)
-            .expect("default terminal mode should require permission routing");
         let unsafe_key = permission_event_key_for_call("terminal", &unsafe_args)
             .expect("unsafe terminal mode should require permission routing");
 
-        assert_eq!(default_key.mode, TerminalMode::Network);
-        assert_eq!(default_key.script, "ls");
+        // Default and sandboxed no longer require approval: network is
+        // available by default and only unsafe escalation is gated.
+        assert!(permission_event_key_for_call("terminal", &default_args).is_none());
         assert_eq!(unsafe_key.mode, TerminalMode::Unsafe);
         assert_eq!(unsafe_key.script, "rm -rf /tmp/demo");
         assert!(permission_event_key_for_call("terminal", &sandboxed_args).is_none());
@@ -2589,9 +2436,9 @@ mod tests {
             "tool-1",
             "terminal",
             serde_json::to_value(TerminalArgs {
-                description: "fetch the example homepage".to_string(),
-                script: "curl https://example.com".to_string(),
-                mode: TerminalExecutionMode::Default,
+                description: "remove the demo directory".to_string(),
+                script: "rm -rf /tmp/demo".to_string(),
+                mode: TerminalExecutionMode::Unsafe,
                 ssh_server_id: None,
                 expect: aither_sandbox::OutputFormat::Text,
                 resolution: aither_sandbox::MediaResolution::Auto,
@@ -2605,15 +2452,15 @@ mod tests {
         let mut tracker = PermissionPauseTracker::from_tool_calls(&tool_calls);
         let waiting = tracker
             .event_for(PermissionEvent {
-                mode: TerminalMode::Network,
-                script: "curl https://example.com".to_string(),
+                mode: TerminalMode::Unsafe,
+                script: "rm -rf /tmp/demo".to_string(),
                 stage: PermissionEventStage::Waiting,
             })
             .expect("waiting event should map to tool call");
         let resolved = tracker
             .event_for(PermissionEvent {
-                mode: TerminalMode::Network,
-                script: "curl https://example.com".to_string(),
+                mode: TerminalMode::Unsafe,
+                script: "rm -rf /tmp/demo".to_string(),
                 stage: PermissionEventStage::Resolved,
             })
             .expect("resolved event should map to tool call");
@@ -2683,64 +2530,60 @@ mod tests {
     }
 
     #[cfg(feature = "skills")]
-    #[test]
-    fn activate_skills_for_prompt_is_disabled() {
-        futures_lite::future::block_on(async {
-            let mut registry = SkillRegistry::new();
-            registry.register(Skill {
-                name: "code-review".to_string(),
-                description: "Review code carefully".to_string(),
-                instructions: "Use a review checklist.".to_string(),
-                allowed_tools: Some(vec!["mock_tool".to_string()]),
-                resources: HashMap::new(),
-            });
-
-            let mut agent = Agent::with_config(
-                MockLlm {
-                    context_length: 1000,
-                },
-                AgentConfig::default(),
-            );
-            agent.skill_registry = Some(Arc::new(registry));
-            let events = agent.activate_skills_for_prompt("please review this patch");
-            assert!(events.is_empty());
-            assert!(agent.active_skills.is_empty());
-            assert!(agent.active_allowed_tools.is_none());
+    #[tokio::test]
+    async fn activate_skills_for_prompt_is_disabled() {
+        let mut registry = SkillRegistry::new();
+        registry.register(Skill {
+            name: "code-review".to_string(),
+            description: "Review code carefully".to_string(),
+            instructions: "Use a review checklist.".to_string(),
+            allowed_tools: Some(vec!["mock_tool".to_string()]),
+            resources: HashMap::new(),
         });
+
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 1000,
+            },
+            AgentConfig::default(),
+        );
+        agent.skill_registry = Some(Arc::new(registry));
+        let events = agent.activate_skills_for_prompt("please review this patch");
+        assert!(events.is_empty());
+        assert!(agent.active_skills.is_empty());
+        assert!(agent.active_allowed_tools.is_none());
     }
 
     #[cfg(feature = "skills")]
-    #[test]
-    fn build_live_request_messages_omit_skill_resource_catalog() {
-        futures_lite::future::block_on(async {
-            let mut registry = SkillRegistry::new();
-            registry.register(Skill {
-                name: "code-review".to_string(),
-                description: "Review code carefully".to_string(),
-                instructions: "Use a review checklist.".to_string(),
-                allowed_tools: Some(vec!["mock_tool".to_string()]),
-                resources: HashMap::from([(
-                    "templates/review.md".to_string(),
-                    "# Review template".to_string(),
-                )]),
-            });
-
-            let mut agent = Agent::with_config(
-                MockLlm {
-                    context_length: 1000,
-                },
-                AgentConfig::default(),
-            );
-            agent.skill_registry = Some(Arc::new(registry));
-            let _ = agent.activate_skills_for_prompt("please review this patch");
-
-            let messages = agent.build_live_request_messages().await;
-            assert!(
-                messages
-                    .iter()
-                    .all(|message| !message.content().contains("templates/review.md")),
-                "skill resource catalog must not be injected automatically"
-            );
+    #[tokio::test]
+    async fn build_live_request_messages_omit_skill_resource_catalog() {
+        let mut registry = SkillRegistry::new();
+        registry.register(Skill {
+            name: "code-review".to_string(),
+            description: "Review code carefully".to_string(),
+            instructions: "Use a review checklist.".to_string(),
+            allowed_tools: Some(vec!["mock_tool".to_string()]),
+            resources: HashMap::from([(
+                "templates/review.md".to_string(),
+                "# Review template".to_string(),
+            )]),
         });
+
+        let mut agent = Agent::with_config(
+            MockLlm {
+                context_length: 1000,
+            },
+            AgentConfig::default(),
+        );
+        agent.skill_registry = Some(Arc::new(registry));
+        let _ = agent.activate_skills_for_prompt("please review this patch");
+
+        let messages = agent.build_live_request_messages().await;
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message.content().contains("templates/review.md")),
+            "skill resource catalog must not be injected automatically"
+        );
     }
 }

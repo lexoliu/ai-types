@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use uuid::Uuid;
 
-use crate::protocol::{McpServerSpec, SessionUpdate};
+use crate::protocol::{ContentBlock, ContentChunk, McpServerSpec, SessionUpdate, TextContent};
 
 /// An active ACP session.
 ///
@@ -72,6 +72,10 @@ impl AcpSession {
     /// This is a placeholder implementation. The full implementation
     /// will integrate with the aither agent to process prompts and
     /// stream events as ACP session updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if prompt processing fails.
     pub fn prompt<F>(&mut self, prompt: &str, mut on_update: F) -> Result<(), String>
     where
         F: FnMut(SessionUpdate),
@@ -81,8 +85,6 @@ impl AcpSession {
 
         // Placeholder: Echo back the prompt as an agent message
         // In the real implementation, this will run the agent loop
-        use crate::protocol::{ContentBlock, ContentChunk, TextContent};
-
         // Send agent message chunk
         on_update(SessionUpdate::AgentMessageChunk(ContentChunk {
             content: ContentBlock::Text(TextContent {

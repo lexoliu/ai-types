@@ -1,20 +1,21 @@
 use aither_core::llm::{
-    Message, Role,
-    model::{OpenAIPromptCacheRetention, Parameters, ReasoningEffort, ToolChoice},
+    Attachment, Message, Role,
+    model::{
+        OpenAIAutoContainer, OpenAICodeInterpreterContainer, OpenAICodeInterpreterTool,
+        OpenAIComputerUseTool, OpenAIFileSearchTool, OpenAIImageGenerationTool, OpenAIMcpTool,
+        OpenAINativeTools, OpenAIPromptCacheRetention, OpenAIWebSearchTool, Parameters,
+        ReasoningEffort, ToolChoice,
+    },
     tool::ToolDefinition,
 };
-use url::Url;
-
 use schemars::Schema;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
-#[cfg(not(target_arch = "wasm32"))]
-use async_fs;
-
 use crate::attachments::parse_openai_file_url;
 use crate::error::OpenAIError;
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone)]
 pub struct ParameterSnapshot {
     pub(crate) temperature: Option<f32>,
@@ -34,6 +35,7 @@ pub struct ParameterSnapshot {
     pub(crate) response_format: Option<Schema>,
     pub(crate) websearch: bool,
     pub(crate) code_execution: bool,
+    pub(crate) openai_tools: OpenAINativeTools,
     pub(crate) legacy_max_tokens: bool,
     pub(crate) prompt_cache_key: Option<String>,
     pub(crate) prompt_cache_retention: Option<OpenAIPromptCacheRetention>,
@@ -62,6 +64,7 @@ impl From<&Parameters> for ParameterSnapshot {
             response_format: value.response_format.clone(),
             websearch: value.websearch,
             code_execution: value.code_execution,
+            openai_tools: value.native_tools.openai.clone(),
             legacy_max_tokens: false,
             prompt_cache_key: value
                 .cache
@@ -201,6 +204,9 @@ pub enum ContentPart {
     /// Image URL content part.
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrlPayload },
+    /// Base64 audio input content part.
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudioPayload },
 }
 
 /// Image URL payload for vision.
@@ -208,6 +214,13 @@ pub enum ContentPart {
 pub struct ImageUrlPayload {
     /// URL to the image (can be data URL with base64).
     url: String,
+}
+
+/// Base64 audio payload for Chat Completions.
+#[derive(Debug, Clone, Serialize)]
+pub struct InputAudioPayload {
+    data: String,
+    format: &'static str,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -260,7 +273,9 @@ struct ReasoningPayload {
     effort: Option<&'static str>,
 }
 
-pub async fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
+pub async fn to_chat_messages(
+    messages: &[Message],
+) -> Result<Vec<ChatMessagePayload>, OpenAIError> {
     let mut payloads = Vec::with_capacity(messages.len());
     for message in messages {
         let role = match message.role() {
@@ -290,7 +305,7 @@ pub async fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
             )
         };
 
-        let content = build_content(message).await;
+        let content = build_content(message).await?;
         payloads.push(ChatMessagePayload {
             role,
             content,
@@ -298,117 +313,144 @@ pub async fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
             tool_call_id,
         });
     }
-    payloads
+    Ok(payloads)
 }
 
 /// Build content payload for a message.
 ///
 /// Returns simple text for messages without attachments,
 /// or multimodal content parts for messages with attachments.
-async fn build_content(message: &Message) -> ContentPayload {
+async fn build_content(message: &Message) -> Result<ContentPayload, OpenAIError> {
     let attachments = message.attachments();
 
     if attachments.is_empty() {
-        return ContentPayload::Text(message.content().to_owned());
+        return Ok(ContentPayload::Text(message.content().to_owned()));
     }
 
-    let mut parts = Vec::new();
-
-    // Add image parts first
+    let mut parts = Vec::with_capacity(attachments.len() + 1);
     for attachment in attachments {
-        if let Some(data_url) = url_to_data_url(attachment).await {
+        let media_type = attachment.media_type().as_ref();
+        if media_type.starts_with("image/") {
             parts.push(ContentPart::ImageUrl {
-                image_url: ImageUrlPayload { url: data_url },
+                image_url: ImageUrlPayload {
+                    url: attachment_image_url(attachment).await?,
+                },
             });
+        } else if media_type.starts_with("audio/") {
+            parts.push(ContentPart::InputAudio {
+                input_audio: attachment_audio_payload(attachment).await?,
+            });
+        } else {
+            return Err(OpenAIError::Api(format!(
+                "Chat Completions does not support attachment MIME type '{media_type}'"
+            )));
         }
     }
 
-    // Add text content
     if !message.content().is_empty() {
         parts.push(ContentPart::Text {
             text: message.content().to_owned(),
         });
     }
 
-    ContentPayload::Parts(parts)
+    Ok(ContentPayload::Parts(parts))
 }
 
 /// Flatten message content to a simple string.
-///
-/// For non-vision contexts (like Responses API), just returns the text content.
 fn flatten_content(message: &Message) -> String {
     message.content().to_owned()
 }
 
-/// Convert a URL to a data URL suitable for `OpenAI` vision.
-///
-/// Handles:
-/// - `data:...` URLs - passed through as-is
-/// - `file:///path` URLs - reads file and converts to base64 data URL
-/// - HTTP/HTTPS URLs - passed through as-is (`OpenAI` can fetch them)
-async fn url_to_data_url(url: &url::Url) -> Option<String> {
+async fn attachment_image_url(attachment: &Attachment) -> Result<String, OpenAIError> {
+    let url = attachment.url();
     match url.scheme() {
-        "data" => Some(url.as_str().to_string()),
-        "http" | "https" => Some(url.as_str().to_string()),
-        "file" => {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                read_file_to_data_url(url).await
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                tracing::warn!("file:// attachments are not supported on wasm32");
-                None
-            }
-        }
-        _ => {
-            tracing::warn!("Unsupported attachment URL scheme: {}", url.scheme());
-            None
-        }
+        "data" | "http" | "https" => Ok(url.as_str().to_string()),
+        "file" => read_file_to_data_url(attachment).await,
+        scheme => Err(OpenAIError::Api(format!(
+            "OpenAI does not support image attachment URL scheme '{scheme}'"
+        ))),
     }
 }
 
-/// Read a file:// URL and convert to a data URL.
+async fn attachment_audio_payload(
+    attachment: &Attachment,
+) -> Result<InputAudioPayload, OpenAIError> {
+    let media_type = attachment.media_type().as_ref();
+    let format = match media_type {
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/wav" | "audio/x-wav" => "wav",
+        _ => {
+            return Err(OpenAIError::Api(format!(
+                "OpenAI audio input supports only MP3 and WAV, not '{media_type}'"
+            )));
+        }
+    };
+
+    let data = match attachment.url().scheme() {
+        "data" => {
+            let after_data = attachment
+                .url()
+                .as_str()
+                .strip_prefix("data:")
+                .ok_or_else(|| OpenAIError::Api("Malformed audio data URL".to_string()))?;
+            let (header, data) = after_data
+                .split_once(',')
+                .ok_or_else(|| OpenAIError::Api("Audio data URL is missing payload".to_string()))?;
+            let encoded_media_type = header.strip_suffix(";base64").ok_or_else(|| {
+                OpenAIError::Api("Audio data URL must use base64 encoding".to_string())
+            })?;
+            if encoded_media_type != media_type {
+                return Err(OpenAIError::Api(format!(
+                    "Attachment MIME type '{media_type}' does not match data URL MIME type '{encoded_media_type}'"
+                )));
+            }
+            data.to_string()
+        }
+        "file" => read_file_base64(attachment.url()).await?,
+        scheme => {
+            return Err(OpenAIError::Api(format!(
+                "OpenAI audio input requires a data: or file: URL, not '{scheme}'"
+            )));
+        }
+    };
+
+    Ok(InputAudioPayload { data, format })
+}
+
 #[cfg(not(target_arch = "wasm32"))]
-async fn read_file_to_data_url(url: &url::Url) -> Option<String> {
-    use base64::Engine;
-
-    let path = url.to_file_path().ok()?;
-    let data = async_fs::read(&path).await.ok()?;
-    let mime_type = mime_from_path(&path)?;
-    let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
-
-    Some(format!("data:{mime_type};base64,{base64_data}"))
+async fn read_file_to_data_url(attachment: &Attachment) -> Result<String, OpenAIError> {
+    let data = read_file_base64(attachment.url()).await?;
+    Ok(format!("data:{};base64,{data}", attachment.media_type()))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn read_file_to_data_url(_url: &url::Url) -> Option<String> {
-    None
+async fn read_file_to_data_url(_attachment: &Attachment) -> Result<String, OpenAIError> {
+    Err(OpenAIError::Api(
+        "file:// attachments are not supported on wasm32".to_string(),
+    ))
 }
 
-/// Get MIME type from file path extension.
-fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())?
-        .to_lowercase()
-        .as_str()
-    {
-        // Images
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        // Video (for providers that support it)
-        "mp4" => Some("video/mp4"),
-        "webm" => Some("video/webm"),
-        // Audio (for providers that support it)
-        "mp3" => Some("audio/mpeg"),
-        "wav" => Some("audio/wav"),
-        // Documents
-        "pdf" => Some("application/pdf"),
-        _ => None,
-    }
+#[cfg(not(target_arch = "wasm32"))]
+async fn read_file_base64(url: &url::Url) -> Result<String, OpenAIError> {
+    use base64::Engine;
+
+    let path = url.to_file_path().map_err(|()| {
+        OpenAIError::Api("Attachment file URL could not be converted to a path".to_string())
+    })?;
+    let data = async_fs::read(&path).await.map_err(|error| {
+        OpenAIError::Api(format!(
+            "Failed to read attachment '{}': {error}",
+            path.display()
+        ))
+    })?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(data))
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn read_file_base64(_url: &url::Url) -> Result<String, OpenAIError> {
+    Err(OpenAIError::Api(
+        "file:// attachments are not supported on wasm32".to_string(),
+    ))
 }
 
 pub fn convert_tools(definitions: Vec<ToolDefinition>) -> Vec<ToolPayload> {
@@ -455,7 +497,7 @@ fn response_format(params: &ParameterSnapshot) -> Option<ResponseFormatPayload> 
                 strict: Some(params.structured_outputs),
             },
         })
-        .or_else(|| {
+        .or({
             if params.structured_outputs {
                 Some(ResponseFormatPayload::JsonObject)
             } else {
@@ -538,6 +580,7 @@ pub enum ResponsesMessageContent {
 }
 
 #[derive(Debug, Serialize, Clone)]
+#[allow(clippy::enum_variant_names)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponsesInputContent {
     InputText {
@@ -548,12 +591,13 @@ pub enum ResponsesInputContent {
         source: InputImageSource,
     },
     InputFile {
-        file_id: String,
+        #[serde(flatten)]
+        source: InputFileSource,
     },
 }
 
 #[derive(Debug, Serialize, Clone)]
-struct InputImageSource {
+pub struct InputImageSource {
     #[serde(skip_serializing_if = "Option::is_none")]
     image_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -572,6 +616,30 @@ impl InputImageSource {
         Self {
             image_url: None,
             file_id: Some(file_id),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct InputFileSource {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_url: Option<String>,
+}
+
+impl InputFileSource {
+    const fn from_file_id(file_id: String) -> Self {
+        Self {
+            file_id: Some(file_id),
+            file_url: None,
+        }
+    }
+
+    const fn from_url(file_url: String) -> Self {
+        Self {
+            file_id: None,
+            file_url: Some(file_url),
         }
     }
 }
@@ -712,8 +780,55 @@ pub enum ResponsesTool {
         description: String,
         parameters: Value,
     },
-    WebSearch,
-    CodeInterpreter,
+    WebSearch {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        external_web_access: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filters: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_location: Option<Value>,
+    },
+    FileSearch {
+        vector_store_ids: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_num_results: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filters: Option<Value>,
+    },
+    CodeInterpreter {
+        container: CodeInterpreterContainerPayload,
+    },
+    ImageGeneration {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        partial_images: Option<u8>,
+    },
+    Mcp {
+        server_label: String,
+        server_url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        require_approval: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        allowed_tools: Vec<String>,
+    },
+    ComputerUsePreview {
+        display_width: u32,
+        display_height: u32,
+        environment: String,
+    },
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(untagged)]
+pub enum CodeInterpreterContainerPayload {
+    Auto {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        memory_limit: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        file_ids: Vec<String>,
+    },
+    Existing(String),
 }
 
 #[allow(dead_code)]
@@ -830,22 +945,50 @@ fn validate_responses_input(items: &[ResponsesInputItem]) -> Result<(), OpenAIEr
     Ok(())
 }
 
-fn attachment_to_responses_part(url: &Url) -> Result<ResponsesInputContent, OpenAIError> {
+fn attachment_to_responses_part(
+    attachment: &Attachment,
+) -> Result<ResponsesInputContent, OpenAIError> {
+    let url = attachment.url();
+    let media_type = attachment.media_type().as_ref();
+    if media_type.starts_with("audio/") || media_type.starts_with("video/") {
+        return Err(OpenAIError::Api(format!(
+            "Responses API does not support attachment MIME type '{media_type}'"
+        )));
+    }
+
     if let Some((kind, id)) = parse_openai_file_url(url) {
-        if kind.is_image() {
+        if media_type.starts_with("image/") {
+            if !kind.is_image() {
+                return Err(OpenAIError::Api(
+                    "Uploaded image attachment was encoded as a generic file".to_string(),
+                ));
+            }
             return Ok(ResponsesInputContent::InputImage {
                 source: InputImageSource::from_file_id(id),
             });
         }
-        return Ok(ResponsesInputContent::InputFile { file_id: id });
+        return Ok(ResponsesInputContent::InputFile {
+            source: InputFileSource::from_file_id(id),
+        });
     }
 
     match url.scheme() {
-        "http" | "https" | "data" => Ok(ResponsesInputContent::InputImage {
+        "http" | "https" if media_type.starts_with("image/") => {
+            Ok(ResponsesInputContent::InputImage {
+                source: InputImageSource::from_url(url.as_str().to_string()),
+            })
+        }
+        "data" if media_type.starts_with("image/") => Ok(ResponsesInputContent::InputImage {
             source: InputImageSource::from_url(url.as_str().to_string()),
+        }),
+        "http" | "https" => Ok(ResponsesInputContent::InputFile {
+            source: InputFileSource::from_url(url.as_str().to_string()),
         }),
         "file" => Err(OpenAIError::Api(
             "file:// attachments must be uploaded via Files API".to_string(),
+        )),
+        "data" => Err(OpenAIError::Api(
+            "Non-image data: attachments must be persisted and uploaded via Files API".to_string(),
         )),
         other => Err(OpenAIError::Api(format!(
             "Unsupported attachment URL scheme: {other}"
@@ -893,7 +1036,7 @@ fn responses_text(params: &ParameterSnapshot) -> Option<ResponseTextConfig> {
                 strict: Some(params.structured_outputs),
             },
         })
-        .or_else(|| {
+        .or({
             if params.structured_outputs {
                 Some(ResponseTextConfig {
                     format: ResponseTextFormat::JsonObject,
@@ -912,10 +1055,94 @@ fn responses_include(params: &ParameterSnapshot) -> Option<Vec<&'static str>> {
     if params.include_reasoning {
         include.push("reasoning.encrypted_content");
     }
+    if params
+        .openai_tools
+        .file_search
+        .iter()
+        .any(|tool| tool.include_results)
+    {
+        include.push("file_search_call.results");
+    }
     if include.is_empty() {
         None
     } else {
         Some(include)
+    }
+}
+
+impl From<OpenAIWebSearchTool> for ResponsesTool {
+    fn from(tool: OpenAIWebSearchTool) -> Self {
+        Self::WebSearch {
+            external_web_access: tool.external_web_access,
+            filters: tool.filters,
+            user_location: tool.user_location,
+        }
+    }
+}
+
+impl From<OpenAIFileSearchTool> for ResponsesTool {
+    fn from(tool: OpenAIFileSearchTool) -> Self {
+        Self::FileSearch {
+            vector_store_ids: tool.vector_store_ids,
+            max_num_results: tool.max_num_results,
+            filters: tool.filters,
+        }
+    }
+}
+
+impl From<OpenAICodeInterpreterTool> for ResponsesTool {
+    fn from(tool: OpenAICodeInterpreterTool) -> Self {
+        Self::CodeInterpreter {
+            container: CodeInterpreterContainerPayload::from(tool.container),
+        }
+    }
+}
+
+impl From<OpenAICodeInterpreterContainer> for CodeInterpreterContainerPayload {
+    fn from(container: OpenAICodeInterpreterContainer) -> Self {
+        match container {
+            OpenAICodeInterpreterContainer::Auto(container) => Self::from(container),
+            OpenAICodeInterpreterContainer::Existing(id) => Self::Existing(id),
+        }
+    }
+}
+
+impl From<OpenAIAutoContainer> for CodeInterpreterContainerPayload {
+    fn from(container: OpenAIAutoContainer) -> Self {
+        Self::Auto {
+            kind: "auto",
+            memory_limit: container.memory_limit,
+            file_ids: container.file_ids,
+        }
+    }
+}
+
+impl From<OpenAIImageGenerationTool> for ResponsesTool {
+    fn from(tool: OpenAIImageGenerationTool) -> Self {
+        Self::ImageGeneration {
+            partial_images: tool.partial_images,
+        }
+    }
+}
+
+impl From<OpenAIMcpTool> for ResponsesTool {
+    fn from(tool: OpenAIMcpTool) -> Self {
+        Self::Mcp {
+            server_label: tool.server_label,
+            server_url: tool.server_url,
+            require_approval: tool.require_approval,
+            allowed_tools: tool.allowed_tools,
+        }
+    }
+}
+
+impl From<OpenAIComputerUseTool> for ResponsesTool {
+    fn from(tool: OpenAIComputerUseTool) -> Self {
+        Self::ComputerUsePreview {
+            display_width: tool.display_width,
+            display_height: tool.display_height,
+            environment: tool.environment,
+        }
     }
 }
 
@@ -928,8 +1155,67 @@ fn prompt_cache_retention(params: &ParameterSnapshot) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aither_core::llm::model::{OpenAIPromptCacheRetention, Parameters, ToolChoice};
-    use aither_core::llm::{Message, ToolCall};
+    use aither_core::llm::model::{
+        OpenAICodeInterpreterTool, OpenAIFileSearchTool, OpenAIImageGenerationTool, OpenAIMcpTool,
+        OpenAINativeTools, OpenAIPromptCacheRetention, OpenAIWebSearchTool, Parameters, ToolChoice,
+    };
+    use aither_core::llm::{Attachment, Message, ToolCall};
+
+    #[tokio::test]
+    async fn chat_serializes_typed_image_and_audio_parts() {
+        let image = Attachment::new(
+            "data:image/png;base64,AA==".parse().expect("image URL"),
+            "image/png".parse().expect("image MIME"),
+        );
+        let audio = Attachment::new(
+            "data:audio/wav;base64,AA==".parse().expect("audio URL"),
+            "audio/wav".parse().expect("audio MIME"),
+        );
+        let messages = vec![Message::user("describe both").with_attachments([image, audio])];
+        let payload = to_chat_messages(&messages)
+            .await
+            .expect("encode chat attachments");
+        let value = serde_json::to_value(&payload[0]).expect("serialize chat message");
+        assert_eq!(value["content"][0]["type"], "image_url");
+        assert_eq!(value["content"][1]["type"], "input_audio");
+        assert_eq!(value["content"][1]["input_audio"]["format"], "wav");
+        assert_eq!(value["content"][2]["type"], "text");
+    }
+
+    #[test]
+    fn responses_serializes_remote_pdf_as_input_file() {
+        let attachment = Attachment::new(
+            "https://platform.openai.com/docs/guides/pdf-files/sample.pdf"
+                .parse()
+                .expect("PDF URL"),
+            "application/pdf".parse().expect("PDF MIME"),
+        );
+        let messages = vec![Message::user("summarize").with_attachment(attachment)];
+        let input = to_responses_input(&messages).expect("encode Responses attachment");
+        let value = serde_json::to_value(&input[0]).expect("serialize Responses input");
+        assert_eq!(value["content"][0]["type"], "input_file");
+        assert_eq!(
+            value["content"][0]["file_url"],
+            "https://platform.openai.com/docs/guides/pdf-files/sample.pdf"
+        );
+    }
+
+    #[test]
+    fn responses_rejects_audio_attachment() {
+        let attachment = Attachment::new(
+            "https://platform.openai.com/docs/guides/audio/sample.wav"
+                .parse()
+                .expect("audio URL"),
+            "audio/wav".parse().expect("audio MIME"),
+        );
+        let messages = vec![Message::user("transcribe").with_attachment(attachment)];
+        let error = to_responses_input(&messages).expect_err("Responses audio must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("does not support attachment MIME type")
+        );
+    }
 
     #[test]
     fn chat_json_object_when_structured_outputs_without_schema() {
@@ -1064,6 +1350,69 @@ mod tests {
         let value = serde_json::to_value(&req).expect("serialize chat request");
         assert_eq!(value["prompt_cache_key"], "session:beta");
         assert_eq!(value["prompt_cache_retention"], "in-memory");
+    }
+
+    #[test]
+    fn responses_request_serializes_openai_native_tools() {
+        let native_tools = OpenAINativeTools::default()
+            .with_web_search(OpenAIWebSearchTool::default().external_web_access(true))
+            .with_file_search(
+                OpenAIFileSearchTool::new(vec!["vs_123".to_string()])
+                    .max_num_results(5)
+                    .include_results(true),
+            )
+            .with_code_interpreter(OpenAICodeInterpreterTool::auto())
+            .with_image_generation(OpenAIImageGenerationTool::default().partial_images(2))
+            .with_mcp(OpenAIMcpTool::new("docs", "https://example.com/mcp"));
+        let params = Parameters::default().openai_tools(native_tools);
+        let snapshot = ParameterSnapshot::from(&params);
+        let tools = vec![
+            ResponsesTool::from(
+                snapshot
+                    .openai_tools
+                    .web_search
+                    .clone()
+                    .expect("web search"),
+            ),
+            ResponsesTool::from(snapshot.openai_tools.file_search[0].clone()),
+            ResponsesTool::from(
+                snapshot
+                    .openai_tools
+                    .code_interpreter
+                    .clone()
+                    .expect("code interpreter"),
+            ),
+            ResponsesTool::from(
+                snapshot
+                    .openai_tools
+                    .image_generation
+                    .clone()
+                    .expect("image generation"),
+            ),
+            ResponsesTool::from(snapshot.openai_tools.mcp[0].clone()),
+        ];
+        let req = ResponsesRequest::new(
+            "gpt-5".into(),
+            vec![ResponsesInputItem::message(
+                "user",
+                ResponsesMessageContent::Text("hi".to_string()),
+            )],
+            &snapshot,
+            Some(tools),
+            responses_tool_choice(&snapshot, true),
+            false,
+        );
+        let value = serde_json::to_value(&req).expect("serialize responses request");
+        assert_eq!(value["tools"][0]["type"], "web_search");
+        assert_eq!(value["tools"][0]["external_web_access"], true);
+        assert_eq!(value["tools"][1]["type"], "file_search");
+        assert_eq!(value["tools"][1]["vector_store_ids"][0], "vs_123");
+        assert_eq!(value["tools"][2]["type"], "code_interpreter");
+        assert_eq!(value["tools"][2]["container"]["type"], "auto");
+        assert_eq!(value["tools"][3]["type"], "image_generation");
+        assert_eq!(value["tools"][3]["partial_images"], 2);
+        assert_eq!(value["tools"][4]["type"], "mcp");
+        assert_eq!(value["include"][0], "file_search_call.results");
     }
 
     #[test]

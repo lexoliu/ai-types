@@ -105,6 +105,10 @@ impl SubagentDefinition {
     ///
     /// System prompt content...
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when frontmatter is missing, invalid, or uses an unsupported version.
     pub fn parse(content: &str) -> Result<Self, String> {
         let (frontmatter, system_prompt) = Self::split_frontmatter(content)?;
         let parsed = Self::parse_frontmatter(frontmatter)?;
@@ -117,12 +121,20 @@ impl SubagentDefinition {
     }
 
     /// Load a subagent definition from a file asynchronously.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read or parsed.
     pub async fn from_file_async(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let content = fs::read_to_string(path).await?;
         Self::parse(&content).map_err(Self::invalid_data_error)
     }
 
     /// Load all subagent definitions from a directory asynchronously.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory cannot be read or any definition cannot be parsed.
     pub async fn load_from_dir_async(dir: impl AsRef<Path>) -> std::io::Result<Vec<Self>> {
         let mut definitions = Vec::new();
         let dir = dir.as_ref();
@@ -145,24 +157,20 @@ impl SubagentDefinition {
 }
 
 /// Default subagent definitions embedded in the binary.
+///
+/// # Panics
+///
+/// Panics if an embedded subagent definition is invalid.
 #[must_use]
 pub fn builtin_subagents() -> Vec<SubagentDefinition> {
-    let mut defs = Vec::new();
-
-    defs.push(
+    vec![
         SubagentDefinition::parse(include_str!("prompts/subagents/explore.md"))
             .expect("builtin explore subagent must parse"),
-    );
-    defs.push(
         SubagentDefinition::parse(include_str!("prompts/subagents/plan.md"))
             .expect("builtin plan subagent must parse"),
-    );
-    defs.push(
         SubagentDefinition::parse(include_str!("prompts/subagents/research.md"))
             .expect("builtin research subagent must parse"),
-    );
-
-    defs
+    ]
 }
 
 #[cfg(test)]

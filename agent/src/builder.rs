@@ -3,19 +3,21 @@
 //! The builder pattern allows fluent configuration of agents with
 //! tools, hooks, and various settings.
 
+#[cfg(feature = "skills")]
 use std::sync::Arc;
 
 use aither_core::{LanguageModel, llm::Tool};
-use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, OutputStore, PermissionEventReceiver};
+use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, PermissionEventReceiver};
 #[cfg(feature = "skills")]
 use aither_skills::SkillRegistry;
 
 use crate::{
-    agent::{Agent, ModelTier},
+    agent::Agent,
     compression::ContextStrategy,
     config::{AgentConfig, AgentKind},
     context::Context,
     hook::{HCons, Hook},
+    model_group::ModelTier,
     todo::{TodoList, TodoTool},
     tools::AgentTools,
     transcript::Transcript,
@@ -56,7 +58,6 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     config: AgentConfig,
     context: Context,
     todo_list: Option<TodoList>,
-    output_store: Option<Arc<OutputStore>>,
     background_receiver: Option<BackgroundTaskReceiver>,
     permission_receiver: Option<PermissionEventReceiver>,
     job_registry: Option<JobRegistry>,
@@ -72,7 +73,7 @@ impl<Advanced, Balanced, Fast, H> std::fmt::Debug for AgentBuilder<Advanced, Bal
             .field("tier", &self.tier)
             .field("config", &self.config)
             .field("todo_enabled", &self.todo_list.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -91,7 +92,6 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             config: AgentConfig::default(),
             context: Context::default(),
             todo_list: None,
-            output_store: None,
             background_receiver: None,
             permission_receiver: None,
             job_registry: None,
@@ -128,7 +128,6 @@ where
             config: self.config,
             context: self.context,
             todo_list: self.todo_list,
-            output_store: self.output_store,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -157,7 +156,6 @@ where
             config: self.config,
             context: self.context,
             todo_list: self.todo_list,
-            output_store: self.output_store,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -200,9 +198,13 @@ where
 
     /// Registers a dynamic terminal tool (type-erased).
     ///
-    /// This is used for child terminal tools in subagents where the concrete type
-    /// is not known at compile time.
+    /// This is used for child terminal capability bundles in subagents where the
+    /// concrete terminal type is not known at compile time.
     pub fn dyn_terminal(mut self, dyn_tool: aither_sandbox::DynTerminalTool) -> Self {
+        self.background_receiver = Some(dyn_tool.background_receiver());
+        self.permission_receiver = Some(dyn_tool.permission_receiver());
+        self.job_registry = Some(dyn_tool.job_registry());
+        self.sandbox_dir = Some(dyn_tool.working_dir().clone());
         self.tools.register_dyn_terminal(dyn_tool);
         self
     }
@@ -232,7 +234,6 @@ where
             config: self.config,
             context: self.context,
             todo_list: self.todo_list,
-            output_store: self.output_store,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -411,13 +412,11 @@ where
         State: Clone + 'static,
         aither_sandbox::TerminalTool<P, E, State>: Tool + 'static,
     {
-        let output_store = terminal_tool.output_store().clone();
         let background_receiver = terminal_tool.background_receiver();
         let permission_receiver = terminal_tool.permission_receiver();
         let job_registry = terminal_tool.job_registry();
         self.sandbox_dir = Some(terminal_tool.working_dir().clone());
         self.tools.register(terminal_tool);
-        self.output_store = Some(output_store);
         self.background_receiver = Some(background_receiver);
         self.permission_receiver = Some(permission_receiver);
         self.job_registry = Some(job_registry);
@@ -477,7 +476,6 @@ where
             fast_profile: None,
             initialized: false,
             todo_list: self.todo_list,
-            output_store: self.output_store,
             background_receiver: self.background_receiver,
             permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
@@ -574,6 +572,14 @@ mod tests {
     fn test_builder_basic() {
         let agent = AgentBuilder::new(MockLlm).build();
         assert!(agent.tools.definitions().is_empty());
+    }
+
+    #[test]
+    fn public_model_tier_configures_agent_builder() {
+        let agent = AgentBuilder::new(MockLlm)
+            .tier(crate::ModelTier::Balanced)
+            .build();
+        assert_eq!(agent.tier, crate::ModelTier::Balanced);
     }
 
     #[test]

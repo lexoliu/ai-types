@@ -36,7 +36,8 @@ impl From<&IndexEntry> for EntryData {
             chunk_id: entry.chunk.id.clone(),
             chunk_text: entry.chunk.text.clone(),
             chunk_source_id: entry.chunk.source_id.clone(),
-            chunk_index: entry.chunk.index as u32,
+            chunk_index: u32::try_from(entry.chunk.index)
+                .expect("chunk index exceeds rkyv u32 storage"),
             chunk_content_hash: entry.chunk.content_hash,
             chunk_metadata: entry
                 .chunk
@@ -94,10 +95,8 @@ impl RkyvPersistence {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
-}
 
-impl Persistence for RkyvPersistence {
-    fn save(&self, entries: &[IndexEntry]) -> Result<()> {
+    fn save_entries(&self, entries: &[IndexEntry]) -> Result<()> {
         // Ensure parent directory exists
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -118,7 +117,7 @@ impl Persistence for RkyvPersistence {
         Ok(())
     }
 
-    fn load(&self) -> Result<Vec<IndexEntry>> {
+    fn load_entries(&self) -> Result<Vec<IndexEntry>> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -136,6 +135,19 @@ impl Persistence for RkyvPersistence {
             .map_err(|e| RagError::Serialization(e.to_string()))?;
 
         Ok(wrapper.entries.into_iter().map(IndexEntry::from).collect())
+    }
+}
+
+impl Persistence for RkyvPersistence {
+    fn save<'a>(
+        &'a self,
+        entries: &'a [IndexEntry],
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        std::future::ready(self.save_entries(entries))
+    }
+
+    fn load(&self) -> impl std::future::Future<Output = Result<Vec<IndexEntry>>> + Send + '_ {
+        std::future::ready(self.load_entries())
     }
 
     fn extension(&self) -> &'static str {
@@ -158,41 +170,41 @@ mod tests {
         IndexEntry::new(chunk, vec![1.0, 2.0, 3.0, 4.0])
     }
 
-    #[test]
-    fn save_and_load() {
+    #[tokio::test]
+    async fn save_and_load() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.rkyv");
         let persistence = RkyvPersistence::new(&path);
 
         let entries = vec![make_entry("c1", "hello"), make_entry("c2", "world")];
 
-        persistence.save(&entries).unwrap();
+        persistence.save(&entries).await.unwrap();
         assert!(path.exists());
 
-        let loaded = persistence.load().unwrap();
+        let loaded = persistence.load().await.unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].chunk.id, "c1");
         assert_eq!(loaded[1].chunk.id, "c2");
     }
 
-    #[test]
-    fn load_nonexistent() {
+    #[tokio::test]
+    async fn load_nonexistent() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nonexistent.rkyv");
         let persistence = RkyvPersistence::new(&path);
 
-        let loaded = persistence.load().unwrap();
+        let loaded = persistence.load().await.unwrap();
         assert!(loaded.is_empty());
     }
 
-    #[test]
-    fn save_empty() {
+    #[tokio::test]
+    async fn save_empty() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("empty.rkyv");
         let persistence = RkyvPersistence::new(&path);
 
-        persistence.save(&[]).unwrap();
-        let loaded = persistence.load().unwrap();
+        persistence.save(&[]).await.unwrap();
+        let loaded = persistence.load().await.unwrap();
         assert!(loaded.is_empty());
     }
 }

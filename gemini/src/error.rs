@@ -21,7 +21,9 @@ pub enum GeminiError {
     Parse(String),
     /// Rate limit exceeded (includes retry delay if available).
     RateLimit {
+        /// API error message.
         message: String,
+        /// Retry delay parsed from the response.
         retry_after_secs: Option<u64>,
     },
 }
@@ -33,41 +35,60 @@ pub struct ApiErrorResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ApiErrorDetail {
+    /// Numeric error code.
     pub code: Option<i32>,
+    /// Human-readable message.
     pub message: Option<String>,
+    /// Status string.
     pub status: Option<String>,
+    /// Structured error details.
     pub details: Option<Vec<ApiErrorInfo>>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 #[serde(untagged)]
 pub enum ApiErrorInfo {
+    /// Quota failure details.
     QuotaFailure(QuotaFailureInfo),
+    /// Retry info details.
     RetryInfo(RetryInfoDetail),
+    /// Unknown detail object.
     Other(serde_json::Value),
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct QuotaFailureInfo {
     #[serde(rename = "@type")]
+    /// Detail type URL.
     pub type_url: Option<String>,
+    /// Quota violations.
     pub violations: Option<Vec<QuotaViolation>>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code, clippy::struct_field_names)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaViolation {
+    /// Quota metric name.
     pub quota_metric: Option<String>,
+    /// Quota identifier.
     pub quota_id: Option<String>,
+    /// Quota limit value.
     pub quota_value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct RetryInfoDetail {
     #[serde(rename = "@type")]
+    /// Detail type URL.
     pub type_url: Option<String>,
     #[serde(rename = "retryDelay")]
+    /// Retry delay duration.
     pub retry_delay: Option<String>,
 }
 
@@ -117,6 +138,7 @@ impl ApiErrorResponse {
     }
 
     /// Extract retry delay in seconds from the error response.
+    #[must_use]
     pub fn retry_delay_secs(&self) -> Option<u64> {
         let details = self.error.as_ref()?.details.as_ref()?;
         for detail in details {
@@ -198,6 +220,7 @@ impl std::error::Error for GeminiError {}
 
 impl GeminiError {
     /// Check if this error is retryable.
+    #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
             Self::Http(err) => {
@@ -215,6 +238,7 @@ impl GeminiError {
     }
 
     /// Get suggested retry delay in seconds.
+    #[must_use]
     pub fn retry_delay_secs(&self) -> Option<u64> {
         match self {
             Self::RateLimit {

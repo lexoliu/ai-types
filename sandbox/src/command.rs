@@ -30,7 +30,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -47,17 +47,33 @@ use serde_json::Value;
 // Tool Registry
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Payload exchanged between IPC command handlers and terminal command wrappers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandPayload {
-    Text { content: String },
-    Json { value: Value },
-    Binary { mime: String, data_base64: String },
+    /// UTF-8 text output.
+    Text {
+        /// Text content.
+        content: String,
+    },
+    /// Structured JSON output.
+    Json {
+        /// JSON value.
+        value: Value,
+    },
+    /// Binary output encoded as base64 with a MIME type.
+    Binary {
+        /// MIME type of the binary payload.
+        mime: String,
+        /// Base64-encoded bytes.
+        data_base64: String,
+    },
 }
 
 #[derive(Template)]
 #[template(path = "command_output_saved.txt", escape = "none")]
 struct CommandOutputSavedTemplate<'a> {
+    preview: &'a str,
     filename: &'a str,
     line_count: usize,
     byte_count: usize,
@@ -90,8 +106,15 @@ fn tool_usage_error(message: &str, tool_name: &str) -> String {
         .expect("tool usage error template must render")
 }
 
-fn output_saved_text(filename: &str, line_count: usize, byte_count: usize) -> String {
+fn output_saved_text(
+    rendered: &str,
+    filename: &str,
+    line_count: usize,
+    byte_count: usize,
+) -> String {
+    let preview = crate::output::head_preview(rendered, usize::MAX, INLINE_OUTPUT_LIMIT);
     CommandOutputSavedTemplate {
+        preview: preview.trim_end_matches('\n'),
         filename,
         line_count,
         byte_count,
@@ -171,18 +194,22 @@ impl CommandPayload {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Command result envelope returned to IPC callers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandEnvelope {
+    /// Whether command execution succeeded.
     pub ok: bool,
+    /// Optional successful command payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<CommandPayload>,
+    /// Optional command error text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 impl CommandEnvelope {
-    fn success(payload: CommandPayload) -> Self {
+    const fn success(payload: CommandPayload) -> Self {
         Self {
             ok: true,
             payload: Some(payload),
@@ -190,7 +217,7 @@ impl CommandEnvelope {
         }
     }
 
-    fn success_empty() -> Self {
+    const fn success_empty() -> Self {
         Self {
             ok: true,
             payload: None,
@@ -240,10 +267,7 @@ use crate::output::{INLINE_OUTPUT_LIMIT, generate_word_filename};
 ///
 /// Returns the output as-is if small enough, or saves to file and returns
 /// a reference message if the output exceeds the limit.
-async fn handle_large_output(
-    output: Option<CommandPayload>,
-    output_dir: &PathBuf,
-) -> CommandEnvelope {
+async fn handle_large_output(output: Option<CommandPayload>, output_dir: &Path) -> CommandEnvelope {
     let Some(output) = output else {
         return CommandEnvelope::success_empty();
     };
@@ -280,7 +304,7 @@ async fn handle_large_output(
     }
 
     CommandEnvelope::success(CommandPayload::Text {
-        content: output_saved_text(filename.as_str(), line_count, rendered.len()),
+        content: output_saved_text(&rendered, filename.as_str(), line_count, rendered.len()),
     })
 }
 
@@ -312,24 +336,74 @@ use aither_core::llm::tool::ToolDefinition;
 pub type DynToolHandler =
     Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = ToolResult> + Send>> + Send + Sync>;
 
-/// A type-erased terminal tool that can be registered with `AgentTools`.
-pub struct DynTerminalTool {
-    /// Tool definition (name, description, schema).
+/// One type-erased tool in a terminal capability bundle.
+pub struct DynTerminalToolEntry {
+    /// Tool definition exposed to the model.
     pub definition: ToolDefinition,
-    /// Handler that takes JSON args and returns result.
+    /// Handler that takes JSON arguments and returns a result.
     pub handler: DynToolHandler,
 }
 
-impl std::fmt::Debug for DynTerminalTool {
+impl std::fmt::Debug for DynTerminalToolEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DynTerminalTool")
+        f.debug_struct("DynTerminalToolEntry")
             .field("definition", &self.definition)
             .finish_non_exhaustive()
     }
 }
 
+/// A type-erased terminal capability bundle for child agents.
+pub struct DynTerminalTool {
+    pub(crate) entries: Vec<DynTerminalToolEntry>,
+    pub(crate) background_receiver: crate::terminal::BackgroundTaskReceiver,
+    pub(crate) permission_receiver: crate::terminal::PermissionEventReceiver,
+    pub(crate) job_registry: crate::job_registry::JobRegistry,
+    pub(crate) working_dir: PathBuf,
+}
+
+impl DynTerminalTool {
+    /// Returns the receiver for background terminal completions.
+    #[must_use]
+    pub fn background_receiver(&self) -> crate::terminal::BackgroundTaskReceiver {
+        self.background_receiver.clone()
+    }
+
+    /// Returns the receiver for terminal permission lifecycle events.
+    #[must_use]
+    pub fn permission_receiver(&self) -> crate::terminal::PermissionEventReceiver {
+        self.permission_receiver.clone()
+    }
+
+    /// Returns the child terminal job registry.
+    #[must_use]
+    pub fn job_registry(&self) -> crate::job_registry::JobRegistry {
+        self.job_registry.clone()
+    }
+
+    /// Returns the shared terminal working directory.
+    #[must_use]
+    pub const fn working_dir(&self) -> &PathBuf {
+        &self.working_dir
+    }
+
+    /// Consumes the bundle and returns every native terminal tool entry.
+    #[must_use]
+    pub fn into_entries(self) -> Vec<DynTerminalToolEntry> {
+        self.entries
+    }
+}
+
+impl std::fmt::Debug for DynTerminalTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynTerminalTool")
+            .field("entries", &self.entries)
+            .field("working_dir", &self.working_dir)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Builder for tool registries.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ToolRegistryBuilder {
     entries: HashMap<String, ToolEntry>,
 }
@@ -349,6 +423,9 @@ impl ToolRegistryBuilder {
     /// all required fields become positional args in order.
     /// For example, if a tool has `query: String` as its first required field,
     /// then `websearch "rust"` → `websearch --query "rust"`.
+    ///
+    /// # Panics
+    /// Panics if the tool argument schema cannot be serialized.
     pub fn configure_tool<T>(&mut self, tool: T)
     where
         T: Tool + Send + Sync + 'static,
@@ -411,7 +488,7 @@ impl ToolRegistryBuilder {
     /// schema, so external tools such as MCP definitions get the same
     /// positional arguments, `--help`, and usage validation behavior as native
     /// `Tool` implementations.
-    pub fn configure_definition_handler<F>(&mut self, definition: ToolDefinition, handler: F)
+    pub fn configure_definition_handler<F>(&mut self, definition: &ToolDefinition, handler: F)
     where
         F: Fn(
                 Value,
@@ -436,7 +513,7 @@ impl ToolRegistryBuilder {
             help
         };
 
-        let schema_for_handler = schema.clone();
+        let schema_for_handler = schema;
         let name_for_handler = name.clone();
         let handler = Arc::new(handler);
         let raw_handler: ToolHandlerFn = Box::new(move |args: Vec<String>| {
@@ -658,7 +735,7 @@ impl ToolCallCommand {
     }
 }
 
-pub(crate) fn flatten_args_to_cli(args: &std::collections::HashMap<String, Value>) -> Vec<String> {
+pub fn flatten_args_to_cli(args: &std::collections::HashMap<String, Value>) -> Vec<String> {
     if let Some(Value::Array(arr)) = args.get("args") {
         return arr
             .iter()
@@ -887,6 +964,9 @@ where
     T::Arguments: DeserializeOwned + JsonSchema,
 {
     /// Creates a new command wrapper for the given tool.
+    ///
+    /// # Panics
+    /// Panics if the tool argument schema cannot be serialized.
     pub fn new(tool: T) -> Self {
         let schema = schemars::schema_for!(T::Arguments);
         let schema = serde_json::to_value(schema).expect("failed to serialize tool schema");
@@ -914,10 +994,10 @@ where
         let parsed: T::Arguments = serde_json::from_value(json_args)?;
         let output = self.tool.call(parsed).await?;
         let payload = tool_output_to_payload(output).map_err(anyhow::Error::msg)?;
-        match payload {
-            Some(payload) => payload.render_for_cli().map_err(anyhow::Error::msg),
-            None => Ok(String::new()),
-        }
+        payload.map_or_else(
+            || Ok(String::new()),
+            |payload| payload.render_for_cli().map_err(anyhow::Error::msg),
+        )
     }
 }
 
@@ -965,6 +1045,9 @@ where
     T::Arguments: DeserializeOwned + JsonSchema + Send + 'static,
 {
     /// Creates a new IPC command wrapper for the given tool.
+    ///
+    /// # Panics
+    /// Panics if the tool argument schema cannot be serialized.
     pub fn new(tool: T) -> Self {
         let schema = serde_json::to_value(schemars::schema_for!(T::Arguments))
             .expect("failed to serialize tool schema");
@@ -1313,195 +1396,228 @@ fn find_similar_option<'a>(input: &str, options: impl Iterator<Item = &'a str>) 
 
 /// Parses an object schema from CLI arguments.
 fn parse_object(root_schema: &Value, schema: &Value, args: &[String]) -> anyhow::Result<Value> {
-    // Strip leading "--" separator (from `heel ipc`) without disabling flag parsing.
-    // A standalone "--" later in the args still acts as end-of-options.
     let args = if args.first().map(std::string::String::as_str) == Some("--") {
         &args[1..]
     } else {
         args
     };
-    let start_idx = 0;
-    let mut end_of_options = false;
-
-    let mut result: HashMap<String, Value> = HashMap::new();
-    let mut positional_idx = 0;
-
-    // Get object properties
-    let properties = resolved_schema(root_schema, schema)
-        .get("properties")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-
-    let required: Vec<String> = resolved_schema(root_schema, schema)
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Positional fields are required non-array fields in schema order
-    let positional_fields: Vec<String> = required
-        .iter()
-        .filter(|name| {
-            if let Some(prop_schema) = properties.get(name.as_str()) {
-                get_instance_type(root_schema, prop_schema) != Some("array")
-            } else {
-                true
-            }
-        })
-        .cloned()
-        .collect();
-    let command_capture_enabled = properties
-        .get("command")
-        .is_some_and(|schema| get_instance_type(root_schema, schema) == Some("string"));
-    let mut seen_positionals: Vec<String> = Vec::new();
-    let (short_to_field, _) = build_short_option_maps(&properties);
-    let long_names: Vec<String> = properties.keys().map(|k| k.replace('_', "-")).collect();
-
-    let mut i = start_idx;
+    let schema = ObjectParseSchema::new(root_schema, schema);
+    let mut state = ObjectParseState::default();
+    let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
 
-        if !end_of_options && arg == "--" {
-            end_of_options = true;
+        if !state.end_of_options && arg == "--" {
+            state.end_of_options = true;
             i += 1;
             continue;
         }
 
-        if !end_of_options && arg == "-" {
-            // Single "-" is treated as positional
-            if positional_idx < positional_fields.len() {
-                let field_name = &positional_fields[positional_idx];
-                if let Some(prop_schema) = properties.get(field_name) {
-                    let prop_type = get_instance_type(root_schema, prop_schema);
-                    result.insert(field_name.clone(), parse_value(arg, prop_type));
-                }
-                positional_idx += 1;
-                seen_positionals.push(arg.clone());
-            } else if command_capture_enabled {
-                seen_positionals.push(arg.clone());
-            } else {
-                anyhow::bail!("unexpected positional argument: {arg}");
-            }
-            i += 1;
-            continue;
-        }
-
-        if !end_of_options && arg.starts_with("--") {
-            // Named argument
-            let flag = &arg[2..];
-            let (mut name, value) = if let Some(eq_pos) = flag.find('=') {
-                (
-                    flag[..eq_pos].to_string(),
-                    Some(flag[eq_pos + 1..].to_string()),
-                )
-            } else {
-                (flag.to_string(), None)
-            };
-
-            // Normalize long name (allow underscores)
-            name = name.replace('_', "-");
-
-            let mut negated = false;
-            if let Some(stripped) = name.strip_prefix("no-") {
-                name = stripped.to_string();
-                negated = true;
-            }
-
-            // Convert kebab-case to snake_case for matching
-            let field_name = name.replace('-', "_");
-
-            if let Some(prop_schema) = properties.get(&field_name) {
-                let prop_type = get_instance_type(root_schema, prop_schema);
-
-                if negated && prop_type != Some("boolean") {
-                    anyhow::bail!("--no-{name} is only valid for boolean options");
-                }
-
-                let parsed_value = if prop_type == Some("boolean") {
-                    if negated && value.is_some() {
-                        anyhow::bail!("unexpected value for --no-{name}");
-                    }
-                    if let Some(v) = value {
-                        parse_value(&v, prop_type)
-                    } else {
-                        Value::Bool(!negated)
-                    }
-                } else {
-                    let val = value.or_else(|| {
-                        i += 1;
-                        args.get(i).cloned()
-                    });
-                    match val {
-                        Some(v) => parse_value(&v, prop_type),
-                        None => anyhow::bail!("missing value for --{name}"),
-                    }
-                };
-
-                insert_value(
-                    root_schema,
-                    &mut result,
-                    &field_name,
-                    parsed_value,
-                    prop_schema,
-                );
-            } else {
-                let suggestion = find_similar_option(&name, long_names.iter().map(String::as_str));
-                if let Some(similar) = suggestion {
-                    anyhow::bail!("unknown option: --{name}. Did you mean --{similar}?");
-                }
-                anyhow::bail!("unknown option: --{name}");
-            }
-        } else if !end_of_options && arg.starts_with('-') && arg.len() > 1 {
+        if !state.end_of_options && arg.starts_with("--") {
+            parse_long_option(root_schema, args, &mut i, &schema, &mut state)?;
+        } else if !state.end_of_options && arg.starts_with('-') && arg.len() > 1 && arg != "-" {
             parse_short_options(
                 root_schema,
                 arg,
                 args,
                 &mut i,
-                &properties,
-                &short_to_field,
-                &mut result,
+                &schema.properties,
+                &schema.short_to_field,
+                &mut state.result,
             )?;
         } else {
-            // Positional argument
-            if positional_idx < positional_fields.len() {
-                let field_name = &positional_fields[positional_idx];
-                if let Some(prop_schema) = properties.get(field_name) {
-                    let prop_type = get_instance_type(root_schema, prop_schema);
-                    result.insert(field_name.clone(), parse_value(arg, prop_type));
-                }
-                positional_idx += 1;
-                seen_positionals.push(arg.clone());
-            } else if command_capture_enabled {
-                seen_positionals.push(arg.clone());
-            } else {
-                anyhow::bail!("unexpected positional argument: {arg}");
-            }
+            parse_positional_arg(root_schema, &schema, &mut state, arg)?;
         }
 
         i += 1;
     }
 
-    if command_capture_enabled && !seen_positionals.is_empty() && !result.contains_key("command") {
-        result.insert(
+    if schema.command_capture_enabled
+        && !state.seen_positionals.is_empty()
+        && !state.result.contains_key("command")
+    {
+        state.result.insert(
             "command".to_string(),
-            Value::String(seen_positionals.join(" ")),
+            Value::String(state.seen_positionals.join(" ")),
         );
     }
 
-    // Check required fields
-    for req in &required {
-        if !result.contains_key(req) {
+    for req in &schema.required {
+        if !state.result.contains_key(req) {
             anyhow::bail!("missing required argument: {req}");
         }
     }
 
-    Ok(Value::Object(result.into_iter().collect()))
+    Ok(Value::Object(state.result.into_iter().collect()))
+}
+
+struct ObjectParseSchema {
+    properties: serde_json::Map<String, Value>,
+    required: Vec<String>,
+    positional_fields: Vec<String>,
+    command_capture_enabled: bool,
+    short_to_field: HashMap<char, String>,
+    long_names: Vec<String>,
+}
+
+impl ObjectParseSchema {
+    fn new(root_schema: &Value, schema: &Value) -> Self {
+        let resolved = resolved_schema(root_schema, schema);
+        let properties = resolved
+            .get("properties")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let required: Vec<String> = resolved
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let positional_fields = positional_fields(root_schema, &properties, &required);
+        let command_capture_enabled = properties
+            .get("command")
+            .is_some_and(|schema| get_instance_type(root_schema, schema) == Some("string"));
+        let (short_to_field, _) = build_short_option_maps(&properties);
+        let long_names = properties.keys().map(|k| k.replace('_', "-")).collect();
+        Self {
+            properties,
+            required,
+            positional_fields,
+            command_capture_enabled,
+            short_to_field,
+            long_names,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ObjectParseState {
+    result: HashMap<String, Value>,
+    positional_idx: usize,
+    seen_positionals: Vec<String>,
+    end_of_options: bool,
+}
+
+fn positional_fields(
+    root_schema: &Value,
+    properties: &serde_json::Map<String, Value>,
+    required: &[String],
+) -> Vec<String> {
+    required
+        .iter()
+        .filter(|name| {
+            properties.get(name.as_str()).is_none_or(|prop_schema| {
+                get_instance_type(root_schema, prop_schema) != Some("array")
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn parse_positional_arg(
+    root_schema: &Value,
+    schema: &ObjectParseSchema,
+    state: &mut ObjectParseState,
+    arg: &str,
+) -> anyhow::Result<()> {
+    if state.positional_idx < schema.positional_fields.len() {
+        let field_name = &schema.positional_fields[state.positional_idx];
+        if let Some(prop_schema) = schema.properties.get(field_name) {
+            let prop_type = get_instance_type(root_schema, prop_schema);
+            state
+                .result
+                .insert(field_name.clone(), parse_value(arg, prop_type));
+        }
+        state.positional_idx += 1;
+        state.seen_positionals.push(arg.to_string());
+    } else if schema.command_capture_enabled {
+        state.seen_positionals.push(arg.to_string());
+    } else {
+        anyhow::bail!("unexpected positional argument: {arg}");
+    }
+    Ok(())
+}
+
+fn parse_long_option(
+    root_schema: &Value,
+    args: &[String],
+    i: &mut usize,
+    schema: &ObjectParseSchema,
+    state: &mut ObjectParseState,
+) -> anyhow::Result<()> {
+    let arg = &args[*i];
+    let flag = &arg[2..];
+    let (mut name, value) = flag.find('=').map_or_else(
+        || (flag.to_string(), None),
+        |eq_pos| {
+            (
+                flag[..eq_pos].to_string(),
+                Some(flag[eq_pos + 1..].to_string()),
+            )
+        },
+    );
+    name = name.replace('_', "-");
+    let (normalized_name, negated) = name.strip_prefix("no-").map_or_else(
+        || (name.clone(), false),
+        |stripped| (stripped.to_string(), true),
+    );
+    name = normalized_name;
+    let field_name = name.replace('-', "_");
+    let Some(prop_schema) = schema.properties.get(&field_name) else {
+        return bail_unknown_long_option(&name, &schema.long_names);
+    };
+    let parsed_value =
+        parse_long_option_value(root_schema, args, i, &name, value, negated, prop_schema)?;
+    insert_value(
+        root_schema,
+        &mut state.result,
+        &field_name,
+        parsed_value,
+        prop_schema,
+    );
+    Ok(())
+}
+
+fn parse_long_option_value(
+    root_schema: &Value,
+    args: &[String],
+    i: &mut usize,
+    name: &str,
+    value: Option<String>,
+    negated: bool,
+    prop_schema: &Value,
+) -> anyhow::Result<Value> {
+    let prop_type = get_instance_type(root_schema, prop_schema);
+    if negated && prop_type != Some("boolean") {
+        anyhow::bail!("--no-{name} is only valid for boolean options");
+    }
+    if prop_type == Some("boolean") {
+        if negated && value.is_some() {
+            anyhow::bail!("unexpected value for --no-{name}");
+        }
+        return Ok(value.map_or(Value::Bool(!negated), |v| parse_value(&v, prop_type)));
+    }
+    let val = value.or_else(|| {
+        *i += 1;
+        args.get(*i).cloned()
+    });
+    val.map_or_else(
+        || anyhow::bail!("missing value for --{name}"),
+        |v| Ok(parse_value(&v, prop_type)),
+    )
+}
+
+fn bail_unknown_long_option(name: &str, long_names: &[String]) -> anyhow::Result<()> {
+    let suggestion = find_similar_option(name, long_names.iter().map(String::as_str));
+    if let Some(similar) = suggestion {
+        anyhow::bail!("unknown option: --{name}. Did you mean --{similar}?");
+    }
+    anyhow::bail!("unknown option: --{name}");
 }
 
 fn parse_short_options(
@@ -2007,8 +2123,7 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("missing required argument: content"),
-            "got: {}",
-            err
+            "got: {err}"
         );
     }
 
@@ -2098,8 +2213,72 @@ mod tests {
         multi_select: bool,
     }
 
+    fn touch_test_arg_types() {
+        let simple = SimpleArgs {
+            path: "file.txt".to_string(),
+            count: Some(1),
+        };
+        assert_eq!(simple.path, "file.txt");
+        assert_eq!(simple.count, Some(1));
+
+        let cluster = ClusterArgs {
+            verbose: true,
+            output: "out.txt".to_string(),
+        };
+        assert!(cluster.verbose);
+        assert_eq!(cluster.output, "out.txt");
+
+        let two = TwoPositionalArgs {
+            first: "a".to_string(),
+            second: "b".to_string(),
+        };
+        assert_eq!((two.first.as_str(), two.second.as_str()), ("a", "b"));
+
+        let read = TaggedOperationArgs::Read {
+            path: "input.txt".to_string(),
+        };
+        let TaggedOperationArgs::Read { path } = read else {
+            panic!("expected read operation");
+        };
+        assert_eq!(path, "input.txt");
+
+        let write = TaggedOperationArgs::Write {
+            path: "output.txt".to_string(),
+            content: "body".to_string(),
+        };
+        let TaggedOperationArgs::Write { path, content } = write else {
+            panic!("expected write operation");
+        };
+        assert_eq!((path.as_str(), content.as_str()), ("output.txt", "body"));
+
+        let trigger = NestedTriggerArgs::Event {
+            event_name: "ready".to_string(),
+        };
+        let NestedTriggerArgs::Event { event_name } = trigger else {
+            panic!("expected event trigger");
+        };
+        assert_eq!(event_name, "ready");
+
+        let nested = NestedObjectArgs {
+            name: "job".to_string(),
+            trigger: NestedTriggerArgs::Webhook,
+        };
+        assert_eq!(nested.name, "job");
+        assert!(matches!(nested.trigger, NestedTriggerArgs::Webhook));
+
+        let ask = AskUserLikeArgs {
+            question: "Continue?".to_string(),
+            options: vec!["yes".to_string()],
+            multi_select: false,
+        };
+        assert_eq!(ask.question, "Continue?");
+        assert_eq!(ask.options, ["yes"]);
+        assert!(!ask.multi_select);
+    }
+
     #[test]
     fn test_repeated_flag_for_array() {
+        touch_test_arg_types();
         let schema = schemars::schema_for!(AskUserLikeArgs);
         let schema = serde_json::to_value(schema).unwrap();
 
@@ -2164,8 +2343,7 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("missing required argument: options"),
-            "got: {}",
-            err
+            "got: {err}"
         );
     }
 
@@ -2251,7 +2429,7 @@ mod tests {
         let err = cli_to_json(&schema, &["--path".into()]).unwrap_err();
         // path is consumed as positional, so we get missing required
         // Actually --path starts with --, so it enters the named path and needs a value
-        assert!(err.to_string().contains("missing"), "got: {}", err);
+        assert!(err.to_string().contains("missing"), "got: {err}");
     }
 
     #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -2300,11 +2478,7 @@ mod tests {
         let cli = cmd.args_to_cli();
         // Should produce repeated --options flags
         let options_count = cli.iter().filter(|a| *a == "--options").count();
-        assert_eq!(
-            options_count, 3,
-            "expected 3 --options flags, got: {:?}",
-            cli
-        );
+        assert_eq!(options_count, 3, "expected 3 --options flags, got: {cli:?}");
         assert!(cli.contains(&"A".to_string()));
         assert!(cli.contains(&"B".to_string()));
         assert!(cli.contains(&"C".to_string()));
@@ -2355,8 +2529,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_handle_large_output_write_failure_returns_error_message() {
+    #[tokio::test]
+    async fn test_handle_large_output_write_failure_returns_error_message() {
         let tmp = tempfile::tempdir().unwrap();
         let output_dir = tmp.path().join("not-a-directory");
         std::fs::write(&output_dir, "occupied").unwrap();
@@ -2364,7 +2538,7 @@ mod tests {
             content: "x".repeat(INLINE_OUTPUT_LIMIT + 1),
         });
 
-        let result = futures_lite::future::block_on(handle_large_output(output, &output_dir));
+        let result = handle_large_output(output, &output_dir).await;
         assert!(!result.ok);
         assert!(
             result
@@ -2375,15 +2549,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_ask_user_e2e_repeated_option() {
+    #[tokio::test]
+    async fn test_ask_user_e2e_repeated_option() {
         use aither_core::llm::{Tool, ToolResult};
         use std::borrow::Cow;
 
         #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
         struct Question {
             section: String,
-            question: String,
+            #[serde(rename = "question")]
+            prompt: String,
             option: Vec<String>,
             #[serde(default)]
             multi_select: bool,
@@ -2416,6 +2591,7 @@ mod tests {
                     "question": args.question,
                     "option": args.option,
                     "multi_select": args.multi_select,
+                    "questions": args.questions,
                 }))
             }
         }
@@ -2435,7 +2611,7 @@ mod tests {
         }))
         .unwrap();
 
-        let result = futures_lite::future::block_on(cmd.handle());
+        let result = cmd.handle().await;
         tracing::debug!("result: {}", serde_json::to_string_pretty(&result).unwrap());
         assert!(result.ok, "command should succeed: {result:?}");
 
@@ -2443,7 +2619,7 @@ mod tests {
             panic!("expected JSON payload, got {result:?}");
         };
         let options = parsed["option"].as_array().expect("option should be array");
-        assert_eq!(options.len(), 3, "expected 3 options, got: {:?}", options);
+        assert_eq!(options.len(), 3, "expected 3 options, got: {options:?}");
         assert_eq!(options[0], "原味");
         assert_eq!(options[1], "番茄味");
         assert_eq!(options[2], "芝士味");

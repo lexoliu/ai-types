@@ -3,7 +3,7 @@
 mod ask;
 mod terminal;
 
-pub use ask::AskCommand;
+pub use ask::{AskCommand, AskModelTier};
 pub use terminal::{
     InputTerminalArgs, InputTerminalTool, KillTerminalArgs, KillTerminalTool,
     ReadTerminalDeltaArgs, ReadTerminalDeltaTool,

@@ -239,32 +239,30 @@ mod system_time_option {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_file_cache_insert_get() {
-        tokio_test::block_on(async {
-            let dir = tempfile::tempdir().expect("create temp dir");
-            let cache_dir = dir.path().join("cache");
-            let file_path = dir.path().join("file.txt");
-            async_fs::write(&file_path, b"hello")
-                .await
-                .expect("write file");
+    #[tokio::test]
+    async fn test_file_cache_insert_get() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let cache_dir = dir.path().join("cache");
+        let file_path = dir.path().join("file.txt");
+        async_fs::write(&file_path, b"hello")
+            .await
+            .expect("write file");
 
-            let mut cache = FileCache::open(cache_dir).await.expect("open cache");
-            cache
-                .insert(&file_path, "openai", "file-1".to_string(), None)
-                .await
-                .expect("insert");
-            cache.save().await.expect("save");
+        let mut cache = FileCache::open(cache_dir).await.expect("open cache");
+        cache
+            .insert(&file_path, "openai", "file-1".to_string(), None)
+            .await
+            .expect("insert");
+        cache.save().await.expect("save");
 
-            let cache = FileCache::open(dir.path().join("cache"))
-                .await
-                .expect("reload");
-            let entry = cache
-                .get(&file_path, "openai")
-                .await
-                .expect("get")
-                .expect("entry");
-            assert_eq!(entry.reference, "file-1");
-        });
+        let cache = FileCache::open(dir.path().join("cache"))
+            .await
+            .expect("reload");
+        let entry = cache
+            .get(&file_path, "openai")
+            .await
+            .expect("get")
+            .expect("entry");
+        assert_eq!(entry.reference, "file-1");
     }
 }

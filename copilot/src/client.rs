@@ -14,7 +14,6 @@ use aither_core::{
         tool::ToolDefinition,
     },
 };
-use async_fs;
 use async_io::Timer;
 use futures_core::Stream;
 use futures_lite::StreamExt;
@@ -88,7 +87,13 @@ impl LanguageModel for Copilot {
                 return;
             }
 
-            let payload_messages = to_chat_messages(&messages).await;
+            let payload_messages = match to_chat_messages(&messages).await {
+                Ok(messages) => messages,
+                Err(error) => {
+                    yield Err(CopilotError::Api(error));
+                    return;
+                }
+            };
             let openai_tools = if tool_defs.is_empty() {
                 None
             } else {
@@ -381,7 +386,7 @@ struct ChunkToolFunction {
 
 // === Conversion Functions ===
 
-async fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
+async fn to_chat_messages(messages: &[Message]) -> Result<Vec<ChatMessagePayload>, String> {
     let mut payloads = Vec::with_capacity(messages.len());
     for msg in messages {
         let (role, tool_calls, tool_call_id) = match msg.role() {
@@ -415,29 +420,33 @@ async fn to_chat_messages(messages: &[Message]) -> Vec<ChatMessagePayload> {
         };
         payloads.push(ChatMessagePayload {
             role,
-            content: build_content(msg).await,
+            content: build_content(msg).await?,
             tool_calls,
             tool_call_id,
         });
     }
-    payloads
+    Ok(payloads)
 }
 
-async fn build_content(message: &Message) -> ContentPayload {
+async fn build_content(message: &Message) -> Result<ContentPayload, String> {
     let attachments = message.attachments();
 
     if attachments.is_empty() {
-        return ContentPayload::Text(message.content().to_owned());
+        return Ok(ContentPayload::Text(message.content().to_owned()));
     }
 
-    let mut parts = Vec::new();
-
+    let mut parts = Vec::with_capacity(attachments.len() + 1);
     for attachment in attachments {
-        if let Some(data_url) = url_to_data_url(attachment).await {
-            parts.push(ContentPart::ImageUrl {
-                image_url: ImageUrlPayload { url: data_url },
-            });
+        let media_type = attachment.media_type().as_ref();
+        if !media_type.starts_with("image/") {
+            return Err(format!(
+                "Copilot Chat Completions does not support attachment MIME type '{media_type}'"
+            ));
         }
+        let data_url = url_to_data_url(attachment.url(), media_type).await?;
+        parts.push(ContentPart::ImageUrl {
+            image_url: ImageUrlPayload { url: data_url },
+        });
     }
 
     if !message.content().is_empty() {
@@ -446,45 +455,30 @@ async fn build_content(message: &Message) -> ContentPayload {
         });
     }
 
-    ContentPayload::Parts(parts)
+    Ok(ContentPayload::Parts(parts))
 }
 
-async fn url_to_data_url(url: &url::Url) -> Option<String> {
+async fn url_to_data_url(url: &url::Url, media_type: &str) -> Result<String, String> {
     match url.scheme() {
-        "data" => Some(url.as_str().to_string()),
-        "http" | "https" => Some(url.as_str().to_string()),
-        "file" => read_file_to_data_url(url).await,
-        _ => {
-            tracing::warn!("Unsupported attachment URL scheme: {}", url.scheme());
-            None
-        }
+        "data" | "http" | "https" => Ok(url.as_str().to_string()),
+        "file" => read_file_to_data_url(url, media_type).await,
+        scheme => Err(format!(
+            "Copilot does not support attachment URL scheme '{scheme}'"
+        )),
     }
 }
 
-async fn read_file_to_data_url(url: &url::Url) -> Option<String> {
+async fn read_file_to_data_url(url: &url::Url, media_type: &str) -> Result<String, String> {
     use base64::Engine;
 
-    let path = url.to_file_path().ok()?;
-    let data = async_fs::read(&path).await.ok()?;
-    let mime_type = mime_from_path(&path)?;
-    let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
-
-    Some(format!("data:{mime_type};base64,{base64_data}"))
-}
-
-fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())?
-        .to_lowercase()
-        .as_str()
-    {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        _ => None,
-    }
+    let path = url
+        .to_file_path()
+        .map_err(|()| "attachment file URL could not be converted to a path".to_string())?;
+    let data = async_fs::read(&path)
+        .await
+        .map_err(|error| format!("failed to read attachment '{}': {error}", path.display()))?;
+    let base64_data = base64::engine::general_purpose::STANDARD.encode(data);
+    Ok(format!("data:{media_type};base64,{base64_data}"))
 }
 
 fn convert_tools(tool_defs: &[ToolDefinition]) -> Vec<ToolPayload> {
@@ -596,6 +590,183 @@ async fn refresh_session_config(cfg: &Config) -> Result<Option<Config>, CopilotE
     Ok(Some(refreshed))
 }
 
+async fn open_sse_stream_with_refresh(
+    cfg: &mut Config,
+    request: &ChatCompletionRequest,
+) -> Result<zenwave::sse::SseStream, CopilotError> {
+    match open_sse_stream(cfg, request).await {
+        Ok(stream) => Ok(stream),
+        Err(err) if is_unauthorized(&err) => match refresh_session_config(cfg).await? {
+            Some(refreshed) => {
+                *cfg = refreshed;
+                open_sse_stream(cfg, request).await
+            }
+            None => Err(err),
+        },
+        Err(err) => Err(err),
+    }
+}
+
+struct ProcessedSse {
+    events: Vec<Event>,
+    saw_payload: bool,
+    done: bool,
+}
+
+enum SseStep {
+    Event(Result<zenwave::sse::Event, zenwave::sse::ParseError>),
+    Closed,
+    IdleTimeout,
+    FirstEventTimeout,
+}
+
+async fn next_sse_event(
+    sse_stream: &mut zenwave::sse::SseStream,
+    saw_payload: bool,
+    last_progress: Instant,
+) -> SseStep {
+    let timeout = if saw_payload {
+        SSE_IDLE_TIMEOUT
+    } else {
+        SSE_FIRST_EVENT_TIMEOUT
+    };
+    let elapsed = Instant::now().saturating_duration_since(last_progress);
+    if elapsed >= timeout {
+        return if saw_payload {
+            SseStep::IdleTimeout
+        } else {
+            SseStep::FirstEventTimeout
+        };
+    }
+    futures_lite::future::race(
+        async {
+            sse_stream
+                .next()
+                .await
+                .map_or(SseStep::Closed, SseStep::Event)
+        },
+        async {
+            Timer::after(timeout.saturating_sub(elapsed)).await;
+            if saw_payload {
+                SseStep::IdleTimeout
+            } else {
+                SseStep::FirstEventTimeout
+            }
+        },
+    )
+    .await
+}
+
+fn process_sse_data(
+    data: &str,
+    usage: &mut Option<Usage>,
+    tool_calls: &mut HashMap<usize, ToolCallAccumulator>,
+    saw_finish: &mut bool,
+) -> Result<ProcessedSse, CopilotError> {
+    if data.is_empty() {
+        return Ok(ProcessedSse {
+            events: Vec::new(),
+            saw_payload: false,
+            done: false,
+        });
+    }
+    if data == "[DONE]" {
+        return Ok(ProcessedSse {
+            events: Vec::new(),
+            saw_payload: false,
+            done: true,
+        });
+    }
+    if let Ok(error_obj) = serde_json::from_str::<Value>(data)
+        && let Some(error) = error_obj.get("error")
+    {
+        let msg = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Unknown API error");
+        return Err(CopilotError::Api(msg.to_string()));
+    }
+
+    let chunk: ChatCompletionChunk = serde_json::from_str(data).map_err(CopilotError::Json)?;
+    let mut events = Vec::new();
+    let mut saw_payload = chunk.usage.is_some();
+    if let Some(chunk_usage) = &chunk.usage {
+        *usage = Some(usage_from_chat_completion(chunk_usage));
+    }
+    if !chunk.choices.is_empty()
+        && chunk
+            .choices
+            .iter()
+            .all(|choice| choice.finish_reason.is_some())
+    {
+        *saw_finish = true;
+    }
+    for choice in &chunk.choices {
+        if let Some(content) = &choice.delta.content
+            && !content.is_empty()
+        {
+            saw_payload = true;
+            events.push(Event::Text(content.clone()));
+        }
+        if let Some(calls) = &choice.delta.tool_calls
+            && !calls.is_empty()
+        {
+            saw_payload = true;
+            accumulate_tool_calls(calls, tool_calls);
+        }
+    }
+    Ok(ProcessedSse {
+        events,
+        saw_payload,
+        done: false,
+    })
+}
+
+fn accumulate_tool_calls(
+    calls: &[ChunkToolCall],
+    tool_calls: &mut HashMap<usize, ToolCallAccumulator>,
+) {
+    for call in calls {
+        let index = call.index.unwrap_or(0);
+        let acc = tool_calls.entry(index).or_default();
+        if let Some(id) = &call.id {
+            acc.id = Some(id.clone());
+        }
+        if let Some(function) = &call.function {
+            if let Some(name) = &function.name {
+                acc.name = Some(name.clone());
+            }
+            if let Some(args) = &function.arguments {
+                acc.arguments.push_str(args);
+            }
+        }
+    }
+}
+
+fn accumulated_tool_call_events(tool_calls: HashMap<usize, ToolCallAccumulator>) -> Vec<Event> {
+    let mut sorted_calls: Vec<_> = tool_calls.into_iter().collect();
+    sorted_calls.sort_by_key(|(index, _)| *index);
+    sorted_calls
+        .into_iter()
+        .filter_map(|(_, acc)| {
+            let (Some(id), Some(name)) = (acc.id, acc.name) else {
+                return None;
+            };
+            let arguments = if acc.arguments.is_empty() {
+                Value::Object(serde_json::Map::default())
+            } else {
+                serde_json::from_str(&acc.arguments)
+                    .unwrap_or_else(|_| Value::Object(serde_json::Map::default()))
+            };
+            Some(Event::ToolCall(ToolCall {
+                id,
+                name,
+                arguments,
+            }))
+        })
+        .collect()
+}
+
 fn chat_completions_stream(
     cfg: Arc<Config>,
     payload_messages: Vec<ChatMessagePayload>,
@@ -645,179 +816,78 @@ fn chat_completions_stream_inner(
             "Sending Copilot chat completion request"
         );
 
-        let sse_stream = match open_sse_stream(&cfg, &request).await {
+        let sse_stream = match open_sse_stream_with_refresh(&mut cfg, &request).await {
             Ok(stream) => stream,
-            Err(err) if is_unauthorized(&err) => {
-                match refresh_session_config(&cfg).await {
-                    Ok(Some(refreshed)) => {
-                        cfg = refreshed;
-                        match open_sse_stream(&cfg, &request).await {
-                            Ok(stream) => stream,
-                            Err(e) => {
-                                yield Err(e);
-                                return;
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        yield Err(err);
-                        return;
-                    }
-                    Err(e) => {
-                        yield Err(e);
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                yield Err(e);
+            Err(err) => {
+                yield Err(err);
                 return;
             }
         };
 
-        // Stream SSE events, stopping on [DONE], a finish_reason, or an idle timeout.
+        let events = stream_chat_completion_events(sse_stream);
+        futures_lite::pin!(events);
+        while let Some(event) = events.next().await {
+            yield event;
+        }
+    }
+}
+
+fn stream_chat_completion_events(
+    sse_stream: zenwave::sse::SseStream,
+) -> impl Stream<Item = Result<Event, CopilotError>> + Send {
+    async_stream::stream! {
         let mut event_count = 0usize;
         let mut saw_finish = false;
         let mut saw_payload = false;
         let mut last_progress = Instant::now();
-
-        // Accumulate tool calls by index
         let mut tool_calls: HashMap<usize, ToolCallAccumulator> = HashMap::new();
         let mut usage: Option<Usage> = None;
 
-        let sse_stream = sse_stream;
         futures_lite::pin!(sse_stream);
-
         loop {
-            enum NextEvent {
-                Event(Option<Result<zenwave::sse::Event, zenwave::sse::ParseError>>),
-                Timeout,
-            }
-
-            let timeout = if saw_payload {
-                SSE_IDLE_TIMEOUT
-            } else {
-                SSE_FIRST_EVENT_TIMEOUT
-            };
-
-            let elapsed = Instant::now().saturating_duration_since(last_progress);
-            if elapsed >= timeout {
-                if saw_payload {
+            let next = next_sse_event(&mut sse_stream, saw_payload, last_progress).await;
+            match next {
+                SseStep::Event(Ok(event)) => {
+                    let data = event.text_data();
+                    let data = data.trim();
+                    if data.is_empty() {
+                        continue;
+                    }
+                    tracing::trace!(sse_event = %data, "Received Copilot SSE event");
+                    event_count += 1;
+                    let processed = match process_sse_data(
+                        data,
+                        &mut usage,
+                        &mut tool_calls,
+                        &mut saw_finish,
+                    ) {
+                        Ok(processed) => processed,
+                        Err(err) => {
+                            yield Err(err);
+                            return;
+                        }
+                    };
+                    if processed.done {
+                        break;
+                    }
+                    if processed.saw_payload {
+                        saw_payload = true;
+                        last_progress = Instant::now();
+                    }
+                    for event in processed.events {
+                        yield Ok(event);
+                    }
+                }
+                SseStep::Event(Err(err)) => {
+                    yield Err(CopilotError::Stream(err));
+                    return;
+                }
+                SseStep::Closed => break,
+                SseStep::IdleTimeout => {
                     tracing::warn!("Copilot SSE idle timeout; ending stream");
                     break;
                 }
-                yield Err(CopilotError::Timeout);
-                return;
-            }
-            let remaining = timeout.saturating_sub(elapsed);
-
-            let next = futures_lite::future::race(
-                async {
-                    NextEvent::Event(sse_stream.next().await)
-                },
-                async {
-                    Timer::after(remaining).await;
-                    NextEvent::Timeout
-                },
-            )
-            .await;
-
-            match next {
-                NextEvent::Event(Some(event)) => {
-                    match event {
-                        Ok(e) => {
-                            let data = e.text_data();
-                            let data = data.trim();
-                            if data.is_empty() {
-                                continue;
-                            }
-                            if data == "[DONE]" {
-                                break;
-                            }
-                            tracing::trace!(sse_event = %data, "Received Copilot SSE event");
-                            event_count += 1;
-
-                            // Check for API error response
-                            if let Ok(error_obj) = serde_json::from_str::<Value>(data) {
-                                if let Some(error) = error_obj.get("error") {
-                                    let msg = error
-                                        .get("message")
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("Unknown API error");
-                                    yield Err(CopilotError::Api(msg.to_string()));
-                                    return;
-                                }
-                            }
-
-                            match serde_json::from_str::<ChatCompletionChunk>(data) {
-                                Ok(chunk) => {
-                                    if let Some(chunk_usage) = &chunk.usage {
-                                        usage = Some(usage_from_chat_completion(chunk_usage));
-                                        saw_payload = true;
-                                        last_progress = Instant::now();
-                                    }
-                                    if !chunk.choices.is_empty()
-                                        && chunk
-                                            .choices
-                                            .iter()
-                                            .all(|choice| choice.finish_reason.is_some())
-                                    {
-                                        saw_finish = true;
-                                    }
-                                    for choice in &chunk.choices {
-                                        // Emit text events
-                                        if let Some(content) = &choice.delta.content {
-                                            if !content.is_empty() {
-                                                saw_payload = true;
-                                                last_progress = Instant::now();
-                                                yield Ok(Event::Text(content.clone()));
-                                            }
-                                        }
-
-                                        // Accumulate tool calls
-                                        if let Some(calls) = &choice.delta.tool_calls {
-                                            if !calls.is_empty() {
-                                                saw_payload = true;
-                                                last_progress = Instant::now();
-                                            }
-                                            for call in calls {
-                                                let index = call.index.unwrap_or(0);
-                                                let acc = tool_calls.entry(index).or_default();
-                                                if let Some(id) = &call.id {
-                                                    acc.id = Some(id.clone());
-                                                }
-                                                if let Some(function) = &call.function {
-                                                    if let Some(name) = &function.name {
-                                                        acc.name = Some(name.clone());
-                                                    }
-                                                    if let Some(args) = &function.arguments {
-                                                        acc.arguments.push_str(args);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    yield Err(CopilotError::Json(e));
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            yield Err(CopilotError::Stream(e));
-                            return;
-                        }
-                    }
-                }
-                NextEvent::Event(None) => {
-                    break;
-                }
-                NextEvent::Timeout => {
-                    if saw_payload {
-                        tracing::warn!("Copilot SSE idle timeout; ending stream");
-                        break;
-                    }
+                SseStep::FirstEventTimeout => {
                     yield Err(CopilotError::Timeout);
                     return;
                 }
@@ -828,20 +898,8 @@ fn chat_completions_stream_inner(
         }
 
         tracing::debug!(event_count, "Processed Copilot SSE events");
-
-        // Emit accumulated tool calls at the end
-        let mut sorted_calls: Vec<_> = tool_calls.into_iter().collect();
-        sorted_calls.sort_by_key(|(index, _)| *index);
-        for (_, acc) in sorted_calls {
-            if let (Some(id), Some(name)) = (acc.id, acc.name) {
-                let arguments = if acc.arguments.is_empty() {
-                    Value::Object(Default::default())
-                } else {
-                    serde_json::from_str(&acc.arguments)
-                        .unwrap_or(Value::Object(Default::default()))
-                };
-                yield Ok(Event::ToolCall(ToolCall { id, name, arguments }));
-            }
+        for event in accumulated_tool_call_events(tool_calls) {
+            yield Ok(event);
         }
         if let Some(final_usage) = usage {
             yield Ok(Event::Usage(final_usage));

@@ -1,14 +1,13 @@
 //! Request building and message conversion for the Claude API.
 
 use aither_core::llm::{
-    Message, Role,
+    Attachment, Message, Role,
     model::{
-        ClaudeCacheBreakpointTarget, ClaudeExplicitCacheBreakpoints, ClaudePromptCache,
-        ClaudePromptCacheStrategy, ClaudePromptCacheTtl, Parameters, ToolChoice,
+        ClaudeCacheBreakpointTarget, ClaudeExplicitCacheBreakpoints, ClaudeNativeTools,
+        ClaudePromptCache, ClaudePromptCacheStrategy, ClaudePromptCacheTtl, Parameters, ToolChoice,
     },
     tool::ToolDefinition,
 };
-use async_fs;
 use base64::Engine;
 use serde::Serialize;
 use serde_json::Value;
@@ -110,7 +109,16 @@ pub enum ContentBlock {
     #[serde(rename = "image")]
     Image {
         /// Image source (base64 or URL).
-        source: ImageSource,
+        source: MediaSource,
+        /// Optional explicit cache control for this block.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControlPayload>,
+    },
+    /// PDF document content block.
+    #[serde(rename = "document")]
+    Document {
+        /// PDF source (base64 or URL).
+        source: MediaSource,
         /// Optional explicit cache control for this block.
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControlPayload>,
@@ -144,7 +152,7 @@ pub enum ContentBlock {
 /// Image source for vision requests.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
-pub enum ImageSource {
+pub enum MediaSource {
     /// Base64-encoded image data.
     #[serde(rename = "base64")]
     Base64 {
@@ -163,7 +171,17 @@ pub enum ImageSource {
 
 /// Tool definition in Claude format.
 #[derive(Debug, Clone, Serialize)]
-pub struct ToolPayload {
+#[serde(untagged)]
+pub enum ToolPayload {
+    /// User-defined tool.
+    Custom(CustomToolPayload),
+    /// Anthropic-defined tool.
+    Native(NativeToolPayload),
+}
+
+/// Custom tool definition in Claude format.
+#[derive(Debug, Clone, Serialize)]
+pub struct CustomToolPayload {
     /// Tool name.
     pub name: String,
     /// Tool description.
@@ -173,6 +191,19 @@ pub struct ToolPayload {
     /// Optional explicit cache control for this tool block.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControlPayload>,
+}
+
+/// Anthropic-defined tool definition.
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeToolPayload {
+    /// Tool type.
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    /// Tool name.
+    pub name: &'static str,
+    /// Optional maximum character count for text editor views.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_characters: Option<u32>,
 }
 
 /// Claude prompt cache control payload.
@@ -234,6 +265,8 @@ pub struct ParameterSnapshot {
     pub tool_choice: ToolChoice,
     /// Claude-specific cache controls.
     pub cache: Option<ClaudePromptCache>,
+    /// Claude-native tools.
+    pub native_tools: ClaudeNativeTools,
 }
 
 impl From<&Parameters> for ParameterSnapshot {
@@ -247,6 +280,7 @@ impl From<&Parameters> for ParameterSnapshot {
             include_reasoning: params.include_reasoning,
             tool_choice: params.tool_choice.clone(),
             cache: params.cache.claude,
+            native_tools: params.native_tools.claude.clone(),
         }
     }
 }
@@ -257,7 +291,7 @@ impl From<&Parameters> for ParameterSnapshot {
 /// plain text, while multiple system messages are preserved as system blocks.
 pub async fn to_claude_messages(
     messages: &[Message],
-) -> (Option<SystemPayload>, Vec<MessagePayload>) {
+) -> Result<(Option<SystemPayload>, Vec<MessagePayload>), String> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut claude_messages: Vec<MessagePayload> = Vec::new();
 
@@ -270,7 +304,7 @@ pub async fn to_claude_messages(
                 let content = if matches!(message.role(), Role::Tool) {
                     build_tool_result_content(message)
                 } else {
-                    build_user_content(message).await
+                    build_user_content(message).await?
                 };
                 claude_messages.push(MessagePayload {
                     role: "user",
@@ -303,31 +337,38 @@ pub async fn to_claude_messages(
         ))
     };
 
-    (system, claude_messages)
+    Ok((system, claude_messages))
 }
 
-/// Build content for a user message, handling vision attachments.
-async fn build_user_content(message: &Message) -> ContentPayload {
+/// Build content for a user message, handling image and PDF attachments.
+async fn build_user_content(message: &Message) -> Result<ContentPayload, String> {
     let attachments = message.attachments();
 
     if attachments.is_empty() {
-        return ContentPayload::Text(flatten_content(message));
+        return Ok(ContentPayload::Text(flatten_content(message)));
     }
 
-    let mut blocks: Vec<ContentBlock> = Vec::new();
-
-    // Process image attachments
+    let mut blocks: Vec<ContentBlock> = Vec::with_capacity(attachments.len() + 1);
     for attachment in attachments {
-        let url_str = attachment.as_str();
-        if let Some(source) = parse_image_source(url_str).await {
+        let source = parse_media_source(attachment).await?;
+        let media_type = attachment.media_type().as_ref();
+        if media_type.starts_with("image/") {
             blocks.push(ContentBlock::Image {
                 source,
                 cache_control: None,
             });
+        } else if media_type == "application/pdf" {
+            blocks.push(ContentBlock::Document {
+                source,
+                cache_control: None,
+            });
+        } else {
+            return Err(format!(
+                "Claude Messages API does not support attachment MIME type '{media_type}'"
+            ));
         }
     }
 
-    // Add text content
     let text = flatten_content(message);
     if !text.is_empty() {
         blocks.push(ContentBlock::Text {
@@ -336,18 +377,16 @@ async fn build_user_content(message: &Message) -> ContentPayload {
         });
     }
 
-    // Optimize: if only one text block, use simple string
-    if blocks.len() == 1 {
-        if let Some(ContentBlock::Text {
+    if blocks.len() == 1
+        && let Some(ContentBlock::Text {
             text,
             cache_control: None,
         }) = blocks.pop()
-        {
-            return ContentPayload::Text(text);
-        }
+    {
+        return Ok(ContentPayload::Text(text));
     }
 
-    ContentPayload::Blocks(blocks)
+    Ok(ContentPayload::Blocks(blocks))
 }
 
 fn build_assistant_content(message: &Message) -> ContentPayload {
@@ -490,6 +529,7 @@ fn apply_explicit_breakpoints(
     Ok(applied)
 }
 
+#[allow(clippy::ref_option)]
 fn maybe_automatic_cache_control(
     system: &Option<SystemPayload>,
     messages: &[MessagePayload],
@@ -526,6 +566,7 @@ fn maybe_automatic_cache_control(
     Ok(Some((cache_control, AppliedBreakpoint { position, ttl })))
 }
 
+#[allow(clippy::ref_option)]
 fn find_last_cacheable_block(
     system: &Option<SystemPayload>,
     messages: &[MessagePayload],
@@ -569,7 +610,12 @@ fn find_last_cacheable_block(
     }
 
     if let Some(tools) = tools {
-        if let Some((tool_index, tool)) = tools.iter().enumerate().last() {
+        if let Some((tool_index, tool)) = tools
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, tool)| custom_tool(tool).map(|custom| (index, custom)))
+        {
             return Some((PromptPosition::tool(tool_index), tool.cache_control.clone()));
         }
     }
@@ -577,7 +623,7 @@ fn find_last_cacheable_block(
     None
 }
 
-fn cache_control_payload_for_ttl(ttl: ClaudePromptCacheTtl) -> CacheControlPayload {
+const fn cache_control_payload_for_ttl(ttl: ClaudePromptCacheTtl) -> CacheControlPayload {
     CacheControlPayload {
         kind: "ephemeral",
         ttl: match ttl {
@@ -654,12 +700,15 @@ fn mark_last_tool_cache_control(
     let tools = tools.as_mut().ok_or_else(|| {
         "Claude explicit cache breakpoint requested for tools but tools are empty".to_string()
     })?;
-    let index = tools.len().checked_sub(1).ok_or_else(|| {
-        "Claude explicit cache breakpoint requested for tools but tools are empty".to_string()
-    })?;
-    let tool = tools.get_mut(index).ok_or_else(|| {
-        "Claude explicit cache breakpoint requested for tools but tools are empty".to_string()
-    })?;
+    let (index, tool) = tools
+        .iter_mut()
+        .enumerate()
+        .rev()
+        .find_map(|(index, tool)| custom_tool_mut(tool).map(|custom| (index, custom)))
+        .ok_or_else(|| {
+            "Claude explicit cache breakpoint requested for tools but no custom tool exists"
+                .to_string()
+        })?;
     set_cache_control(
         &mut tool.cache_control,
         cache_control,
@@ -679,6 +728,9 @@ fn mark_tool_cache_control(
     let tool = tools
         .get_mut(index)
         .ok_or_else(|| format!("Claude explicit tool breakpoint index {index} is out of range"))?;
+    let tool = custom_tool_mut(tool).ok_or_else(|| {
+        format!("Claude explicit tool breakpoint index {index} targets a native tool")
+    })?;
     set_cache_control(
         &mut tool.cache_control,
         cache_control,
@@ -836,33 +888,38 @@ fn last_cacheable_block_index(blocks: &[ContentBlock]) -> Option<usize> {
     blocks.iter().rposition(|block| match block {
         ContentBlock::Text { text, .. } => !text.is_empty(),
         ContentBlock::Image { .. }
+        | ContentBlock::Document { .. }
         | ContentBlock::ToolUse { .. }
         | ContentBlock::ToolResult { .. } => true,
     })
 }
 
-fn is_cacheable_block(block: &ContentBlock) -> bool {
+const fn is_cacheable_block(block: &ContentBlock) -> bool {
     match block {
         ContentBlock::Text { text, .. } => !text.is_empty(),
         ContentBlock::Image { .. }
+        | ContentBlock::Document { .. }
         | ContentBlock::ToolUse { .. }
         | ContentBlock::ToolResult { .. } => true,
     }
 }
 
-fn block_cache_control_mut(block: &mut ContentBlock) -> &mut Option<CacheControlPayload> {
+const fn block_cache_control_mut(block: &mut ContentBlock) -> &mut Option<CacheControlPayload> {
     match block {
         ContentBlock::Text { cache_control, .. }
         | ContentBlock::Image { cache_control, .. }
+        | ContentBlock::Document { cache_control, .. }
         | ContentBlock::ToolUse { cache_control, .. }
         | ContentBlock::ToolResult { cache_control, .. } => cache_control,
     }
 }
 
-fn block_cache_control(block: &ContentBlock) -> &Option<CacheControlPayload> {
+#[allow(clippy::ref_option)]
+const fn block_cache_control(block: &ContentBlock) -> &Option<CacheControlPayload> {
     match block {
         ContentBlock::Text { cache_control, .. }
         | ContentBlock::Image { cache_control, .. }
+        | ContentBlock::Document { cache_control, .. }
         | ContentBlock::ToolUse { cache_control, .. }
         | ContentBlock::ToolResult { cache_control, .. } => cache_control,
     }
@@ -883,97 +940,51 @@ fn set_cache_control(
     Ok(())
 }
 
-/// Parse a URL string into an image source.
-///
-/// Handles:
-/// - `data:image/...;base64,...` - already base64 encoded
-/// - `file:///path/to/file` - reads file and converts to base64
-/// - `http://` or `https://` URLs - passed through as URL source
-async fn parse_image_source(url: &str) -> Option<ImageSource> {
-    if url.starts_with("data:image/") {
-        // Parse data URL: data:image/jpeg;base64,/9j/4AAQ...
-        let after_data = url.strip_prefix("data:")?;
-        let (header, data) = after_data.split_once(',')?;
-        let media_type = header.strip_suffix(";base64")?;
-        Some(ImageSource::Base64 {
-            media_type: media_type.to_string(),
-            data: data.to_string(),
-        })
-    } else if url.starts_with("file://") {
-        // Read local file and convert to base64
-        read_file_to_base64_source(url).await
-    } else if is_image_url(url) {
-        Some(ImageSource::Url {
-            url: url.to_string(),
-        })
-    } else {
-        None
+/// Converts a typed attachment into a Claude media source.
+async fn parse_media_source(attachment: &Attachment) -> Result<MediaSource, String> {
+    let url = attachment.url();
+    let media_type = attachment.media_type().as_ref();
+    match url.scheme() {
+        "data" => {
+            let after_data = url
+                .as_str()
+                .strip_prefix("data:")
+                .ok_or_else(|| "attachment data URL is malformed".to_string())?;
+            let (header, data) = after_data
+                .split_once(',')
+                .ok_or_else(|| "attachment data URL is missing its payload".to_string())?;
+            let encoded_media_type = header
+                .strip_suffix(";base64")
+                .ok_or_else(|| "attachment data URL must use base64 encoding".to_string())?;
+            if encoded_media_type != media_type {
+                return Err(format!(
+                    "attachment MIME type '{media_type}' does not match data URL MIME type '{encoded_media_type}'"
+                ));
+            }
+            Ok(MediaSource::Base64 {
+                media_type: media_type.to_string(),
+                data: data.to_string(),
+            })
+        }
+        "file" => {
+            let path = url
+                .to_file_path()
+                .map_err(|()| "attachment file URL could not be converted to a path".to_string())?;
+            let data = async_fs::read(&path).await.map_err(|error| {
+                format!("failed to read attachment '{}': {error}", path.display())
+            })?;
+            Ok(MediaSource::Base64 {
+                media_type: media_type.to_string(),
+                data: base64::engine::general_purpose::STANDARD.encode(data),
+            })
+        }
+        "http" | "https" => Ok(MediaSource::Url {
+            url: url.as_str().to_string(),
+        }),
+        scheme => Err(format!(
+            "Claude does not support attachment URL scheme '{scheme}'"
+        )),
     }
-}
-
-/// Read a file:// URL and convert to base64 image source.
-async fn read_file_to_base64_source(file_url: &str) -> Option<ImageSource> {
-    let url = url::Url::parse(file_url).ok()?;
-    let path = url.to_file_path().ok()?;
-
-    // Read the file
-    let data = async_fs::read(&path).await.ok()?;
-
-    // Determine media type from extension
-    let media_type = mime_from_path(&path)?;
-
-    // Encode to base64
-    let base64_data = base64::engine::general_purpose::STANDARD.encode(&data);
-
-    Some(ImageSource::Base64 {
-        media_type: media_type.to_string(),
-        data: base64_data,
-    })
-}
-
-/// Get MIME type from file path extension.
-///
-/// Supports images, video, audio, and PDFs.
-fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())?
-        .to_lowercase()
-        .as_str()
-    {
-        // Images
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "heic" => Some("image/heic"),
-        "heif" => Some("image/heif"),
-        // Video
-        "mp4" => Some("video/mp4"),
-        "webm" => Some("video/webm"),
-        "mov" => Some("video/quicktime"),
-        "avi" => Some("video/x-msvideo"),
-        // Audio
-        "mp3" => Some("audio/mpeg"),
-        "wav" => Some("audio/wav"),
-        "ogg" => Some("audio/ogg"),
-        "m4a" => Some("audio/mp4"),
-        "flac" => Some("audio/flac"),
-        // Documents
-        "pdf" => Some("application/pdf"),
-        _ => None,
-    }
-}
-
-/// Check if a URL appears to be an image.
-fn is_image_url(url: &str) -> bool {
-    let lower = url.to_lowercase();
-    lower.ends_with(".jpg")
-        || lower.ends_with(".jpeg")
-        || lower.ends_with(".png")
-        || lower.ends_with(".gif")
-        || lower.ends_with(".webp")
-        || lower.contains("/image")
 }
 
 /// Flatten message content.
@@ -981,17 +992,73 @@ fn flatten_content(message: &Message) -> String {
     message.content().to_owned()
 }
 
+const fn custom_tool(tool: &ToolPayload) -> Option<&CustomToolPayload> {
+    match tool {
+        ToolPayload::Custom(tool) => Some(tool),
+        ToolPayload::Native(_) => None,
+    }
+}
+
+const fn custom_tool_mut(tool: &mut ToolPayload) -> Option<&mut CustomToolPayload> {
+    match tool {
+        ToolPayload::Custom(tool) => Some(tool),
+        ToolPayload::Native(_) => None,
+    }
+}
+
 /// Convert aither tool definitions to Claude format.
 pub fn convert_tools(definitions: &[ToolDefinition]) -> Vec<ToolPayload> {
     definitions
         .iter()
-        .map(|tool| ToolPayload {
-            name: tool.name().to_string(),
-            description: tool.description().to_string(),
-            input_schema: tool.arguments_openai_schema(),
-            cache_control: None,
+        .map(|tool| {
+            ToolPayload::Custom(CustomToolPayload {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                input_schema: tool.arguments_openai_schema(),
+                cache_control: None,
+            })
         })
         .collect()
+}
+
+pub fn convert_native_tools(tools: &ClaudeNativeTools) -> Vec<ToolPayload> {
+    let mut payload = Vec::new();
+    if tools.web_search {
+        payload.push(ToolPayload::Native(NativeToolPayload {
+            kind: "web_search_20260209",
+            name: "web_search",
+            max_characters: None,
+        }));
+    }
+    if tools.web_fetch {
+        payload.push(ToolPayload::Native(NativeToolPayload {
+            kind: "web_fetch_20260209",
+            name: "web_fetch",
+            max_characters: None,
+        }));
+    }
+    if tools.code_execution {
+        payload.push(ToolPayload::Native(NativeToolPayload {
+            kind: "code_execution_20260120",
+            name: "code_execution",
+            max_characters: None,
+        }));
+    }
+    if tools.bash {
+        payload.push(ToolPayload::Native(NativeToolPayload {
+            kind: "bash_20250124",
+            name: "bash",
+            max_characters: None,
+        }));
+    }
+    if let Some(text_editor) = tools.text_editor {
+        payload.push(ToolPayload::Native(NativeToolPayload {
+            kind: "text_editor_20250728",
+            name: "str_replace_based_edit_tool",
+            max_characters: text_editor.max_characters,
+        }));
+    }
+    payload
 }
 
 pub fn filter_tool_definitions(
@@ -1021,19 +1088,19 @@ pub fn tool_choice_payload(choice: &ToolChoice, has_tools: bool) -> Option<ToolC
 }
 
 #[cfg(test)]
+#[allow(clippy::match_wildcard_for_single_variants)]
 mod tests {
     use super::*;
     use aither_core::llm::{
-        ToolCall,
+        Attachment, ToolCall,
         model::{
             ClaudeCacheBreakpointTarget, ClaudeExplicitCacheBreakpoint,
             ClaudeExplicitCacheBreakpoints, ClaudePromptCache, ClaudePromptCacheStrategy,
             ClaudePromptCacheTtl, Parameters, ToolChoice,
         },
     };
-
-    #[test]
-    fn assistant_tool_calls_are_encoded_as_tool_use_blocks() {
+    #[tokio::test]
+    async fn assistant_tool_calls_are_encoded_as_tool_use_blocks() {
         let messages = vec![Message::assistant_with_tool_calls(
             "Working on it",
             vec![ToolCall {
@@ -1042,7 +1109,9 @@ mod tests {
                 arguments: serde_json::json!({"q":"rust"}),
             }],
         )];
-        let (_, encoded) = to_claude_messages(&messages);
+        let (_, encoded) = to_claude_messages(&messages)
+            .await
+            .expect("encode Claude messages");
         assert_eq!(encoded.len(), 1);
         assert_eq!(encoded[0].role, "assistant");
         match &encoded[0].content {
@@ -1055,10 +1124,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tool_message_is_encoded_as_tool_result_block() {
+    #[tokio::test]
+    async fn tool_message_is_encoded_as_tool_result_block() {
         let messages = vec![Message::tool("call_9", "{\"ok\":true}")];
-        let (_, encoded) = to_claude_messages(&messages);
+        let (_, encoded) = to_claude_messages(&messages)
+            .await
+            .expect("encode Claude messages");
         assert_eq!(encoded.len(), 1);
         assert_eq!(encoded[0].role, "user");
         match &encoded[0].content {
@@ -1078,6 +1149,43 @@ mod tests {
             }
             other => panic!("expected user blocks payload, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn image_and_pdf_attachments_use_distinct_blocks() {
+        let image = Attachment::new(
+            "data:image/png;base64,AA==".parse().expect("image URL"),
+            "image/png".parse().expect("image MIME"),
+        );
+        let pdf = Attachment::new(
+            "https://platform.claude.com/docs/en/build-with-claude/pdf-support/sample.pdf"
+                .parse()
+                .expect("PDF URL"),
+            "application/pdf".parse().expect("PDF MIME"),
+        );
+        let messages = vec![Message::user("inspect").with_attachments([image, pdf])];
+        let (_, encoded) = to_claude_messages(&messages)
+            .await
+            .expect("encode Claude attachments");
+        let ContentPayload::Blocks(blocks) = &encoded[0].content else {
+            panic!("expected Claude content blocks");
+        };
+        assert!(matches!(blocks[0], ContentBlock::Image { .. }));
+        assert!(matches!(blocks[1], ContentBlock::Document { .. }));
+        assert!(matches!(blocks[2], ContentBlock::Text { .. }));
+    }
+
+    #[tokio::test]
+    async fn audio_attachment_fails_instead_of_becoming_an_image() {
+        let audio = Attachment::new(
+            "data:audio/wav;base64,AA==".parse().expect("audio URL"),
+            "audio/wav".parse().expect("audio MIME"),
+        );
+        let messages = vec![Message::user("listen").with_attachment(audio)];
+        let error = to_claude_messages(&messages)
+            .await
+            .expect_err("Claude audio input must fail");
+        assert!(error.contains("does not support attachment MIME type"));
     }
 
     #[test]
@@ -1123,14 +1231,16 @@ mod tests {
         assert!(short_json.get("ttl").is_none());
     }
 
-    #[test]
-    fn multiple_system_messages_are_preserved_as_system_blocks() {
+    #[tokio::test]
+    async fn multiple_system_messages_are_preserved_as_system_blocks() {
         let messages = vec![
             Message::system("Instruction A"),
             Message::system("Instruction B"),
             Message::user("Hello"),
         ];
-        let (system, encoded) = to_claude_messages(&messages);
+        let (system, encoded) = to_claude_messages(&messages)
+            .await
+            .expect("encode Claude messages");
         assert_eq!(encoded.len(), 1);
         let system = system.expect("system payload should exist");
         match system {
@@ -1222,12 +1332,12 @@ mod tests {
             role: "user",
             content: ContentPayload::Text("Tell me about Mars".to_string()),
         }];
-        let mut tools = Some(vec![ToolPayload {
+        let mut tools = Some(vec![ToolPayload::Custom(CustomToolPayload {
             name: "search".to_string(),
             description: "search docs".to_string(),
             input_schema: serde_json::json!({"type":"object"}),
             cache_control: None,
-        }]);
+        })]);
 
         let cache =
             ClaudePromptCache::automatic_with_explicit(ClaudePromptCacheTtl::FiveMinutes, {
@@ -1246,6 +1356,7 @@ mod tests {
         assert!(
             tools
                 .last()
+                .and_then(custom_tool)
                 .and_then(|tool| tool.cache_control.as_ref())
                 .is_some()
         );
@@ -1258,12 +1369,12 @@ mod tests {
             role: "user",
             content: ContentPayload::Text("Hello".to_string()),
         }];
-        let mut tools = Some(vec![ToolPayload {
+        let mut tools = Some(vec![ToolPayload::Custom(CustomToolPayload {
             name: "search".to_string(),
             description: "search docs".to_string(),
             input_schema: serde_json::json!({"type":"object"}),
             cache_control: None,
-        }]);
+        })]);
 
         let breakpoints = ClaudeExplicitCacheBreakpoints::new(
             ClaudeExplicitCacheBreakpoint::new(ClaudeCacheBreakpointTarget::LastTool)
@@ -1308,12 +1419,12 @@ mod tests {
                 content: ContentPayload::Text("Final user message".to_string()),
             },
         ];
-        let mut tools = Some(vec![ToolPayload {
+        let mut tools = Some(vec![ToolPayload::Custom(CustomToolPayload {
             name: "search".to_string(),
             description: "search docs".to_string(),
             input_schema: serde_json::json!({"type":"object"}),
             cache_control: None,
-        }]);
+        })]);
 
         let breakpoints = ClaudeExplicitCacheBreakpoints::new(ClaudeExplicitCacheBreakpoint::new(
             ClaudeCacheBreakpointTarget::Tool(0),

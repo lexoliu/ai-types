@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 /// Outcome of a container execution request.
 #[derive(Debug)]
 pub enum ContainerExecOutcome {
+    /// Command completed with process output.
     Completed(std::process::Output),
+    /// Command was killed before completion.
     Killed,
 }
 
@@ -34,7 +36,9 @@ pub trait ContainerExec: Send + Sync {
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
 }
 
-pub(crate) trait ContainerExecObject: Send + Sync {
+/// Object-safe container execution trait.
+pub trait ContainerExecObject: Send + Sync {
+    /// Execute a command inside a container through a boxed future.
     fn exec_boxed<'a>(
         &'a self,
         container_id: &'a str,
@@ -104,6 +108,7 @@ impl ContainerExec for ContainerExecHandle {
     }
 }
 
+/// Container runtime session metadata.
 #[derive(Clone)]
 pub struct ContainerShellRuntime {
     exec: Arc<dyn ContainerExecObject>,
@@ -121,6 +126,10 @@ impl std::fmt::Debug for ContainerShellRuntime {
 }
 
 impl ContainerShellRuntime {
+    /// Creates a container shell runtime.
+    ///
+    /// # Panics
+    /// Panics if `container_id` or `ipc_host` is empty after trimming.
     #[must_use]
     pub fn new(
         container_id: impl Into<String>,
@@ -138,18 +147,20 @@ impl ContainerShellRuntime {
             "container runtime requires a non-empty ipc_host"
         );
         Self {
-            exec: Arc::clone(&exec.inner),
+            exec: exec.inner,
             container_id,
             ipc_host,
         }
     }
 
     #[must_use]
+    /// Returns the container id.
     pub fn container_id(&self) -> &str {
         &self.container_id
     }
 
     #[must_use]
+    /// Returns the host name used for IPC callbacks from the container.
     pub fn ipc_host(&self) -> &str {
         &self.ipc_host
     }
@@ -180,36 +191,53 @@ impl<T: ContainerExec> ContainerExecObject for T {
     }
 }
 
+/// Available shell execution backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellBackend {
+    /// Execute directly on the local host.
     Local,
+    /// Execute inside a container.
     Container,
+    /// Execute through SSH.
     Ssh,
 }
 
+/// Named SSH server target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SshServer {
+    /// Server identifier.
     pub name: String,
+    /// SSH target string.
     pub target: String,
 }
 
 impl SshServer {
+    /// Returns the server identifier.
     #[must_use]
     pub fn id(&self) -> &str {
         &self.name
     }
 }
 
+/// Runtime profile used after preparing an SSH target.
 #[derive(Debug, Clone)]
 pub enum SshRuntimeProfile {
-    Heel { binary: String },
+    /// Heel-powered SSH runtime.
+    Heel {
+        /// Remote heel binary path.
+        binary: String,
+    },
 }
 
+/// Availability flags for shell execution backends.
 #[derive(Debug, Clone, Serialize)]
 pub struct ShellRuntimeAvailability {
+    /// Local host execution is available.
     pub local: bool,
+    /// Container execution is available.
     pub container: bool,
+    /// SSH execution is available.
     pub ssh: bool,
 }
 
@@ -223,12 +251,15 @@ impl Default for ShellRuntimeAvailability {
     }
 }
 
+/// Authorizes SSH connection and runtime bootstrap actions.
 pub trait SshSessionAuthorizer: Send + Sync {
+    /// Authorizes connecting to `target`.
     fn authorize_connect(
         &self,
         target: &str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
 
+    /// Authorizes installing or preparing heel on `target`.
     fn authorize_heel_install(
         &self,
         target: &str,
@@ -236,6 +267,7 @@ pub trait SshSessionAuthorizer: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
 }
 
+/// Registry for shell backend availability and session metadata.
 #[derive(Clone)]
 pub struct ShellSessionRegistry {
     availability: ShellRuntimeAvailability,
@@ -252,6 +284,7 @@ impl std::fmt::Debug for ShellSessionRegistry {
 }
 
 impl ShellSessionRegistry {
+    /// Creates a shell session registry.
     #[must_use]
     pub fn new(availability: ShellRuntimeAvailability) -> Self {
         Self {
@@ -262,18 +295,21 @@ impl ShellSessionRegistry {
         }
     }
 
+    /// Replaces runtime availability.
     #[must_use]
-    pub fn with_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
+    pub const fn with_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
         self.availability = availability;
         self
     }
 
+    /// Sets the SSH session authorizer.
     #[must_use]
     pub fn with_ssh_authorizer(mut self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
         self.ssh_authorizer = Some(authorizer);
         self
     }
 
+    /// Sets the container runtime.
     #[must_use]
     pub fn with_container_runtime(mut self, runtime: ContainerShellRuntime) -> Self {
         self.container_runtime = Some(runtime);
@@ -281,10 +317,15 @@ impl ShellSessionRegistry {
     }
 
     #[must_use]
+    /// Returns runtime availability.
     pub fn availability(&self) -> ShellRuntimeAvailability {
         self.availability.clone()
     }
 
+    /// Sets SSH server definitions.
+    ///
+    /// # Errors
+    /// Returns an error when a server entry has an empty id/target or duplicates another id.
     pub fn with_ssh_servers(mut self, servers: Vec<SshServer>) -> Result<Self, String> {
         let mut seen = HashSet::new();
         let mut deduped = Vec::new();
@@ -305,14 +346,19 @@ impl ShellSessionRegistry {
     }
 
     #[must_use]
+    /// Lists configured SSH servers.
     pub fn list_ssh_servers(&self) -> Vec<SshServer> {
         self.ssh_servers.clone()
     }
 
-    pub(crate) fn container_runtime(&self) -> Option<&ContainerShellRuntime> {
+    pub(crate) const fn container_runtime(&self) -> Option<&ContainerShellRuntime> {
         self.container_runtime.as_ref()
     }
 
+    /// Returns the default SSH server.
+    ///
+    /// # Errors
+    /// Returns an error when no SSH server is configured or more than one server requires disambiguation.
     pub fn default_ssh_server(&self) -> Result<SshServer, String> {
         match self.ssh_servers.as_slice() {
             [] => Err("no ssh servers are configured".to_string()),
@@ -323,6 +369,10 @@ impl ShellSessionRegistry {
         }
     }
 
+    /// Resolves a configured SSH server by id.
+    ///
+    /// # Errors
+    /// Returns an error when the id is empty or unknown.
     pub fn resolve_ssh_server(&self, server_id: &str) -> Result<SshServer, String> {
         let wanted = server_id.trim();
         if wanted.is_empty() {
@@ -335,6 +385,10 @@ impl ShellSessionRegistry {
             .ok_or_else(|| format!("unknown ssh_server_id: {wanted}"))
     }
 
+    /// Selects the preferred local backend.
+    ///
+    /// # Errors
+    /// Returns an error when neither container nor local execution is available.
     pub fn resolve_local_backend(&self) -> Result<ShellBackend, String> {
         let availability = self.availability();
         if availability.container {
@@ -346,6 +400,10 @@ impl ShellSessionRegistry {
         Err("no local backend available".to_string())
     }
 
+    /// Ensures SSH execution is available.
+    ///
+    /// # Errors
+    /// Returns an error when SSH execution is unavailable.
     pub fn ensure_ssh_available(&self) -> Result<(), String> {
         if self.availability().ssh {
             Ok(())
@@ -354,11 +412,17 @@ impl ShellSessionRegistry {
         }
     }
 
+    #[must_use]
+    /// Returns the SSH authorizer when configured.
     pub fn ssh_authorizer(&self) -> Option<Arc<dyn SshSessionAuthorizer>> {
         self.ssh_authorizer.clone()
     }
 }
 
+/// Bootstraps an SSH runtime profile.
+///
+/// # Errors
+/// Returns an error when authorization fails or the remote runtime cannot be prepared.
 pub async fn bootstrap_ssh_runtime(
     target: &str,
     authorizer: &Option<Arc<dyn SshSessionAuthorizer>>,

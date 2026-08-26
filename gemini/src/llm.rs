@@ -1,7 +1,7 @@
 use aither_core::{
     Error, LanguageModel,
     llm::{
-        Event, LLMRequest, Message, Role, Usage,
+        Attachment, Event, LLMRequest, Message, Role, Usage,
         model::{Ability, Parameters, Profile, ReasoningEffort, ToolChoice},
         tool::ToolDefinition,
     },
@@ -69,8 +69,7 @@ impl LanguageModel for Gemini {
                         .and_then(aither_models::ModelEntry::max_input_tokens)
                         .unwrap_or_else(|| {
                             panic!(
-                                "Gemini model '{}' missing context metadata from provider and aither-models",
-                                model_name
+                                "Gemini model '{model_name}' missing context metadata from provider and aither-models"
                             )
                         })
                 }
@@ -101,6 +100,7 @@ fn respond_stream(
     Box::pin(respond_stream_inner(cfg, request))
 }
 
+#[allow(clippy::too_many_lines)]
 fn respond_stream_inner(
     cfg: crate::config::GeminiConfig,
     request: LLMRequest,
@@ -124,7 +124,13 @@ fn respond_stream_inner(
         };
         #[cfg(target_arch = "wasm32")]
         let messages = messages;
-        let (system_instruction, contents) = messages_to_gemini(&messages).await;
+        let (system_instruction, contents) = match messages_to_gemini(&messages).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                yield Err(error);
+                return;
+            }
+        };
         let mut gemini_tools_payload: Vec<GeminiTool> = Vec::new();
         let tool_defs = match &parameters.tool_choice {
             ToolChoice::None => Vec::new(),
@@ -151,17 +157,26 @@ fn respond_stream_inner(
             });
         }
 
+        let gemini_native_tools = parameters.native_tools.gemini.clone();
+        let allow_native_tools = !matches!(parameters.tool_choice, ToolChoice::None | ToolChoice::Exact(_));
+
         // Add native Google Search tool if enabled in parameters
-        if parameters.websearch && !matches!(parameters.tool_choice, ToolChoice::None | ToolChoice::Exact(_)) {
+        if allow_native_tools && (parameters.websearch || gemini_native_tools.google_search) {
             gemini_tools_payload.push(GeminiTool::GoogleSearchTool {
                 google_search: GoogleSearch {},
             });
         }
 
         // Add native Code Execution tool if enabled in parameters
-        if parameters.code_execution && !matches!(parameters.tool_choice, ToolChoice::None | ToolChoice::Exact(_)) {
+        if allow_native_tools && (parameters.code_execution || gemini_native_tools.code_execution) {
             gemini_tools_payload.push(GeminiTool::CodeExecutionTool {
                 code_execution: crate::types::CodeExecution {},
+            });
+        }
+
+        if allow_native_tools && gemini_native_tools.url_context {
+            gemini_tools_payload.push(GeminiTool::UrlContextTool {
+                url_context: crate::types::UrlContext {},
             });
         }
 
@@ -325,7 +340,7 @@ fn parse_tool_response(content: &str) -> Option<(String, serde_json::Value, Opti
     let name = header_split.next()?.trim().to_string();
     let output = content[end + 1..]
         .strip_prefix(' ')
-        .unwrap_or(&content[end + 1..]);
+        .unwrap_or_else(|| &content[end + 1..]);
     let (_, signature) = parse_tool_signature(id);
     let response_value = match serde_json::from_str::<serde_json::Value>(output) {
         Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
@@ -357,7 +372,7 @@ fn parse_tool_signature(id: &str) -> (String, Option<String>) {
     (id.to_string(), None)
 }
 
-fn usage_from_metadata(meta: &UsageMetadata) -> Usage {
+const fn usage_from_metadata(meta: &UsageMetadata) -> Usage {
     Usage {
         prompt_tokens: meta.prompt_token_count,
         completion_tokens: meta.candidates_token_count,
@@ -370,7 +385,9 @@ fn usage_from_metadata(meta: &UsageMetadata) -> Usage {
     }
 }
 
-async fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<GeminiContent>) {
+async fn messages_to_gemini(
+    messages: &[Message],
+) -> Result<(Option<GeminiContent>, Vec<GeminiContent>), GeminiError> {
     use std::collections::HashMap;
 
     let mut system_parts = Vec::new();
@@ -397,9 +414,7 @@ async fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec
 
                     // Add attachment parts first
                     for attachment in attachments {
-                        if let Some(part) = url_to_part(attachment).await {
-                            parts.push(part);
-                        }
+                        parts.push(url_to_part(attachment).await?);
                     }
 
                     // Add text content
@@ -488,7 +503,7 @@ async fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec
         Some(GeminiContent::system(system_parts))
     };
 
-    (system_instruction, contents)
+    Ok((system_instruction, contents))
 }
 
 fn format_prompt_feedback(feedback: &PromptFeedback) -> String {
@@ -582,8 +597,7 @@ fn build_thinking_config(parameters: &Parameters) -> Option<ThinkingConfig> {
         thinking_level: parameters.reasoning_effort.map(|effort| {
             // Gemini does not have a direct mapping for Minimum, so we map it to Low.
             match effort {
-                ReasoningEffort::Minimum => "low",
-                ReasoningEffort::Low => "low",
+                ReasoningEffort::Minimum | ReasoningEffort::Low => "low",
                 ReasoningEffort::Medium => "medium",
                 ReasoningEffort::High => "high",
             }
@@ -602,115 +616,102 @@ fn convert_tool_definitions(defs: Vec<ToolDefinition>) -> Vec<FunctionDeclaratio
         .collect()
 }
 
-/// Convert a URL attachment to a Gemini Part.
-///
-/// Handles:
-/// - `data:...;base64,...` - already base64 encoded
-/// - `file:///path/to/file` - reads file and converts to base64
-/// - Gemini file URI (<https://generativelanguage.googleapis.com>/...) - uses file reference
-/// - Other HTTP/HTTPS URLs - not currently supported (would need download)
-async fn url_to_part(url: &url::Url) -> Option<Part> {
+/// Convert a typed attachment to a Gemini content part.
+async fn url_to_part(attachment: &Attachment) -> Result<Part, GeminiError> {
+    let url = attachment.url();
+    let media_type = attachment.media_type().as_ref();
     match url.scheme() {
-        "data" => parse_data_url(url.as_str()),
-        "file" => read_file_to_part(url).await,
-        "http" | "https" => {
-            // Check if this is a Gemini Files API URI
-            if is_gemini_file_uri(url) {
-                gemini_file_uri_to_part(url)
-            } else {
-                // Other HTTP/HTTPS URLs would need to be downloaded first
-                tracing::warn!("Unsupported attachment URL: {}", url);
-                None
-            }
-        }
-        _ => {
-            tracing::warn!("Unsupported attachment URL scheme: {}", url.scheme());
-            None
-        }
+        "data" => parse_data_url(url.as_str(), media_type),
+        "file" => read_file_to_part(url, media_type).await,
+        "http" | "https" => Ok(Part::from_file(media_type, url.as_str())),
+        scheme => Err(GeminiError::Api(format!(
+            "Gemini does not support attachment URL scheme '{scheme}'"
+        ))),
     }
 }
 
-/// Check if a URL is a Gemini Files API URI.
-fn is_gemini_file_uri(url: &url::Url) -> bool {
-    url.host_str()
-        .is_some_and(|h| h == "generativelanguage.googleapis.com")
-}
-
-/// Convert a Gemini Files API URI to a Part using file reference.
-fn gemini_file_uri_to_part(url: &url::Url) -> Option<Part> {
-    // The file URI contains the path which includes the file type info
-    // We need to infer the MIME type from the original file or use a generic one
-    // For now, use application/octet-stream as the API will handle it
-    let mime_type = infer_mime_from_gemini_uri(url).unwrap_or("application/octet-stream");
-    Some(Part::from_file(mime_type, url.as_str()))
-}
-
-/// Try to infer MIME type from a Gemini file URI.
-/// The URI doesn't typically contain MIME info, so we return None.
-const fn infer_mime_from_gemini_uri(_url: &url::Url) -> Option<&'static str> {
-    // Gemini file URIs don't contain MIME type info in the URL
-    // The server knows the type from when it was uploaded
-    None
-}
-
-/// Parse a data URL into a Part with inline data.
-fn parse_data_url(url: &str) -> Option<Part> {
+fn parse_data_url(url: &str, media_type: &str) -> Result<Part, GeminiError> {
     use base64::Engine;
 
-    // Format: data:mime/type;base64,<data>
-    let after_data = url.strip_prefix("data:")?;
-    let (header, data) = after_data.split_once(',')?;
-    let mime_type = header.strip_suffix(";base64")?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .ok()?;
-
-    Some(Part::inline_media(mime_type, bytes))
+    let after_data = url
+        .strip_prefix("data:")
+        .ok_or_else(|| GeminiError::Api("Malformed attachment data URL".to_string()))?;
+    let (header, data) = after_data
+        .split_once(',')
+        .ok_or_else(|| GeminiError::Api("Attachment data URL is missing payload".to_string()))?;
+    let encoded_media_type = header.strip_suffix(";base64").ok_or_else(|| {
+        GeminiError::Api("Attachment data URL must use base64 encoding".to_string())
+    })?;
+    if encoded_media_type != media_type {
+        return Err(GeminiError::Api(format!(
+            "Attachment MIME type '{media_type}' does not match data URL MIME type '{encoded_media_type}'"
+        )));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+    Ok(Part::inline_media(media_type, bytes))
 }
 
-/// Read a file:// URL and convert to a Part with inline data.
 #[cfg(not(target_arch = "wasm32"))]
-async fn read_file_to_part(url: &url::Url) -> Option<Part> {
-    let path = url.to_file_path().ok()?;
-    let data = async_fs::read(&path).await.ok()?;
-    let mime_type = mime_from_path(&path)?;
-
-    Some(Part::inline_media(mime_type, data))
+async fn read_file_to_part(url: &url::Url, media_type: &str) -> Result<Part, GeminiError> {
+    let path = url.to_file_path().map_err(|()| {
+        GeminiError::Api("Attachment file URL could not be converted to a path".to_string())
+    })?;
+    let data = async_fs::read(&path).await.map_err(|error| {
+        GeminiError::Api(format!(
+            "Failed to read attachment '{}': {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Part::inline_media(media_type, data))
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn read_file_to_part(_url: &url::Url) -> Option<Part> {
-    None
+async fn read_file_to_part(_url: &url::Url, _media_type: &str) -> Result<Part, GeminiError> {
+    Err(GeminiError::Api(
+        "file:// attachments are not supported on wasm32".to_string(),
+    ))
 }
 
-/// Get MIME type from file path extension.
-fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())?
-        .to_lowercase()
-        .as_str()
-    {
-        // Images
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "heic" => Some("image/heic"),
-        "heif" => Some("image/heif"),
-        // Video
-        "mp4" => Some("video/mp4"),
-        "webm" => Some("video/webm"),
-        "mov" => Some("video/quicktime"),
-        "avi" => Some("video/x-msvideo"),
-        // Audio
-        "mp3" => Some("audio/mpeg"),
-        "wav" => Some("audio/wav"),
-        "ogg" => Some("audio/ogg"),
-        "m4a" => Some("audio/mp4"),
-        "flac" => Some("audio/flac"),
-        // Documents
-        "pdf" => Some("application/pdf"),
-        _ => None,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn data_attachments_preserve_declared_media_types() {
+        for media_type in ["image/png", "audio/wav", "video/mp4", "application/pdf"] {
+            let attachment = Attachment::new(
+                format!("data:{media_type};base64,AA==")
+                    .parse()
+                    .expect("data URL"),
+                media_type.parse().expect("MIME type"),
+            );
+            let part = url_to_part(&attachment).await.expect("encode attachment");
+            let value = serde_json::to_value(part).expect("serialize part");
+            assert_eq!(value["inlineData"]["mimeType"], media_type);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_attachment_uses_file_data_with_media_type() {
+        let attachment = Attachment::new(
+            "https://ai.google.dev/static/gemini-api/docs/files/sample.pdf"
+                .parse()
+                .expect("remote URL"),
+            "application/pdf".parse().expect("PDF MIME"),
+        );
+        let part = url_to_part(&attachment).await.expect("encode attachment");
+        let value = serde_json::to_value(part).expect("serialize part");
+        assert_eq!(value["fileData"]["mimeType"], "application/pdf");
+        assert_eq!(
+            value["fileData"]["fileUri"],
+            "https://ai.google.dev/static/gemini-api/docs/files/sample.pdf"
+        );
+    }
+
+    #[test]
+    fn data_url_mime_mismatch_fails() {
+        let error = parse_data_url("data:image/png;base64,AA==", "audio/wav")
+            .expect_err("MIME mismatch must fail");
+        assert!(error.to_string().contains("does not match"));
     }
 }

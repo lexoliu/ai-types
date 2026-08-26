@@ -18,10 +18,12 @@ pub mod convert;
 mod registry;
 #[cfg(feature = "remote")]
 pub mod remote;
+mod tier;
 pub mod types;
 
 pub use aither_core::llm::model::Ability;
 pub use registry::ModelRegistry;
+pub use tier::ModelTier;
 pub use types::{ModelEntry, ModelMode, Pricing, Provider};
 
 /// Look up a model by ID or alias.
@@ -50,6 +52,14 @@ pub fn models_by_mode(mode: ModelMode) -> impl Iterator<Item = &'static ModelEnt
 /// Get all known models.
 pub fn all_models() -> impl Iterator<Item = &'static ModelEntry> {
     ModelRegistry::bundled().all()
+}
+
+/// Capability/cost tier of a model in the bundled registry.
+///
+/// Unknown models classify as [`ModelTier::Balanced`].
+#[must_use]
+pub fn tier(model_id: &str) -> ModelTier {
+    ModelRegistry::bundled().tier(model_id)
 }
 
 #[cfg(test)]

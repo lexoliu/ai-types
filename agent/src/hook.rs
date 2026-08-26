@@ -289,7 +289,7 @@ where
     async fn on_turn_boundary(&self, ctx: &TurnBoundaryContext<'_>) -> TurnBoundaryAction {
         match self.head.on_turn_boundary(ctx).await {
             TurnBoundaryAction::Continue => self.tail.on_turn_boundary(ctx).await,
-            other => other,
+            other @ TurnBoundaryAction::EndTurn => other,
         }
     }
 

@@ -57,10 +57,10 @@ async fn detect_stdin_blocked_inside_container(
         bollard::exec::StartExecResults::Attached { mut output, .. } => {
             while let Some(chunk) = output.next().await {
                 match chunk {
-                    Ok(LogOutput::StdOut { message }) | Ok(LogOutput::Console { message }) => {
+                    Ok(LogOutput::StdOut { message } | LogOutput::Console { message }) => {
                         stdout.push_str(&String::from_utf8_lossy(&message));
                     }
-                    Ok(LogOutput::StdErr { .. }) | Ok(LogOutput::StdIn { .. }) => {}
+                    Ok(LogOutput::StdErr { .. } | LogOutput::StdIn { .. }) => {}
                     Err(e) => return Err(format!("syscall probe stream error: {e}")),
                 }
             }
@@ -132,6 +132,109 @@ enum StreamEvent {
     Cancel,
 }
 
+fn append_log_output(output: LogOutput, stdout: &mut Vec<u8>, stderr: &mut Vec<u8>) {
+    match output {
+        LogOutput::StdOut { message } | LogOutput::Console { message } => {
+            stdout.extend_from_slice(&message);
+        }
+        LogOutput::StdErr { message } => {
+            stderr.extend_from_slice(&message);
+        }
+        LogOutput::StdIn { .. } => {}
+    }
+}
+
+async fn write_container_stdin<W>(input: &mut W, bytes: &[u8]) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    input
+        .write_all(bytes)
+        .await
+        .map_err(|error| format!("container exec stdin write failed: {error}"))?;
+    input
+        .flush()
+        .await
+        .map_err(|error| format!("container exec stdin flush failed: {error}"))
+}
+
+async fn shutdown_container_stdin<W>(input: &mut W) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    input
+        .shutdown()
+        .await
+        .map_err(|error| format!("container exec stdin shutdown failed: {error}"))
+}
+
+struct WatchdogTick<'a, W> {
+    client: &'a Docker,
+    container_id: &'a str,
+    exec_id: &'a str,
+    input: &'a mut W,
+    stdin_open: &'a mut bool,
+    watchdog_active: &'a mut bool,
+    notice_sent: &'a mut bool,
+    stdin_blocked_notice: Option<&'a Sender<String>>,
+}
+
+async fn handle_container_watchdog_tick<W>(tick: WatchdogTick<'_, W>) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let inspect = tick
+        .client
+        .inspect_exec(tick.exec_id)
+        .await
+        .map_err(|e| format!("failed to inspect running exec for stdin watchdog: {e}"))?;
+
+    if !inspect.running.unwrap_or(false) {
+        if *tick.stdin_open {
+            let _ = shutdown_container_stdin(tick.input).await;
+            *tick.stdin_open = false;
+        }
+        *tick.watchdog_active = false;
+        return Ok(());
+    }
+
+    let Some(pid) = inspect.pid else {
+        return Ok(());
+    };
+    if pid <= 0 {
+        return Ok(());
+    }
+
+    match detect_stdin_blocked_inside_container(tick.client, tick.container_id, pid).await {
+        Ok(true) => {
+            if let Some(notice_tx) = tick.stdin_blocked_notice {
+                let _ = notice_tx.try_send(TERMINAL_STDIN_BLOCKED_NOTICE.to_string());
+            }
+            *tick.notice_sent = true;
+            *tick.watchdog_active = false;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::debug!(error = %error, pid, "stdin watchdog probe failed");
+        }
+    }
+    Ok(())
+}
+
+async fn inspect_exec_exit_status(client: &Docker, exec_id: &str) -> Result<ExitStatus, String> {
+    let inspect = client
+        .inspect_exec(exec_id)
+        .await
+        .map_err(|e| format!("failed to inspect exec: {e}"))?;
+    let exit_code = i32::try_from(inspect.exit_code.unwrap_or(-1))
+        .map_err(|_| "container exec exit code is outside i32 range".to_string())?;
+    Ok(ExitStatusExt::from_raw(exit_code))
+}
+
 impl ContainerExec for BollardContainerExec {
     fn exec(
         &self,
@@ -184,7 +287,7 @@ impl ContainerExec for BollardContainerExec {
             loop {
                 let event = tokio::select! {
                     output = async { output.next().await } => StreamEvent::Output(output),
-                    _ = async {
+                    () = async {
                         let _ = kill_rx.recv().await;
                     } => StreamEvent::Cancel,
                     bytes = async { stdin_rx.recv().await }, if stdin_open => StreamEvent::Stdin(bytes),
@@ -192,16 +295,9 @@ impl ContainerExec for BollardContainerExec {
                 };
 
                 match event {
-                    StreamEvent::Output(Some(Ok(LogOutput::StdOut { message }))) => {
-                        stdout.extend_from_slice(&message);
+                    StreamEvent::Output(Some(Ok(output))) => {
+                        append_log_output(output, &mut stdout, &mut stderr);
                     }
-                    StreamEvent::Output(Some(Ok(LogOutput::StdErr { message }))) => {
-                        stderr.extend_from_slice(&message);
-                    }
-                    StreamEvent::Output(Some(Ok(LogOutput::Console { message }))) => {
-                        stdout.extend_from_slice(&message);
-                    }
-                    StreamEvent::Output(Some(Ok(LogOutput::StdIn { .. }))) => {}
                     StreamEvent::Output(Some(Err(e))) => {
                         return Err(format!("exec stream error: {e}"));
                     }
@@ -209,29 +305,15 @@ impl ContainerExec for BollardContainerExec {
                         break;
                     }
                     StreamEvent::Stdin(Ok(bytes)) => {
-                        use tokio::io::AsyncWriteExt;
-
-                        input.write_all(&bytes).await.map_err(|error| {
-                            format!("container exec stdin write failed: {error}")
-                        })?;
-                        input.flush().await.map_err(|error| {
-                            format!("container exec stdin flush failed: {error}")
-                        })?;
+                        write_container_stdin(&mut input, &bytes).await?;
                     }
                     StreamEvent::Stdin(Err(_)) => {
-                        use tokio::io::AsyncWriteExt;
-
-                        input.shutdown().await.map_err(|error| {
-                            format!("container exec stdin shutdown failed: {error}")
-                        })?;
+                        shutdown_container_stdin(&mut input).await?;
                         stdin_open = false;
                     }
                     StreamEvent::Cancel => {
                         if stdin_open {
-                            use tokio::io::AsyncWriteExt;
-
-                            let _ = input.shutdown().await;
-                            stdin_open = false;
+                            let _ = shutdown_container_stdin(&mut input).await;
                         }
                         if let Err(error) =
                             kill_exec_pid_inside_container(&client, &container_id, &exec_id).await
@@ -245,56 +327,24 @@ impl ContainerExec for BollardContainerExec {
                         return Ok(ContainerExecOutcome::Killed);
                     }
                     StreamEvent::WatchdogTick => {
-                        let inspect = client.inspect_exec(&exec_id).await.map_err(|e| {
-                            format!("failed to inspect running exec for stdin watchdog: {e}")
-                        })?;
-
-                        if !inspect.running.unwrap_or(false) {
-                            if stdin_open {
-                                use tokio::io::AsyncWriteExt;
-
-                                let _ = input.shutdown().await;
-                                stdin_open = false;
-                            }
-                            watchdog_active = false;
-                            continue;
-                        }
-
-                        let Some(pid) = inspect.pid else {
-                            continue;
-                        };
-                        if pid <= 0 {
-                            continue;
-                        }
-
-                        match detect_stdin_blocked_inside_container(&client, &container_id, pid)
-                            .await
-                        {
-                            Ok(true) => {
-                                if let Some(notice_tx) = stdin_blocked_notice.as_ref() {
-                                    let _ = notice_tx
-                                        .try_send(TERMINAL_STDIN_BLOCKED_NOTICE.to_string());
-                                }
-                                notice_sent = true;
-                                watchdog_active = false;
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
-                                tracing::debug!(error = %error, pid, "stdin watchdog probe failed");
-                            }
-                        }
+                        handle_container_watchdog_tick(WatchdogTick {
+                            client: &client,
+                            container_id: &container_id,
+                            exec_id: &exec_id,
+                            input: &mut input,
+                            stdin_open: &mut stdin_open,
+                            watchdog_active: &mut watchdog_active,
+                            notice_sent: &mut notice_sent,
+                            stdin_blocked_notice: stdin_blocked_notice.as_ref(),
+                        })
+                        .await?;
                     }
                 }
             }
 
-            let inspect = client
-                .inspect_exec(&exec_id)
-                .await
-                .map_err(|e| format!("failed to inspect exec: {e}"))?;
-
-            let exit_code = inspect.exit_code.unwrap_or(-1) as i32;
+            let status = inspect_exec_exit_status(&client, &exec_id).await?;
             Ok(ContainerExecOutcome::Completed(Output {
-                status: ExitStatusExt::from_raw(exit_code),
+                status,
                 stdout,
                 stderr,
             }))

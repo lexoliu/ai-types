@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use serde::Deserialize;
 use serde_json::Value;
 use zenwave::sse::Event;

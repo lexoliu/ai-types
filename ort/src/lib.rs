@@ -260,7 +260,7 @@ impl OrtEmbeddingBuilder {
         })?;
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| OrtError::tokenizer(&tokenizer_path, e))?;
+            .map_err(|e| OrtError::tokenizer(&tokenizer_path, e.to_string()))?;
 
         // Load ONNX session with optimizations
         let session = Session::builder()?
@@ -391,12 +391,12 @@ fn spawn_inference_worker(session: Session) -> Result<Sender<InferenceRequest>, 
     let (tx, rx) = async_channel::unbounded::<InferenceRequest>();
     std::thread::Builder::new()
         .name("ort-embedding-worker".to_string())
-        .spawn(move || run_inference_worker(session, rx))
+        .spawn(move || run_inference_worker(session, &rx))
         .map_err(|error| OrtError::Worker(error.to_string()))?;
     Ok(tx)
 }
 
-fn run_inference_worker(session: Session, rx: async_channel::Receiver<InferenceRequest>) {
+fn run_inference_worker(session: Session, rx: &async_channel::Receiver<InferenceRequest>) {
     let mut session = session;
     while let Ok(request) = rx.recv_blocking() {
         let result = run_inference(&mut session, request.input_ids, request.attention_mask);

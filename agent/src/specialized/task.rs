@@ -43,13 +43,17 @@ pub struct SubagentType<LLM> {
     builder: SubagentBuilder<LLM>,
 }
 
+/// Mapping from a sandbox-visible path prefix to a host directory.
 #[derive(Clone, Debug)]
 pub struct SubagentFileMount {
+    /// Path prefix visible to the sandboxed agent.
     pub virtual_prefix: PathBuf,
+    /// Host directory backing the virtual prefix.
     pub host_root: PathBuf,
 }
 
 impl SubagentFileMount {
+    /// Creates a mount from a virtual sandbox prefix to a host root directory.
     #[must_use]
     pub fn new(virtual_prefix: impl Into<PathBuf>, host_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -63,7 +67,7 @@ impl<LLM> std::fmt::Debug for SubagentType<LLM> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubagentType")
             .field("description", &self.description)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -163,11 +167,11 @@ impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
         f.debug_struct("SubagentTool")
             .field("type_names", &type_names)
             .field("base_dir", &self.base_dir)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
-impl<LLM: Clone> SubagentTool<LLM> {
+impl<LLM: Clone + Sync> SubagentTool<LLM> {
     /// Creates a new `TaskTool` with the given LLM.
     pub fn new(llm: LLM) -> Self {
         Self {
@@ -340,14 +344,12 @@ impl<LLM: Clone> SubagentTool<LLM> {
             let display_path = if display_prefix.as_os_str().is_empty() {
                 candidate
                     .strip_prefix(&mount.host_root)
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|_| requested_display.to_path_buf())
+                    .map_or_else(|_| requested_display.to_path_buf(), Path::to_path_buf)
             } else {
                 display_prefix.join(
                     candidate
                         .strip_prefix(&mount.host_root)
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|_| requested_display.to_path_buf()),
+                        .map_or_else(|_| requested_display.to_path_buf(), Path::to_path_buf),
                 )
             };
             attempted.push(display_path.display().to_string());
@@ -398,7 +400,7 @@ impl<LLM: Clone> SubagentTool<LLM> {
     }
 }
 
-impl<LLM: LanguageModel + Clone> SubagentTool<LLM> {
+impl<LLM: LanguageModel + Clone + Sync> SubagentTool<LLM> {
     /// Register a subagent from a definition (builder pattern).
     ///
     /// Creates a subagent type from a `SubagentDefinition` loaded from a file.
@@ -428,7 +430,7 @@ impl<LLM: LanguageModel + Clone> SubagentTool<LLM> {
 
 impl<LLM> Tool for SubagentTool<LLM>
 where
-    LLM: LanguageModel + Clone + 'static,
+    LLM: LanguageModel + Clone + Sync + 'static,
 {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("subagent")
@@ -440,7 +442,10 @@ where
     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
         // Determine if subagent is a file path or a registered type name
         // File paths contain '/' or end with '.md'
-        let is_file_path = args.subagent.contains('/') || args.subagent.ends_with(".md");
+        let is_file_path = args.subagent.contains('/')
+            || Path::new(&args.subagent)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
 
         let (subagent_id, agent_builder) = if is_file_path {
             // Load subagent from file
@@ -481,20 +486,33 @@ where
         tracing::info!(subagent = %subagent_id, "Starting subagent");
 
         // Add child terminal tool if factory is configured
-        let agent_builder = if let Some(factory) = &self.terminal_tool_factory {
+        let (agent_builder, child_job_registry) = if let Some(factory) = &self.terminal_tool_factory
+        {
             let dyn_terminal = factory
                 .create()
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to create subagent terminal tool: {e}"))?;
-            agent_builder.dyn_terminal(dyn_terminal)
+            let job_registry = dyn_terminal.job_registry();
+            (agent_builder.dyn_terminal(dyn_terminal), Some(job_registry))
         } else {
-            agent_builder
+            (agent_builder, None)
         };
 
         let mut agent = agent_builder.build();
 
         // Run the subagent with the prompt
-        let result = match agent.query(&args.prompt).await {
+        let query_result = agent.query(&args.prompt).await;
+        if let Some(job_registry) = child_job_registry {
+            let killed = job_registry.kill_running().await;
+            if killed > 0 {
+                tracing::info!(
+                    subagent = %subagent_id,
+                    killed,
+                    "Stopped background terminal jobs left by completed subagent"
+                );
+            }
+        }
+        let result = match query_result {
             Ok(result) => result,
             Err(error) => {
                 let history = agent.history();

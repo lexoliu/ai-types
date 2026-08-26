@@ -236,21 +236,6 @@ impl Part {
         }
     }
 
-    pub(crate) const fn function_call(name: String, args: Value) -> Self {
-        Self {
-            text: None,
-            thought: None,
-            thought_signature: None,
-            inline_data: None,
-            file_data: None,
-            function_call: Some(FunctionCall { name, args }),
-            function_response: None,
-            executable_code: None,
-            code_execution_result: None,
-            metadata: None,
-        }
-    }
-
     pub(crate) const fn function_call_with_signature(
         name: String,
         args: Value,
@@ -391,6 +376,7 @@ pub struct FunctionResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[allow(clippy::enum_variant_names)]
 #[serde(untagged)] // This allows deserialization to try matching one variant after another
 pub enum GeminiTool {
     FunctionTool {
@@ -405,6 +391,10 @@ pub enum GeminiTool {
         #[serde(rename = "codeExecution")]
         code_execution: CodeExecution,
     },
+    UrlContextTool {
+        #[serde(rename = "urlContext")]
+        url_context: UrlContext,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +402,9 @@ pub struct GoogleSearch {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeExecution {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UrlContext {}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FunctionDeclaration {
@@ -581,6 +574,7 @@ pub struct Candidate {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[allow(clippy::struct_field_names)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageMetadata {
     #[serde(default)]

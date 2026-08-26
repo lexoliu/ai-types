@@ -1,1 +1,2 @@
-Output saved to outputs/{{ filename }} ({{ line_count }} lines, {{ byte_count }} bytes)
+{{ preview }}
+[Preview only. Full output ({{ line_count }} lines, {{ byte_count }} bytes) saved to outputs/{{ filename }}. Use head/tail/grep/sed on that file to read the rest.]

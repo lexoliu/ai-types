@@ -1,3 +1,8 @@
+//! Search tool backed by `LanceDB` plus optional semantic embeddings.
+//!
+//! The tool indexes text/code files into chunks and supports text, full-text,
+//! fuzzy, regex, hybrid, and semantic retrieval over the indexed workspace.
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,7 +21,10 @@ use arrow_schema::{DataType, Field, Schema};
 use futures_lite::StreamExt;
 use ignore::WalkBuilder;
 use lance_index::scalar::FullTextSearchQuery;
-use lancedb::index::Index;
+use lancedb::index::{
+    Index,
+    scalar::{BTreeIndexBuilder, InvertedIndexParams},
+};
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use lancedb::{Table, connect};
 use regex::RegexBuilder;
@@ -31,6 +39,7 @@ const MAX_FILE_BYTES: usize = 1024 * 1024;
 const CHUNK_TARGET_CHARS: usize = 2400;
 const CHUNK_OVERLAP_CHARS: usize = 240;
 
+/// Error returned when a shell-like search command cannot be split.
 #[derive(Debug, thiserror::Error)]
 #[error("{label} command contains invalid shell quoting: {source}")]
 pub struct SplitShellWordsError {
@@ -52,14 +61,20 @@ fn push_unique<T: Eq>(items: &mut Vec<T>, value: T) {
     }
 }
 
+/// Embedding model interface required by semantic search.
 pub trait SearchEmbeddingModel: EmbeddingModel + Clone {
+    /// Stable selector describing the embedding backend and model.
     fn selector(&self) -> &str;
 }
 
+/// Runtime state of the optional embedding model used for semantic search.
 #[derive(Debug, Clone)]
 pub enum SearchEmbeddingResolution<E> {
+    /// Semantic search is disabled.
     Disabled,
+    /// Semantic search failed to initialize.
     Failed(String),
+    /// Semantic search is ready.
     Ready(E),
 }
 
@@ -68,6 +83,7 @@ where
     E: SearchEmbeddingModel,
 {
     #[must_use]
+    /// Returns the ready embedding model when semantic search is available.
     pub const fn ready(&self) -> Option<&E> {
         match self {
             Self::Ready(model) => Some(model),
@@ -76,155 +92,230 @@ where
     }
 
     #[must_use]
+    /// Clones the ready embedding model when semantic search is available.
     pub fn clone_ready(&self) -> Option<E> {
         self.ready().cloned()
     }
 }
 
+/// Errors returned by the search tool.
 #[derive(Debug, thiserror::Error)]
 pub enum SearchToolError {
+    /// The index command did not include a path.
     #[error("search index requires a non-empty path")]
     MissingIndexPath,
+    /// The query command did not include a query.
     #[error("search query requires a non-empty query")]
     MissingQuery,
+    /// The command string is empty.
     #[error("search command must not be empty")]
     EmptyCommand,
+    /// The command string has no action or query body.
     #[error("search command must include an action or query")]
     MissingActionOrQuery,
+    /// The index command received too many path arguments.
     #[error("search index accepts exactly one path argument")]
     InvalidIndexCommandArity,
+    /// The query command received no prompt.
     #[error("search query requires a prompt")]
     MissingQueryPrompt,
+    /// Failed to resolve a filesystem path.
     #[error("failed to resolve search path {path}: {source}")]
     ResolvePath {
+        /// Path that failed to resolve.
         path: PathBuf,
         #[source]
+        /// Source I/O error.
         source: std::io::Error,
     },
+    /// The indexer found no text chunks.
     #[error("search index contains no text chunks; choose a text or code file/directory")]
     IndexContainsNoText,
+    /// Failed to load index metadata.
     #[error("failed to read search index metadata {path}: {source}")]
     LoadIndexMetadata {
+        /// Metadata path.
         path: PathBuf,
         #[source]
+        /// Source I/O error.
         source: std::io::Error,
     },
+    /// Failed to parse index metadata.
     #[error("failed to parse search index metadata {path}: {source}")]
     ParseIndexMetadata {
+        /// Metadata path.
         path: PathBuf,
         #[source]
+        /// Source JSON error.
         source: serde_json::Error,
     },
+    /// Failed to remove a stale semantic index.
     #[error("failed to remove stale semantic index {path}: {source}")]
     RemoveStaleSemanticIndex {
+        /// Semantic index path.
         path: PathBuf,
         #[source]
+        /// Source I/O error.
         source: std::io::Error,
     },
+    /// The metadata records no indexed roots.
     #[error("search index is empty; run `search index <path>` first")]
     EmptyIndex,
+    /// The `LanceDB` table is missing.
     #[error("search index is missing; run `search index <path>` again")]
     MissingIndexTable,
+    /// No embedding model is available.
     #[error(
         "semantic search requires a global models.embedding_model and at least one enabled provider that supports it"
     )]
     SemanticEmbeddingUnavailable,
+    /// The semantic index was built with another embedding configuration.
     #[error(
         "semantic index was built for a different embedding configuration; run `search index <path>` again"
     )]
     SemanticEmbeddingMismatch,
+    /// Regex compilation failed.
     #[error("invalid regex pattern: {0}")]
     InvalidRegexPattern(#[source] regex::Error),
+    /// Semantic search cannot execute wildcard queries.
     #[error("semantic search does not support wildcard queries")]
     SemanticWildcardUnsupported,
+    /// The semantic index file is missing.
     #[error("semantic index is missing; run `search index <path>` again")]
     MissingSemanticIndex,
+    /// Failed to inspect a semantic index.
     #[error("failed to inspect semantic index {path}: {source}")]
     InspectSemanticIndex {
+        /// Semantic index path.
         path: PathBuf,
         #[source]
+        /// Source I/O error.
         source: std::io::Error,
     },
+    /// Required semantic chunk metadata is missing.
     #[error("semantic index entry is missing '{key}' metadata")]
-    MissingSemanticMetadata { key: &'static str },
+    MissingSemanticMetadata {
+        /// Missing metadata key.
+        key: &'static str,
+    },
+    /// A LanceDB/Arrow column has an unexpected type.
     #[error("missing or invalid '{name}' column; expected {expected}")]
     InvalidColumn {
+        /// Column name.
         name: &'static str,
+        /// Expected Arrow type.
         expected: &'static str,
     },
+    /// Walking files failed.
     #[error("failed to walk searchable files under {root}: {source}")]
     WalkFiles {
+        /// Walk root.
         root: PathBuf,
         #[source]
+        /// Source walk error.
         source: ignore::Error,
     },
+    /// Joining the file scan task failed.
     #[error("failed to join searchable file scan task: {0}")]
     JoinFileScan(#[source] tokio::task::JoinError),
+    /// Filesystem I/O failed.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// JSON serialization failed.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    /// `LanceDB` failed.
     #[error("LanceDB error: {0}")]
     LanceDb(#[from] lancedb::Error),
+    /// Arrow schema or batch construction failed.
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
+    /// RAG semantic indexing failed.
     #[error("RAG error: {0}")]
     Rag(#[from] aither_rag::error::RagError),
+    /// Lance full-text search failed outside `LanceDB`'s error type.
     #[error("Lance error: {0}")]
     Lance(String),
 }
 
+/// Indexing or query action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchAction {
+    /// Build or rebuild the search index.
     Index,
+    /// Query the existing search index.
     Query,
 }
 
+/// Search strategy used for querying the index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
+    /// Merge text, full-text, and fuzzy matches.
     Hybrid,
+    /// Plain substring text search.
     Text,
+    /// Regex search.
     Regex,
+    /// Lance full-text search.
     Fulltext,
+    /// Fuzzy full-text search.
     Fuzzy,
+    /// Embedding-backed semantic search.
     Semantic,
 }
 
+/// Shape of search results returned to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchOutputMode {
+    /// Collapse matches to file-level results.
     Files,
+    /// Return individual matching chunks.
     Chunks,
 }
 
+/// Arguments accepted by the search tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SearchArgs {
+    /// Shell-like command form, such as `search index src` or `search query foo`.
     #[serde(default)]
     pub command: Option<String>,
+    /// Action to perform.
     #[serde(default = "default_action")]
     pub action: SearchAction,
+    /// Path filter or path to index.
     #[serde(default)]
     pub path: Option<String>,
+    /// Query text.
     #[serde(default)]
     pub query: Option<String>,
+    /// Search strategy.
     #[serde(default = "default_search_mode")]
     pub search_mode: SearchMode,
+    /// Output shape.
     #[serde(default = "default_output_mode")]
     pub output_mode: SearchOutputMode,
+    /// Maximum number of results to return.
     #[serde(default = "default_limit")]
     pub limit: usize,
+    /// Number of results to skip.
     #[serde(default)]
     pub offset: usize,
+    /// Maximum candidate rows to scan.
     #[serde(default = "default_scan_limit")]
     pub scan_limit: usize,
+    /// Whether text and regex matching is case-sensitive.
     #[serde(default)]
     pub case_sensitive: bool,
+    /// Regex pattern override.
     #[serde(default)]
     pub regex: Option<String>,
+    /// Maximum fuzzy edit distance.
     #[serde(default = "default_fuzzy_distance")]
     pub fuzzy_distance: u32,
+    /// Include matched chunk content in file-level results.
     #[serde(default)]
     pub include_content: bool,
 }
@@ -253,6 +344,7 @@ const fn default_fuzzy_distance() -> u32 {
     1
 }
 
+/// Search tool implementation.
 #[derive(Debug, Clone)]
 pub struct SearchTool<E>
 where
@@ -266,6 +358,8 @@ impl<E> SearchTool<E>
 where
     E: SearchEmbeddingModel + 'static,
 {
+    /// Create a search tool rooted in the sandbox data directory.
+    #[must_use]
     pub const fn new(sandbox_dir: PathBuf, embedder: SearchEmbeddingResolution<E>) -> Self {
         Self {
             sandbox_dir,
@@ -289,7 +383,7 @@ where
         self.index_dir().join("semantic.redb")
     }
 
-    fn normalize_args(&self, mut args: SearchArgs) -> Result<SearchArgs, SearchToolError> {
+    fn normalize_args(mut args: SearchArgs) -> Result<SearchArgs, SearchToolError> {
         if let Some(command) = args.command.take() {
             apply_command_form(&mut args, &command)?;
         }
@@ -355,7 +449,7 @@ where
 
     async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
         let result = async {
-            let mut args = self.normalize_args(arguments)?;
+            let mut args = Self::normalize_args(arguments)?;
             if let Some(path) = args.path.as_deref() {
                 args.path = Some(
                     resolve_search_path(self.sandbox_dir.as_path(), path)
@@ -393,6 +487,12 @@ where
     }
 }
 
+/// Apply shell-like command text to structured search arguments.
+///
+/// # Errors
+///
+/// Returns an error when the command is empty, malformed, or contains invalid
+/// shell quoting.
 pub fn apply_command_form(args: &mut SearchArgs, command: &str) -> Result<(), SearchToolError> {
     let trimmed = command.trim();
     if trimmed.is_empty() {
@@ -538,12 +638,12 @@ where
     let table = conn.create_table(TABLE_NAME, reader).execute().await?;
     for column in ["content", "relative_path", "file_name"] {
         table
-            .create_index(&[column], Index::FTS(Default::default()))
+            .create_index(&[column], Index::FTS(InvertedIndexParams::default()))
             .execute()
             .await?;
     }
     table
-        .create_index(&["file_path"], Index::BTree(Default::default()))
+        .create_index(&["file_path"], Index::BTree(BTreeIndexBuilder::default()))
         .execute()
         .await?;
 
@@ -639,7 +739,7 @@ where
             .await?;
     }
 
-    rag.save()?;
+    rag.save().await?;
     Ok(indexed_chunks > 0)
 }
 
@@ -681,109 +781,133 @@ where
         return run_semantic_query(semantic_index_path, embedder, args, meta).await;
     }
 
-    let mut candidates = match args.search_mode {
-        SearchMode::Fulltext => run_full_text_query(&table, &args, false).await?,
-        SearchMode::Fuzzy => run_full_text_query(&table, &args, true).await?,
-        SearchMode::Regex => run_plain_query(&table, &args).await?,
-        SearchMode::Text => run_plain_query(&table, &args).await?,
-        SearchMode::Hybrid => {
-            if query_enabled {
-                let mut merged = Vec::new();
-                let mut fts = run_full_text_query(&table, &args, false).await?;
-                let mut fuzzy = run_full_text_query(&table, &args, true).await?;
-                let mut plain = run_plain_query(&table, &args).await?;
-                merged.append(&mut fts);
-                merged.append(&mut fuzzy);
-                merged.append(&mut plain);
-                merged
-            } else {
-                run_plain_query(&table, &args).await?
-            }
-        }
-        SearchMode::Semantic => unreachable!("semantic search returns earlier"),
-    };
+    let mut candidates = collect_query_candidates(&table, &args, query_enabled).await?;
+    let regex = build_query_regex(&args, &query, query_enabled)?;
+    score_query_candidates(
+        &mut candidates,
+        &args,
+        &query,
+        regex.as_ref(),
+        query_enabled,
+    );
+    let rows = dedupe_and_sort_rows(candidates);
+    let total_matches = rows.len();
+    Ok(finalize_rows(&rows, total_matches, &args, &meta))
+}
 
-    let query_norm = if args.case_sensitive {
-        query.clone()
-    } else {
-        query.to_lowercase()
-    };
-
-    let regex_enabled =
-        args.search_mode == SearchMode::Regex && (query_enabled || args.regex.is_some());
-    let regex = if regex_enabled {
-        let pattern = args.regex.as_deref().unwrap_or(query.as_str()).to_string();
-        Some(
-            RegexBuilder::new(&pattern)
-                .case_insensitive(!args.case_sensitive)
-                .build()
-                .map_err(SearchToolError::InvalidRegexPattern)?,
-        )
-    } else {
-        None
-    };
-
-    for row in &mut candidates {
-        if row.matched_by.is_empty() {
-            push_unique(&mut row.matched_by, args.search_mode);
-        }
-
-        let haystack = [row.relative_path.as_str(), row.content.as_str()].join("\n");
-        let haystack_norm = if args.case_sensitive {
-            haystack.clone()
-        } else {
-            haystack.to_lowercase()
-        };
-        if query_enabled
-            && args.search_mode != SearchMode::Fulltext
-            && args.search_mode != SearchMode::Fuzzy
-            && haystack_norm.contains(&query_norm)
-        {
-            row.score += 10.0;
-            push_unique(&mut row.matched_by, SearchMode::Text);
-        }
-        if let Some(re) = &regex
-            && re.is_match(&haystack)
-        {
-            row.score += 15.0;
-            push_unique(&mut row.matched_by, SearchMode::Regex);
-        }
+async fn collect_query_candidates(
+    table: &Table,
+    args: &SearchArgs,
+    query_enabled: bool,
+) -> Result<Vec<FileMatchRow>, SearchToolError> {
+    if matches!(args.search_mode, SearchMode::Regex | SearchMode::Text)
+        || (args.search_mode == SearchMode::Hybrid && !query_enabled)
+    {
+        return run_plain_query(table, args).await;
     }
+    match args.search_mode {
+        SearchMode::Fulltext => run_full_text_query(table, args, false).await,
+        SearchMode::Fuzzy => run_full_text_query(table, args, true).await,
+        SearchMode::Hybrid => {
+            let ((mut fts, mut fuzzy), mut plain) = futures_lite::future::try_zip(
+                futures_lite::future::try_zip(
+                    run_full_text_query(table, args, false),
+                    run_full_text_query(table, args, true),
+                ),
+                run_plain_query(table, args),
+            )
+            .await?;
+            let mut merged = Vec::with_capacity(fts.len() + fuzzy.len() + plain.len());
+            merged.append(&mut fts);
+            merged.append(&mut fuzzy);
+            merged.append(&mut plain);
+            Ok(merged)
+        }
+        SearchMode::Regex | SearchMode::Text => unreachable!("plain search returns earlier"),
+        SearchMode::Semantic => unreachable!("semantic search returns earlier"),
+    }
+}
 
-    candidates.retain(|row| {
-        let haystack = [row.relative_path.as_str(), row.content.as_str()].join("\n");
-        if query_enabled && args.search_mode == SearchMode::Text {
-            let haystack = if args.case_sensitive {
-                haystack
-            } else {
-                haystack.to_lowercase()
-            };
-            return haystack.contains(&query_norm);
-        }
-        if regex_enabled {
-            let Some(re) = &regex else {
-                return false;
-            };
-            return re.is_match(&haystack);
-        }
-        true
+fn build_query_regex(
+    args: &SearchArgs,
+    query: &str,
+    query_enabled: bool,
+) -> Result<Option<regex::Regex>, SearchToolError> {
+    if args.search_mode != SearchMode::Regex || !(query_enabled || args.regex.is_some()) {
+        return Ok(None);
+    }
+    let pattern = args.regex.as_deref().unwrap_or(query).to_string();
+    RegexBuilder::new(&pattern)
+        .case_insensitive(!args.case_sensitive)
+        .build()
+        .map(Some)
+        .map_err(SearchToolError::InvalidRegexPattern)
+}
+
+fn score_query_candidates(
+    candidates: &mut Vec<FileMatchRow>,
+    args: &SearchArgs,
+    query: &str,
+    regex: Option<&regex::Regex>,
+    query_enabled: bool,
+) {
+    let query_norm = if args.case_sensitive {
+        Cow::Borrowed(query)
+    } else {
+        Cow::Owned(query.to_lowercase())
+    };
+    candidates.retain_mut(|row| {
+        score_and_match_query_candidate(row, args, &query_norm, regex, query_enabled)
     });
+}
 
+fn score_and_match_query_candidate(
+    row: &mut FileMatchRow,
+    args: &SearchArgs,
+    query_norm: &str,
+    regex: Option<&regex::Regex>,
+    query_enabled: bool,
+) -> bool {
+    if row.matched_by.is_empty() {
+        push_unique(&mut row.matched_by, args.search_mode);
+    }
+    let haystack = [row.relative_path.as_str(), row.content.as_str()].join("\n");
+    let haystack_norm = if args.case_sensitive {
+        Cow::Borrowed(haystack.as_str())
+    } else {
+        Cow::Owned(haystack.to_lowercase())
+    };
+    if query_enabled
+        && !matches!(args.search_mode, SearchMode::Fulltext | SearchMode::Fuzzy)
+        && haystack_norm.contains(query_norm)
+    {
+        row.score += 10.0;
+        push_unique(&mut row.matched_by, SearchMode::Text);
+    }
+    if let Some(re) = regex
+        && re.is_match(&haystack)
+    {
+        row.score += 15.0;
+        push_unique(&mut row.matched_by, SearchMode::Regex);
+    }
+    if query_enabled && args.search_mode == SearchMode::Text {
+        return haystack_norm.contains(query_norm);
+    }
+    regex.is_none_or(|re| !matches!(args.search_mode, SearchMode::Regex) || re.is_match(&haystack))
+}
+
+fn dedupe_and_sort_rows(candidates: Vec<FileMatchRow>) -> Vec<FileMatchRow> {
     let mut deduped: HashMap<String, FileMatchRow> = HashMap::new();
     for row in candidates {
         let key = format!("{}:{}", row.file_path, row.chunk_id);
         match deduped.get_mut(&key) {
-            Some(existing) => {
-                if row.score > existing.score {
-                    *existing = row;
-                }
-            }
+            Some(existing) if row.score > existing.score => *existing = row,
+            Some(_) => {}
             None => {
                 deduped.insert(key, row);
             }
         }
     }
-
     let mut rows: Vec<FileMatchRow> = deduped.into_values().collect();
     rows.sort_by(|a, b| {
         b.score
@@ -791,8 +915,7 @@ where
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.file_path.cmp(&b.file_path))
     });
-    let total_matches = rows.len();
-    finalize_rows(rows, total_matches, &args, &meta)
+    rows
 }
 
 fn require_semantic_metadata<'a>(
@@ -843,7 +966,7 @@ where
         .deduplication(false)
         .auto_save(false)
         .build()?;
-    rag.load()?;
+    rag.load().await?;
 
     let path_filter = args
         .path
@@ -867,7 +990,9 @@ where
                 file_path: file_path.to_string(),
                 relative_path: relative_path.to_string(),
                 modified_at: modified_at.to_string(),
-                chunk_id: result.chunk.index as i64,
+                chunk_id: i64::try_from(result.chunk.index).map_err(|_| {
+                    SearchToolError::Lance("semantic chunk index exceeds i64".into())
+                })?,
                 content: result.chunk.text,
                 score: f64::from(result.score),
                 matched_by: vec![SearchMode::Semantic],
@@ -878,7 +1003,7 @@ where
         .flatten()
         .collect::<Vec<_>>();
     let total_matches = rows.len();
-    finalize_rows(rows, total_matches, &args, &meta)
+    Ok(finalize_rows(&rows, total_matches, &args, &meta))
 }
 
 fn build_sql_filter(args: &SearchArgs) -> Option<String> {
@@ -1014,27 +1139,29 @@ async fn read_rows_from_stream(
         let score_col = batch.column_by_name("_score");
         let scores = score_col
             .and_then(|column| column.as_any().downcast_ref::<Float32Array>())
-            .map(|array| {
-                (0..array.len())
-                    .map(|idx| {
-                        if array.is_null(idx) {
-                            0.0
-                        } else {
-                            f64::from(array.value(idx))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| vec![0.0; batch.num_rows()]);
+            .map_or_else(
+                || vec![0.0; batch.num_rows()],
+                |array| {
+                    (0..array.len())
+                        .map(|idx| {
+                            if array.is_null(idx) {
+                                0.0
+                            } else {
+                                f64::from(array.value(idx))
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                },
+            );
 
-        for idx in 0..batch.num_rows() {
+        for (idx, score) in scores.iter().copied().enumerate().take(batch.num_rows()) {
             rows.push(FileMatchRow {
                 file_path: file_path.value(idx).to_string(),
                 relative_path: relative_path.value(idx).to_string(),
                 modified_at: modified_at.value(idx).to_string(),
                 chunk_id: chunk_id.value(idx),
                 content: content.value(idx).to_string(),
-                score: scores[idx],
+                score,
                 matched_by: Vec::new(),
             });
         }
@@ -1126,7 +1253,8 @@ fn build_rows(files: &[SearchableFile]) -> Vec<FileChunkRow> {
                     relative_path: file.relative_path.clone(),
                     file_name: file.file_name.clone(),
                     modified_at: file.modified_at.clone(),
-                    chunk_id: idx as i64,
+                    chunk_id: i64::try_from(idx)
+                        .expect("chunk index should fit into i64 for indexed file"),
                     content: chunk,
                 })
                 .collect::<Vec<_>>()
@@ -1178,6 +1306,8 @@ async fn read_searchable_file(
     }))
 }
 
+/// Split text into overlapping chunks used by the indexer.
+#[must_use]
 pub fn chunk_text(content: &str) -> Vec<String> {
     let chars: Vec<char> = content.chars().collect();
     if chars.len() <= CHUNK_TARGET_CHARS {
@@ -1245,28 +1375,28 @@ fn rows_to_record_reader(
 }
 
 fn finalize_rows(
-    rows: Vec<FileMatchRow>,
+    rows: &[FileMatchRow],
     total_matches: usize,
     args: &SearchArgs,
     meta: &SearchIndexMeta,
-) -> Result<ToolResult, SearchToolError> {
+) -> ToolResult {
     let start = args.offset.min(rows.len());
     let end = (start + args.limit).min(rows.len());
-    let rows = rows[start..end].to_vec();
+    let rows = &rows[start..end];
 
     let query = args.query.clone().expect("validated");
     let value = if args.output_mode == SearchOutputMode::Chunks {
         let items = rows
-            .into_iter()
+            .iter()
             .map(|row| ChunkResult {
-                file_path: row.file_path,
-                relative_path: row.relative_path,
-                modified_at: row.modified_at,
+                file_path: row.file_path.clone(),
+                relative_path: row.relative_path.clone(),
+                modified_at: row.modified_at.clone(),
                 chunk_id: row.chunk_id,
                 score: (row.score * 100.0).round() / 100.0,
-                matched_by: row.matched_by,
+                matched_by: row.matched_by.clone(),
                 snippet: truncate_text(row.content.as_str(), 240),
-                content: args.include_content.then_some(row.content),
+                content: args.include_content.then_some(row.content.clone()),
             })
             .collect::<Vec<_>>();
         serde_json::json!({
@@ -1298,14 +1428,14 @@ fn finalize_rows(
             }
             if entry.highlights.len() < 3 {
                 entry.highlights.push(ChunkResult {
-                    file_path: row.file_path,
-                    relative_path: row.relative_path,
-                    modified_at: row.modified_at,
+                    file_path: row.file_path.clone(),
+                    relative_path: row.relative_path.clone(),
+                    modified_at: row.modified_at.clone(),
                     chunk_id: row.chunk_id,
                     score: (row.score * 100.0).round() / 100.0,
-                    matched_by: row.matched_by,
+                    matched_by: row.matched_by.clone(),
                     snippet: truncate_text(row.content.as_str(), 240),
-                    content: args.include_content.then_some(row.content),
+                    content: args.include_content.then_some(row.content.clone()),
                 });
             }
         }
@@ -1329,7 +1459,7 @@ fn finalize_rows(
         })
     };
 
-    Ok(ToolResult::json_value(value))
+    ToolResult::json_value(value)
 }
 
 fn truncate_text(input: &str, max_chars: usize) -> String {
@@ -1362,7 +1492,7 @@ mod tests {
     }
 
     impl SearchEmbeddingModel for NoopEmbedding {
-        fn selector(&self) -> &str {
+        fn selector(&self) -> &'static str {
             "noop@embedding"
         }
     }

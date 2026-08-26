@@ -134,7 +134,7 @@ impl AgentConfig {
 
     /// Sets the idle gap after which ephemeral context should be reassembled.
     #[must_use]
-    pub fn with_idle_reassemble_after(mut self, idle_reassemble_after: Duration) -> Self {
+    pub const fn with_idle_reassemble_after(mut self, idle_reassemble_after: Duration) -> Self {
         self.context_assembler.idle_reassemble_after = idle_reassemble_after;
         self
     }

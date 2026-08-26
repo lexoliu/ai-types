@@ -8,18 +8,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::job_registry::{JobRegistry, JobStatus};
 
+/// Tool for terminating a background terminal task.
 #[derive(Debug, Clone)]
 pub struct KillTerminalTool {
     registry: JobRegistry,
 }
 
 impl KillTerminalTool {
+    /// Creates a terminal kill tool.
     #[must_use]
     pub const fn new(registry: JobRegistry) -> Self {
         Self { registry }
     }
 }
 
+/// Arguments for [`KillTerminalTool`].
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct KillTerminalArgs {
     /// Task identifier returned by terminal when the task is backgrounded.
@@ -54,18 +57,21 @@ impl Tool for KillTerminalTool {
     }
 }
 
+/// Tool for sending stdin to a background terminal task.
 #[derive(Debug, Clone)]
 pub struct InputTerminalTool {
     registry: JobRegistry,
 }
 
 impl InputTerminalTool {
+    /// Creates a terminal input tool.
     #[must_use]
     pub const fn new(registry: JobRegistry) -> Self {
         Self { registry }
     }
 }
 
+/// Arguments for [`InputTerminalTool`].
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InputTerminalArgs {
     /// Task identifier returned by terminal when the task is backgrounded.
@@ -112,18 +118,21 @@ impl Tool for InputTerminalTool {
     }
 }
 
+/// Tool for reading incremental output from a background terminal task.
 #[derive(Debug, Clone)]
 pub struct ReadTerminalDeltaTool {
     registry: JobRegistry,
 }
 
 impl ReadTerminalDeltaTool {
+    /// Creates a terminal delta reader tool.
     #[must_use]
     pub const fn new(registry: JobRegistry) -> Self {
         Self { registry }
     }
 }
 
+/// Arguments for [`ReadTerminalDeltaTool`].
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ReadTerminalDeltaArgs {
     /// Task identifier returned by terminal when the task is backgrounded.

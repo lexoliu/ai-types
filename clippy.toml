@@ -1,0 +1,5 @@
+disallowed-methods = [
+    { path = "futures_lite::future::block_on", reason = "use an async test macro or keep the async boundary explicit" },
+    { path = "tokio_test::block_on", reason = "use an async test macro" },
+    { path = "async_io::block_on", reason = "use an async test macro or keep the async boundary explicit" },
+]

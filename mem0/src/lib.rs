@@ -148,10 +148,7 @@ where
             store,
             config,
         };
-        std::thread::Builder::new()
-            .name("mem0-runtime".to_string())
-            .spawn(move || futures_lite::future::block_on(run_mem0_actor(actor, command_rx)))
-            .expect("mem0 runtime thread must spawn");
+        async_global_executor::spawn(run_mem0_actor(actor, command_rx)).detach();
         Self {
             inner: Arc::new(Mem0Inner { command_tx }),
             _marker: std::marker::PhantomData,

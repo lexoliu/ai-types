@@ -7,8 +7,6 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[cfg(not(target_arch = "wasm32"))]
-use async_fs;
 use serde::{Deserialize, Serialize};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
@@ -87,7 +85,7 @@ impl OpenAIFile {
     /// Get the creation time as `SystemTime`.
     #[must_use]
     pub fn created(&self) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(self.created_at as u64)
+        UNIX_EPOCH + Duration::from_secs(self.created_at.cast_unsigned())
     }
 
     /// Check if the file is ready for use.
@@ -164,10 +162,14 @@ impl FilesConfig {
 ///
 /// # Arguments
 /// * `cfg` - Files configuration
-/// * `file_name` - File name reported to OpenAI
+/// * `file_name` - File name reported to `OpenAI`
 /// * `mime_type` - MIME type for multipart metadata
 /// * `data` - File content bytes
 /// * `purpose` - Purpose of the file
+///
+/// # Errors
+///
+/// Returns an error when request construction or the `OpenAI` Files API call fails.
 pub async fn upload_bytes(
     cfg: &FilesConfig,
     file_name: &str,
@@ -235,6 +237,10 @@ pub async fn upload_bytes(
 /// Upload a local file path to `OpenAI`.
 ///
 /// This is a native-only convenience API. For wasm, use [`upload_bytes`].
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or the upload request fails.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn upload_file(
     cfg: &FilesConfig,
@@ -255,6 +261,10 @@ pub async fn upload_file(
 /// # Arguments
 /// * `cfg` - Files configuration
 /// * `file_id` - ID of the file to delete
+///
+/// # Errors
+///
+/// Returns an error when request construction or deletion fails.
 pub async fn delete_file(
     cfg: &FilesConfig,
     file_id: &str,
@@ -285,6 +295,10 @@ pub async fn delete_file(
 /// # Arguments
 /// * `cfg` - Files configuration
 /// * `file_id` - ID of the file
+///
+/// # Errors
+///
+/// Returns an error when request construction or lookup fails.
 pub async fn get_file(cfg: &FilesConfig, file_id: &str) -> Result<OpenAIFile, OpenAIError> {
     let endpoint = format!("{}/{}", cfg.files_endpoint(), file_id);
 
@@ -312,6 +326,10 @@ pub async fn get_file(cfg: &FilesConfig, file_id: &str) -> Result<OpenAIFile, Op
 /// # Arguments
 /// * `cfg` - Files configuration
 /// * `purpose` - Optional filter by purpose
+///
+/// # Errors
+///
+/// Returns an error when request construction or listing fails.
 pub async fn list_files(
     cfg: &FilesConfig,
     purpose: Option<FilePurpose>,

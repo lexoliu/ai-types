@@ -60,15 +60,21 @@ impl AgentTools {
         use futures_core::Future;
         use std::pin::Pin;
 
-        let handler = dyn_tool.handler;
-        self.eager
-            .register_dyn(dyn_tool.definition, move |args: &str| -> Pin<Box<dyn Future<Output = aither_core::Result<ToolResult>> + Send>> {
+        for entry in dyn_tool.into_entries() {
+            let handler = entry.handler;
+            self.eager.register_dyn(
+                entry.definition,
+                move |args: &str| -> Pin<
+                    Box<dyn Future<Output = aither_core::Result<ToolResult>> + Send>,
+                > {
                 let handler = handler.clone();
                 let args = args.to_string();
                 Box::pin(async move {
                     handler(&args).await.into_tool_result()
                 })
-            });
+                },
+            );
+        }
     }
 
     /// Returns definitions of all registered tools.

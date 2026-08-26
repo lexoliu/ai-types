@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use aither_core::llm::model::Ability;
 
 use crate::convert;
+use crate::tier::{ChatPriceBreakpoints, ModelTier, classify_entry};
 use crate::types::{ModelEntry, ModelMode, Pricing, Provider};
 
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
@@ -15,6 +16,7 @@ include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 pub struct ModelRegistry {
     entries: Vec<ModelEntry>,
     index: HashMap<String, usize>,
+    chat_price_breakpoints: Option<ChatPriceBreakpoints>,
 }
 
 impl ModelRegistry {
@@ -44,7 +46,27 @@ impl ModelRegistry {
             // Index by litellm ID (lowercase)
             index.entry(entry.litellm_id().to_lowercase()).or_insert(i);
         }
-        Self { entries, index }
+        let chat_price_breakpoints = ChatPriceBreakpoints::compute(entries.iter());
+        Self {
+            entries,
+            index,
+            chat_price_breakpoints,
+        }
+    }
+
+    /// Capability/cost tier of a model, classified against this registry's
+    /// chat-model price distribution. Unknown models classify as
+    /// [`ModelTier::Balanced`].
+    #[must_use]
+    pub fn tier(&self, model_id: &str) -> ModelTier {
+        self.lookup(model_id)
+            .map_or(ModelTier::Balanced, |entry| self.tier_of(entry))
+    }
+
+    /// Capability/cost tier of a specific registry entry.
+    #[must_use]
+    pub fn tier_of(&self, entry: &ModelEntry) -> ModelTier {
+        classify_entry(entry, self.chat_price_breakpoints)
     }
 
     /// Exact match by canonical ID or LiteLLM ID, then prefix match.

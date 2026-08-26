@@ -5,6 +5,7 @@
 use aither_agent::{
     Hook, PostToolAction, PreToolAction, StopContext, ToolResultContext, ToolUseContext,
 };
+use aither_core::llm::ToolResult;
 
 /// A debug hook that logs tool calls with human-friendly terminal output.
 #[derive(Debug, Clone, Copy, Default)]
@@ -48,49 +49,43 @@ impl Hook for DebugHook {
         let duration_ms = ctx.duration.as_millis();
 
         if ctx.tool_name == "terminal" {
-            match ctx.result {
-                Ok(result) => {
-                    // Parse terminal result and show human-friendly output
-                    if let Some(output) = parse_terminal_result(result) {
-                        print_terminal_output(&output, duration_ms);
-                    } else {
-                        // Fallback: show raw but truncated
-                        println!("\x1b[90m({duration_ms}ms)\x1b[0m");
-                        let truncated = truncate_output(result, 500);
-                        for line in truncated.lines().take(10) {
-                            println!("  {line}");
-                        }
+            if let Some(err) = ctx.result.error_message() {
+                println!("\x1b[31m✗ Error:\x1b[0m {err} \x1b[90m({duration_ms}ms)\x1b[0m");
+            } else {
+                let result = render_tool_result(ctx.result);
+                if let Some(output) = parse_terminal_result(&result) {
+                    print_terminal_output(&output, duration_ms);
+                } else {
+                    println!("\x1b[90m({duration_ms}ms)\x1b[0m");
+                    let truncated = truncate_output(&result, 500);
+                    for line in truncated.lines().take(10) {
+                        println!("  {line}");
                     }
-                }
-                Err(err) => {
-                    println!("\x1b[31m✗ Error:\x1b[0m {err} \x1b[90m({duration_ms}ms)\x1b[0m");
                 }
             }
         } else {
             // Non-terminal tools
-            match ctx.result {
-                Ok(result) => {
-                    let truncated = truncate_output(result, 500);
-                    println!(
-                        "\x1b[32m[ok]\x1b[0m {} \x1b[90m({duration_ms}ms)\x1b[0m",
-                        ctx.tool_name
-                    );
-                    for line in truncated.lines().take(10) {
-                        println!("  \x1b[90m{line}\x1b[0m");
-                    }
-                    if truncated.lines().count() > 10 {
-                        println!(
-                            "  \x1b[90m... ({} more lines)\x1b[0m",
-                            truncated.lines().count() - 10
-                        );
-                    }
+            if let Some(err) = ctx.result.error_message() {
+                println!(
+                    "\x1b[31m[error]\x1b[0m {} \x1b[90m({duration_ms}ms)\x1b[0m",
+                    ctx.tool_name
+                );
+                println!("  \x1b[31m{err}\x1b[0m");
+            } else {
+                let result = render_tool_result(ctx.result);
+                let truncated = truncate_output(&result, 500);
+                println!(
+                    "\x1b[32m[ok]\x1b[0m {} \x1b[90m({duration_ms}ms)\x1b[0m",
+                    ctx.tool_name
+                );
+                for line in truncated.lines().take(10) {
+                    println!("  \x1b[90m{line}\x1b[0m");
                 }
-                Err(err) => {
+                if truncated.lines().count() > 10 {
                     println!(
-                        "\x1b[31m[error]\x1b[0m {} \x1b[90m({duration_ms}ms)\x1b[0m",
-                        ctx.tool_name
+                        "  \x1b[90m... ({} more lines)\x1b[0m",
+                        truncated.lines().count() - 10
                     );
-                    println!("  \x1b[31m{err}\x1b[0m");
                 }
             }
         }
@@ -104,6 +99,15 @@ impl Hook for DebugHook {
             ctx.turns, ctx.reason
         );
         None
+    }
+}
+
+fn render_tool_result(result: &ToolResult) -> String {
+    match result.render_for_cli() {
+        Ok(output) => output,
+        Err(error) => {
+            panic!("failed to render ToolResult for CLI output: {error}");
+        }
     }
 }
 
@@ -152,7 +156,8 @@ fn parse_terminal_result(result: &str) -> Option<TerminalOutput> {
     let exit_code = parsed
         .get("exit_code")
         .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0) as i32;
+        .and_then(|code| i32::try_from(code).ok())
+        .unwrap_or(0);
     let task_id = parsed
         .get("task_id")
         .and_then(|v| v.as_str())

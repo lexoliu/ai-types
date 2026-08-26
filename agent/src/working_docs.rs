@@ -11,6 +11,7 @@ use similar::{ChangeTag, TextDiff};
 /// Snapshot of working documents currently present in the sandbox.
 #[derive(Debug, Clone, Default)]
 pub struct WorkingDocsSnapshot {
+    /// Contents of `tasks.md`, when present.
     pub tasks_md: Option<String>,
 }
 

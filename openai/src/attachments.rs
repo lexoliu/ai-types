@@ -5,12 +5,10 @@ use crate::error::OpenAIError;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::client::Config;
 #[cfg(not(target_arch = "wasm32"))]
-use aither_core::llm::Message;
+use aither_core::llm::{Attachment, Message};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::files::{FilePurpose, FilesConfig, upload_file};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::mime::mime_from_path;
 #[cfg(not(target_arch = "wasm32"))]
 use aither_attachments::{FileCache, default_cache_dir};
 #[cfg(not(target_arch = "wasm32"))]
@@ -57,7 +55,7 @@ pub async fn resolve_messages(
         for attachment in attachments {
             let resolved_url = resolve_attachment(cfg, &mut cache, &attachment).await?;
             cache_dirty |= resolved_url.cache_updated;
-            next_attachments.push(resolved_url.url);
+            next_attachments.push(attachment.with_url(resolved_url.url));
         }
 
         resolved.push(Message::User {
@@ -83,17 +81,18 @@ struct ResolvedUrl {
 async fn resolve_attachment(
     cfg: &Config,
     cache: &mut FileCache,
-    attachment: &Url,
+    attachment: &Attachment,
 ) -> Result<ResolvedUrl, OpenAIError> {
-    match attachment.scheme() {
+    let url = attachment.url();
+    match url.scheme() {
         "file" => {
-            let path = attachment.to_file_path().map_err(|()| {
+            let path = url.to_file_path().map_err(|()| {
                 OpenAIError::Api("Attachment file URL could not be converted to path".to_string())
             })?;
-            resolve_file_attachment(cfg, cache, &path).await
+            resolve_file_attachment(cfg, cache, &path, attachment.media_type().as_ref()).await
         }
         "http" | "https" | "data" => Ok(ResolvedUrl {
-            url: attachment.clone(),
+            url: url.clone(),
             cache_updated: false,
         }),
         other => Err(OpenAIError::Api(format!(
@@ -107,8 +106,13 @@ async fn resolve_file_attachment(
     cfg: &Config,
     cache: &mut FileCache,
     path: &Path,
+    media_type: &str,
 ) -> Result<ResolvedUrl, OpenAIError> {
-    let kind = file_kind_for_path(path)?;
+    let kind = if media_type.starts_with("image/") {
+        OpenAIFileKind::IMAGE
+    } else {
+        OpenAIFileKind::FILE
+    };
     let provider = "openai";
 
     if let Some(entry) = cache.get(path, provider).await.map_err(OpenAIError::from)? {
@@ -148,21 +152,6 @@ fn build_files_config(cfg: &Config) -> FilesConfig {
         files_cfg = files_cfg.with_organization(org.clone());
     }
     files_cfg
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn file_kind_for_path(path: &Path) -> Result<OpenAIFileKind, OpenAIError> {
-    let mime = mime_from_path(path).ok_or_else(|| {
-        OpenAIError::Api(format!(
-            "Unable to infer MIME type for attachment: {}",
-            path.display()
-        ))
-    })?;
-    Ok(if mime.starts_with("image/") {
-        OpenAIFileKind::IMAGE
-    } else {
-        OpenAIFileKind::FILE
-    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]

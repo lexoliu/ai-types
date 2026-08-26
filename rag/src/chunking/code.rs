@@ -18,7 +18,7 @@ pub struct CodeChunker {
 impl CodeChunker {
     /// Creates a new code chunker.
     #[must_use]
-    pub fn new(max_chunk_size: usize) -> Self {
+    pub const fn new(max_chunk_size: usize) -> Self {
         Self {
             max_chunk_size,
             fallback: ParagraphChunker::new(max_chunk_size),
@@ -27,14 +27,16 @@ impl CodeChunker {
 
     /// Creates a chunker with default settings (2048 bytes).
     #[must_use]
-    pub fn default_settings() -> Self {
+    pub const fn default_settings() -> Self {
         Self::new(2048)
     }
 
     fn detect_rust(doc: &Document) -> bool {
-        doc.metadata
-            .get("path")
-            .is_some_and(|path| path.ends_with(".rs"))
+        doc.metadata.get("path").is_some_and(|path| {
+            std::path::Path::new(path)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+        })
     }
 
     fn chunk_rust(&self, doc: &Document) -> Result<Vec<Chunk>> {

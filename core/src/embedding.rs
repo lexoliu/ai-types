@@ -95,11 +95,11 @@ pub type Embedding = Vec<f32>;
 ///     }
 /// }
 ///
-/// # tokio_test::block_on(async {
+/// # async {
 /// let mut model = MyEmbedding { api_key: "sk-...".to_string() };
 /// let embedding = model.embed("The quick brown fox").await.unwrap();
 /// assert_eq!(embedding.len(), 1536);
-/// # });
+/// # };
 /// ```
 ///
 /// # Performance Considerations

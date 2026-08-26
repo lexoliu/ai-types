@@ -14,7 +14,7 @@ fn parse_kernel_u64(value: &str) -> Option<u64> {
     raw.parse::<u64>().ok()
 }
 
-fn is_linux_read_syscall(syscall_no: u64) -> bool {
+const fn is_linux_read_syscall(syscall_no: u64) -> bool {
     matches!(syscall_no, 0 | 3 | 63)
 }
 
@@ -40,6 +40,9 @@ pub fn is_waiting_on_stdin(syscall_dump: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 /// Detect whether a local process is blocked on `read(0, ...)` using `/proc/<pid>/syscall`.
+///
+/// # Errors
+/// Returns an I/O error when the process syscall state cannot be read.
 pub async fn detect_stdin_blocked_for_local_pid(pid: u32) -> std::io::Result<bool> {
     let path = format!("/proc/{pid}/syscall");
     let syscall_dump = async_fs::read_to_string(path).await?;
@@ -48,6 +51,9 @@ pub async fn detect_stdin_blocked_for_local_pid(pid: u32) -> std::io::Result<boo
 
 #[cfg(not(target_os = "linux"))]
 /// Non-Linux platforms do not expose the `/proc/<pid>/syscall` probe used by stdin detection.
+///
+/// # Errors
+/// This implementation does not fail.
 pub async fn detect_stdin_blocked_for_local_pid(_pid: u32) -> std::io::Result<bool> {
     Ok(false)
 }

@@ -19,8 +19,8 @@ use crate::{
     constant::{ANTHROPIC_VERSION, CLAUDE_BASE_URL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL},
     error::ClaudeError,
     request::{
-        MessagesRequest, ParameterSnapshot, apply_cache_strategy, convert_tools,
-        filter_tool_definitions, to_claude_messages, tool_choice_payload,
+        MessagesRequest, ParameterSnapshot, apply_cache_strategy, convert_native_tools,
+        convert_tools, filter_tool_definitions, to_claude_messages, tool_choice_payload,
     },
     response::{StreamState, parse_event, should_skip_event},
 };
@@ -88,6 +88,7 @@ impl Claude {
 impl LanguageModel for Claude {
     type Error = ClaudeError;
 
+    #[allow(clippy::too_many_lines)]
     fn respond(
         &self,
         request: LLMRequest,
@@ -98,17 +99,31 @@ impl LanguageModel for Claude {
         let filtered_tool_definitions =
             filter_tool_definitions(tool_definitions, &snapshot.tool_choice);
         let missing_exact_tool = match &snapshot.tool_choice {
-            ToolChoice::Exact(name) if filtered_tool_definitions.is_empty() => Some(name.clone()),
+            ToolChoice::Exact(name)
+                if filtered_tool_definitions.is_empty()
+                    && !native_tool_name_enabled(&snapshot, name) =>
+            {
+                Some(name.clone())
+            }
             _ => None,
         };
-        let has_tools = !filtered_tool_definitions.is_empty();
-        let mut claude_tools = has_tools.then(|| convert_tools(&filtered_tool_definitions));
+        let mut claude_tool_payloads = convert_tools(&filtered_tool_definitions);
+        claude_tool_payloads.extend(convert_native_tools(&snapshot.native_tools));
+        let has_tools = !claude_tool_payloads.is_empty();
+        let mut claude_tools = has_tools.then_some(claude_tool_payloads);
         let claude_tool_choice = tool_choice_payload(&snapshot.tool_choice, has_tools);
 
         let max_tokens = snapshot.max_tokens.unwrap_or(cfg.default_max_tokens);
 
         async_stream::stream! {
-            let (mut system_prompt, mut claude_messages) = to_claude_messages(&core_messages).await;
+            let (mut system_prompt, mut claude_messages) =
+                match to_claude_messages(&core_messages).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        yield Err(ClaudeError::Api(error));
+                        return;
+                    }
+                };
 
             if parameters.cache.openai.is_some() || parameters.cache.gemini.is_some() {
                 yield Err(ClaudeError::Api(
@@ -178,7 +193,6 @@ impl LanguageModel for Claude {
                     return;
                 }
             };
-
             let sse_stream = match builder.sse().await {
                 Ok(stream) => stream,
                 Err(e) => {
@@ -274,6 +288,26 @@ impl LanguageModel for Claude {
             profile
         }
     }
+}
+
+fn native_tool_name_enabled(snapshot: &ParameterSnapshot, name: &str) -> bool {
+    let tools = &snapshot.native_tools;
+    matches!(
+        name,
+        "web_search" if tools.web_search
+    ) || matches!(
+        name,
+        "web_fetch" if tools.web_fetch
+    ) || matches!(
+        name,
+        "code_execution" if tools.code_execution
+    ) || matches!(
+        name,
+        "bash" if tools.bash
+    ) || matches!(
+        name,
+        "str_replace_based_edit_tool" if tools.text_editor.is_some()
+    )
 }
 
 /// Try to fetch context length from the models endpoint.

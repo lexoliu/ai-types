@@ -100,7 +100,8 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {
-                *value = ((text.len() + idx) % 10) as f32 / 10.0;
+                let digit = u8::try_from((text.len() + idx) % 10).expect("modulo result fits u8");
+                *value = f32::from(digit) / 10.0;
             }
             Ok(vec)
         }
@@ -128,6 +129,6 @@ mod tests {
         };
 
         let result = rag.call(args).await.unwrap();
-        assert!(result.as_str().unwrap().contains("Rust"));
+        assert!(result.render_for_model().unwrap().contains("Rust"));
     }
 }

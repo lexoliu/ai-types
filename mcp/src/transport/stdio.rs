@@ -6,8 +6,8 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use async_io::Async;
-use futures_lite::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tracing::debug;
+use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tracing::{debug, warn};
 
 use super::traits::{BidirectionalTransport, Result, Transport};
 use crate::protocol::{
@@ -62,8 +62,7 @@ impl StdioTransport {
     }
 
     /// Write a message to stdout.
-    async fn write_message(&mut self, msg: &impl serde::Serialize) -> Result<()> {
-        let json = serde_json::to_string(msg)?;
+    async fn write_message(&mut self, json: String) -> Result<()> {
         debug!("MCP TX: {}", json);
 
         self.stdout.write_all(json.as_bytes()).await?;
@@ -75,21 +74,23 @@ impl StdioTransport {
 
     /// Read a message from stdin.
     async fn read_message(&mut self) -> Result<Option<JsonRpcMessage>> {
-        let mut line = String::new();
+        read_message(&mut self.stdin).await
+    }
+}
 
-        match self.stdin.read_line(&mut line).await {
-            Ok(0) => Ok(None), // EOF
-            Ok(_) => {
-                let line = line.trim();
-                if line.is_empty() {
-                    return Ok(None);
-                }
-                debug!("MCP RX: {}", line);
-                let msg: JsonRpcMessage = serde_json::from_str(line)?;
-                Ok(Some(msg))
-            }
-            Err(e) => Err(McpError::Io(e)),
+async fn read_message(reader: &mut (impl AsyncBufRead + Unpin)) -> Result<Option<JsonRpcMessage>> {
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).await? == 0 {
+            return Ok(None);
         }
+
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        debug!("MCP RX: {}", line);
+        return serde_json::from_str(line).map(Some).map_err(Into::into);
     }
 }
 
@@ -104,7 +105,7 @@ impl Transport for StdioTransport {
         req.id = id.clone();
 
         // Send request
-        self.write_message(&req).await?;
+        self.write_message(serde_json::to_string(&req)?).await?;
 
         // Read response (simple: expect next message to be our response)
         loop {
@@ -112,10 +113,7 @@ impl Transport for StdioTransport {
                 Some(JsonRpcMessage::Response(response)) if response.id == id => {
                     return Ok(response);
                 }
-                Some(_) => {
-                    // Skip non-matching messages (notifications, other responses)
-                    continue;
-                }
+                Some(_) => {}
                 None => {
                     return Err(McpError::ConnectionClosed);
                 }
@@ -127,7 +125,7 @@ impl Transport for StdioTransport {
         if self.closed {
             return Err(McpError::ConnectionClosed);
         }
-        self.write_message(&notif).await
+        self.write_message(serde_json::to_string(&notif)?).await
     }
 
     async fn close(&mut self) -> Result<()> {
@@ -141,13 +139,50 @@ impl BidirectionalTransport for StdioTransport {
         if self.closed {
             return Ok(None);
         }
-        self.read_message().await
+        loop {
+            match self.read_message().await {
+                Err(McpError::Serialization(error)) => {
+                    warn!(%error, "ignoring invalid JSON-RPC input");
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn respond(&mut self, response: JsonRpcResponse) -> Result<()> {
         if self.closed {
             return Err(McpError::ConnectionClosed);
         }
-        self.write_message(&response).await
+        self.write_message(serde_json::to_string(&response)?).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_lite::io::{BufReader, Cursor};
+
+    use super::read_message;
+
+    #[test]
+    fn blank_lines_do_not_close_the_transport() {
+        futures_lite::future::block_on(async {
+            let input = b"\n  \r\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+            let mut reader = BufReader::new(Cursor::new(input));
+
+            assert!(read_message(&mut reader).await.unwrap().is_some());
+            assert!(read_message(&mut reader).await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn invalid_json_does_not_consume_the_following_message() {
+        futures_lite::future::block_on(async {
+            let input =
+                b"not json\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+            let mut reader = BufReader::new(Cursor::new(input));
+
+            assert!(read_message(&mut reader).await.is_err());
+            assert!(read_message(&mut reader).await.unwrap().is_some());
+        });
     }
 }

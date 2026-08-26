@@ -55,7 +55,9 @@ impl PoolingStrategy {
             }
             Self::Mean => {
                 // Count valid tokens
-                let valid_count: f32 = attention_mask.iter().map(|&m| m as f32).sum();
+                let valid_count = attention_mask
+                    .iter()
+                    .fold(0.0_f32, |count, &mask| count + f32::from(mask != 0));
                 if valid_count == 0.0 {
                     return vec![0.0; hidden_dim];
                 }

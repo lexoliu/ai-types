@@ -1,6 +1,7 @@
 //! Adapter for converting aither agent events to ACP session updates.
 
 use aither_agent::{AgentEvent, TodoItem, TodoStatus};
+use aither_core::llm::ToolResult;
 
 use crate::protocol::{
     ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionUpdate,
@@ -43,41 +44,65 @@ pub fn agent_event_to_session_update(event: &AgentEvent) -> Option<SessionUpdate
             raw_output: None,
         })),
 
+        AgentEvent::ToolCallDelta {
+            id,
+            name,
+            arguments_fragment,
+        } => Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+            tool_call_id: id.clone(),
+            status: Some(ToolCallStatus::Pending),
+            content: None,
+            title: Some(format_tool_title(name, arguments_fragment)),
+            kind: Some(infer_tool_kind(name)),
+            locations: None,
+            raw_input: Some(serde_json::Value::String(arguments_fragment.clone())),
+            raw_output: None,
+        })),
+
         AgentEvent::ToolCallEnd {
             id,
             name: _,
             result,
-        } => {
-            let (status, output) = match result {
-                Ok(output) => (ToolCallStatus::Completed, Some(output.clone())),
-                Err(error) => (ToolCallStatus::Error, Some(error.clone())),
-            };
+        } => Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+            tool_call_id: id.clone(),
+            status: Some(tool_result_status(result)),
+            content: None,
+            title: None,
+            kind: None,
+            locations: None,
+            raw_input: None,
+            raw_output: Some(tool_result_raw_output(result)),
+        })),
 
-            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                tool_call_id: id.clone(),
-                status: Some(status),
-                content: None,
-                title: None,
-                kind: None,
-                locations: None,
-                raw_input: None,
-                raw_output: output.map(serde_json::Value::String),
-            }))
+        AgentEvent::RunStart { .. }
+        | AgentEvent::Checkpoint { .. }
+        | AgentEvent::BackgroundTaskStarted { .. }
+        | AgentEvent::BackgroundTaskCompleted { .. }
+        | AgentEvent::TerminalInputNeeded { .. }
+        | AgentEvent::RunPaused { .. }
+        | AgentEvent::RunResumed { .. }
+        | AgentEvent::SkillActivated { .. }
+        | AgentEvent::TurnComplete { .. }
+        | AgentEvent::Complete { .. }
+        | AgentEvent::Error(_)
+        | AgentEvent::Usage(_) => None,
+    }
+}
+
+const fn tool_result_status(result: &ToolResult) -> ToolCallStatus {
+    if result.is_error() {
+        ToolCallStatus::Error
+    } else {
+        ToolCallStatus::Completed
+    }
+}
+
+fn tool_result_raw_output(result: &ToolResult) -> serde_json::Value {
+    match serde_json::to_value(result) {
+        Ok(value) => value,
+        Err(error) => {
+            panic!("failed to serialize ToolResult for ACP raw_output: {error}");
         }
-
-        // These events are handled at a higher level
-        AgentEvent::RunStart { .. } => None,
-        AgentEvent::Checkpoint { .. } => None,
-        AgentEvent::BackgroundTaskStarted { .. } => None,
-        AgentEvent::BackgroundTaskCompleted { .. } => None,
-        AgentEvent::TerminalInputNeeded { .. } => None,
-        AgentEvent::RunPaused { .. } => None,
-        AgentEvent::RunResumed { .. } => None,
-        AgentEvent::SkillActivated { .. } => None,
-        AgentEvent::TurnComplete { .. } => None,
-        AgentEvent::Complete { .. } => None,
-        AgentEvent::Error(_) => None,
-        AgentEvent::Usage(_) => None,
     }
 }
 

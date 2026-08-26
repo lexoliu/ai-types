@@ -5,10 +5,11 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use aither_core::llm::tool::ToolDefinition;
 use aither_sandbox::{CommandPayload, ToolRegistryBuilder};
-use async_channel::{Receiver, Sender};
+use async_lock::Mutex;
 use serde::Deserialize;
 
 use crate::protocol::{CallToolResult, McpError, McpToolDefinition};
@@ -95,17 +96,8 @@ pub enum McpConnection {
 /// Service wrapper that serializes MCP tool calls through a command channel.
 #[derive(Clone, Debug)]
 pub struct McpToolService {
-    tx: Sender<McpCommand>,
+    conn: Arc<Mutex<McpConnection>>,
     tools: Vec<McpToolDefinition>,
-}
-
-#[derive(Debug)]
-enum McpCommand {
-    Call {
-        name: String,
-        arguments: serde_json::Value,
-        reply: Sender<Result<CallToolResult, McpError>>,
-    },
 }
 
 impl std::fmt::Debug for McpConnection {
@@ -407,18 +399,19 @@ pub fn register_terminal_commands(
     let definitions = conn.definitions();
     let conn = std::sync::Arc::new(async_lock::Mutex::new(conn));
 
-    for definition in definitions.iter().cloned() {
+    for definition in &definitions {
         let tool_name = definition.name().to_string();
         let conn = conn.clone();
         registry.configure_definition_handler(definition, move |arguments| {
             let conn = conn.clone();
             let tool_name = tool_name.clone();
             Box::pin(async move {
-                let mut conn = conn.lock().await;
-                let result = conn
-                    .call(tool_name.as_str(), arguments)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                let result = {
+                    let mut conn = conn.lock().await;
+                    conn.call(tool_name.as_str(), arguments)
+                        .await
+                        .map_err(|error| error.to_string())?
+                };
                 call_result_to_terminal_payload(result)
             })
         });
@@ -428,13 +421,14 @@ pub fn register_terminal_commands(
 }
 
 impl McpToolService {
-    /// Creates a new MCP tool service and starts its background worker.
+    /// Creates a new MCP tool service.
     #[must_use]
-    pub fn new(mut conn: McpConnection) -> Self {
+    pub fn new(conn: McpConnection) -> Self {
         let tools = conn.mcp_definitions().to_vec();
-        let (tx, rx) = async_channel::unbounded();
-        std::thread::spawn(move || run_service(rx, &mut conn));
-        Self { tx, tools }
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+            tools,
+        }
     }
 
     /// Returns the MCP tool definitions.
@@ -473,33 +467,7 @@ impl McpToolService {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult, McpError> {
-        let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.tx
-            .send(McpCommand::Call {
-                name: name.to_string(),
-                arguments,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| McpError::ConnectionClosed)?;
-        reply_rx
-            .recv()
-            .await
-            .map_err(|_| McpError::ConnectionClosed)?
-    }
-}
-
-fn run_service(rx: Receiver<McpCommand>, conn: &mut McpConnection) {
-    while let Ok(cmd) = rx.recv_blocking() {
-        match cmd {
-            McpCommand::Call {
-                name,
-                arguments,
-                reply,
-            } => {
-                let result = async_io::block_on(conn.call(&name, arguments));
-                let _ = reply.send_blocking(result);
-            }
-        }
+        let mut conn = self.conn.lock().await;
+        conn.call(name, arguments).await
     }
 }

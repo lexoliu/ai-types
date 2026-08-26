@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use aither_agent::sandbox::{
     CommandPayload, ToolRegistryBuilder, cli_to_json,
-    permission::{PermissionError, PermissionHandler, StatefulPermissionHandler, TerminalMode},
+    permission::{PermissionError, PermissionHandler, TerminalMode},
     schema_to_help,
 };
 use aither_agent::specialized::SubagentTool;
@@ -99,16 +99,13 @@ const DEFAULT_DOMAIN_WHITELIST: &[&str] = &[
 /// - Unsafe: always ask for each script
 #[derive(Debug, Default)]
 struct InteractivePermissionHandler {
-    /// Whether network mode has been approved (auto-approves all domains).
-    network_approved: std::sync::atomic::AtomicBool,
-    /// Cache of approved domains for cases where network mode isn't blanket approved.
+    /// Cache of approved domains outside the default whitelist.
     approved_domains: ArcSwap<HashSet<String>>,
 }
 
 impl InteractivePermissionHandler {
     fn new() -> Self {
         Self {
-            network_approved: std::sync::atomic::AtomicBool::new(false),
             approved_domains: ArcSwap::from_pointee(HashSet::new()),
         }
     }
@@ -116,10 +113,9 @@ impl InteractivePermissionHandler {
 
 impl PermissionHandler for InteractivePermissionHandler {
     async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
-        // This will be wrapped in StatefulPermissionHandler for network mode
         match mode {
             TerminalMode::Sandboxed => Ok(true), // Always allow
-            TerminalMode::Network | TerminalMode::Unsafe => {
+            TerminalMode::Unsafe => {
                 // Display script and ask for permission (show full script, no truncation)
                 let mode_desc = mode.description();
                 let display_script = script.trim().replace('\n', "; ");
@@ -133,11 +129,6 @@ impl PermissionHandler for InteractivePermissionHandler {
                 eprintln!();
 
                 if approved {
-                    // Mark network as approved to skip domain prompts
-                    if mode == TerminalMode::Network {
-                        self.network_approved
-                            .store(true, std::sync::atomic::Ordering::Release);
-                    }
                     Ok(true)
                 } else {
                     Err(PermissionError::Denied("user declined".to_string()))
@@ -147,14 +138,6 @@ impl PermissionHandler for InteractivePermissionHandler {
     }
 
     async fn check_domain(&self, domain: &str, _port: u16) -> bool {
-        // If network mode was approved, allow all domains
-        if self
-            .network_approved
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return true;
-        }
-
         // Check default whitelist
         if DEFAULT_DOMAIN_WHITELIST.contains(&domain) {
             return true;
@@ -384,7 +367,10 @@ async fn main() -> Result<()> {
     // Create cloud provider
     let base_url = args.base_url.as_deref();
     let (cloud, model, provider_name) = if let Some(provider) = args.provider {
-        let model = args.model.as_deref().unwrap_or(provider.default_model());
+        let model = args
+            .model
+            .as_deref()
+            .unwrap_or_else(|| provider.default_model());
         (
             provider.create(model, base_url)?,
             model.to_string(),
@@ -413,10 +399,10 @@ async fn main() -> Result<()> {
 
     // Headless mode: run single prompt and exit
     if let Some(ref prompt) = args.prompt {
-        return run_headless(cloud, &args, prompt).await;
+        return Box::pin(run_headless(cloud, &args, prompt)).await;
     }
 
-    run_repl(cloud, &args).await
+    Box::pin(run_repl(cloud, &args)).await
 }
 
 /// Run as ACP server for editor integration.
@@ -439,7 +425,7 @@ async fn build_agent(
     // - Network: ask once, then remember
     // - Unsafe: always ask for each script
     let workdir_parent = std::env::temp_dir().join("aither");
-    let permission_handler = StatefulPermissionHandler::new(InteractivePermissionHandler::new());
+    let permission_handler = InteractivePermissionHandler::new();
     let terminal_tool = aither_agent::sandbox::TerminalTool::new_in(
         &workdir_parent,
         permission_handler,
@@ -541,14 +527,7 @@ async fn build_agent(
         .with_builtins()
         .with_base_dir(builder.sandbox_dir().to_string())
         .with_terminal_tool_factory(builder.terminal_tool_factory());
-    let mut subagent_desc = String::from("Spawn subagent for complex tasks (types: ");
-    let subagent_names: Vec<_> = subagent_tool
-        .type_descriptions()
-        .iter()
-        .map(|(n, _)| *n)
-        .collect();
-    subagent_desc.push_str(&subagent_names.join(", "));
-    subagent_desc.push(')');
+    let subagent_desc = format_subagent_description(&subagent_tool);
     builder = builder.tool_with_desc(subagent_tool, subagent_desc);
 
     // Add system prompt
@@ -561,11 +540,23 @@ async fn build_agent(
     Ok(builder.hook(DebugHook).build())
 }
 
+fn format_subagent_description(subagent_tool: &SubagentTool<CloudProvider>) -> String {
+    let mut subagent_desc = String::from("Spawn subagent for complex tasks (types: ");
+    let subagent_names = subagent_tool
+        .type_descriptions()
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>();
+    subagent_desc.push_str(&subagent_names.join(", "));
+    subagent_desc.push(')');
+    subagent_desc
+}
+
 /// Run a single prompt and exit (headless mode).
 async fn run_headless(cloud: CloudProvider, args: &Args, prompt: &str) -> Result<()> {
     let mut agent = build_agent(cloud, args).await?;
 
-    match agent.query(prompt).await {
+    match Box::pin(agent.query(prompt)).await {
         Ok(response) => {
             println!("{response}");
             Ok(())
@@ -633,7 +624,7 @@ async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
 
         // Query the agent
         println!("\nAgent>");
-        match agent.query(input).await {
+        match Box::pin(agent.query(input)).await {
             Ok(response) => {
                 println!("{response}");
             }

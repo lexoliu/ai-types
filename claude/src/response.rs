@@ -187,15 +187,16 @@ pub struct CacheCreation {
 impl CacheCreation {
     fn total(&self) -> Option<u32> {
         let mut total = 0u32;
-        let mut has_any = false;
-        if let Some(value) = self.ephemeral_5m_input_tokens {
+        let has_five_minute = self.ephemeral_5m_input_tokens.is_some_and(|value| {
             total = total.saturating_add(value);
-            has_any = true;
-        }
-        if let Some(value) = self.ephemeral_1h_input_tokens {
-            total = total.saturating_add(value);
-            has_any = true;
-        }
+            true
+        });
+        let has_any = self
+            .ephemeral_1h_input_tokens
+            .map_or(has_five_minute, |value| {
+                total = total.saturating_add(value);
+                true
+            });
         has_any.then_some(total)
     }
 }
@@ -258,11 +259,6 @@ impl StreamState {
         Self::default()
     }
 
-    /// Check if the response requested tool use.
-    pub const fn has_tool_calls(&self) -> bool {
-        !self.tool_calls.is_empty()
-    }
-
     fn maybe_usage_event(&mut self) -> Option<LLMEvent> {
         if self.usage_emitted {
             return None;
@@ -294,15 +290,15 @@ impl StreamState {
 
     fn refresh_prompt_tokens(&mut self) {
         let mut total = self.uncached_input_tokens.unwrap_or(0);
-        let mut has_any = self.uncached_input_tokens.is_some();
-        if let Some(cache_read) = self.cache_read_tokens {
+        let has_uncached = self.uncached_input_tokens.is_some();
+        let has_read = self.cache_read_tokens.map_or(has_uncached, |cache_read| {
             total = total.saturating_add(cache_read);
-            has_any = true;
-        }
-        if let Some(cache_write) = self.cache_write_tokens {
+            true
+        });
+        let has_any = self.cache_write_tokens.map_or(has_read, |cache_write| {
             total = total.saturating_add(cache_write);
-            has_any = true;
-        }
+            true
+        });
         self.prompt_tokens = has_any.then_some(total);
     }
 }
@@ -310,6 +306,7 @@ impl StreamState {
 /// Parse a single SSE event into LLM events.
 ///
 /// Updates the stream state and returns events to emit.
+#[allow(clippy::too_many_lines)]
 pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<Vec<LLMEvent>, ClaudeError> {
     let event_name = event.event();
     let event_type = event_name.unwrap_or("");
@@ -414,7 +411,7 @@ pub fn parse_event(event: &Event, state: &mut StreamState) -> Result<Vec<LLMEven
             {
                 // Parse the accumulated JSON
                 let input = serde_json::from_str(input_json)
-                    .unwrap_or(Value::Object(serde_json::Map::new()));
+                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
                 state.tool_calls.push(ToolCall {
                     id: id.clone(),
                     name: name.clone(),

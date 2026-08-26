@@ -55,8 +55,10 @@ impl From<Gemini> for CloudEmbedder {
     }
 }
 
+/// Error returned when a cloud provider cannot be used as an embedder.
 #[derive(Debug, thiserror::Error)]
 pub enum CloudEmbedderError {
+    /// The provider does not implement embeddings.
     #[error("provider does not support embeddings: {0}")]
     UnsupportedProvider(&'static str),
 }
@@ -223,14 +225,12 @@ impl LanguageModel for CloudProvider {
         }
     }
 
-    fn profile(&self) -> impl std::future::Future<Output = Profile> + Send {
-        async move {
-            match self {
-                Self::OpenAI(inner) => inner.profile().await,
-                Self::Claude(inner) => inner.profile().await,
-                Self::Gemini(inner) => inner.profile().await,
-                Self::Copilot(inner) => inner.profile().await,
-            }
+    async fn profile(&self) -> Profile {
+        match self {
+            Self::OpenAI(inner) => inner.profile().await,
+            Self::Claude(inner) => inner.profile().await,
+            Self::Gemini(inner) => inner.profile().await,
+            Self::Copilot(inner) => inner.profile().await,
         }
     }
 }

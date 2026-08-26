@@ -129,7 +129,7 @@ impl<T: BidirectionalTransport> AcpServer<T> {
     async fn handle_message(&mut self, msg: JsonRpcMessage) -> Result<()> {
         match msg {
             JsonRpcMessage::Request(req) => {
-                let response = self.handle_request(req).await;
+                let response = self.handle_request(req);
                 self.respond(response).await?;
             }
             JsonRpcMessage::Notification(notif) => {
@@ -148,14 +148,14 @@ impl<T: BidirectionalTransport> AcpServer<T> {
     }
 
     /// Handle an incoming request.
-    async fn handle_request(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
+    fn handle_request(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
         debug!("Handling request: {}", req.method);
 
         match req.method.as_str() {
             "initialize" => self.handle_initialize(req),
-            "session/new" => self.handle_session_new(req).await,
-            "session/prompt" => self.handle_session_prompt(req).await,
-            "session/stop" => self.handle_session_stop(req).await,
+            "session/new" => self.handle_session_new(req),
+            "session/prompt" => self.handle_session_prompt(req),
+            "session/stop" => self.handle_session_stop(req),
             method => JsonRpcResponse::error(req.id, JsonRpcError::method_not_found(method)),
         }
     }
@@ -198,7 +198,7 @@ impl<T: BidirectionalTransport> AcpServer<T> {
     }
 
     /// Handle session/new request.
-    async fn handle_session_new(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
+    fn handle_session_new(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
         let params: SessionNewParams = match req.params.map(serde_json::from_value).transpose() {
             Ok(Some(p)) => p,
             Ok(None) => {
@@ -222,7 +222,7 @@ impl<T: BidirectionalTransport> AcpServer<T> {
     }
 
     /// Handle session/prompt request.
-    async fn handle_session_prompt(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
+    fn handle_session_prompt(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
         let params: PromptParams = match req.params.map(serde_json::from_value).transpose() {
             Ok(Some(p)) => p,
             Ok(None) => {
@@ -236,17 +236,11 @@ impl<T: BidirectionalTransport> AcpServer<T> {
             }
         };
 
-        let session = match self.sessions.get_mut(&params.session_id) {
-            Some(s) => s,
-            None => {
-                return JsonRpcResponse::error(
-                    req.id,
-                    JsonRpcError::invalid_params(format!(
-                        "Session not found: {}",
-                        params.session_id
-                    )),
-                );
-            }
+        let Some(session) = self.sessions.get_mut(&params.session_id) else {
+            return JsonRpcResponse::error(
+                req.id,
+                JsonRpcError::invalid_params(format!("Session not found: {}", params.session_id)),
+            );
         };
 
         // Process prompt and stream updates
@@ -287,7 +281,7 @@ impl<T: BidirectionalTransport> AcpServer<T> {
     }
 
     /// Handle session/stop request.
-    async fn handle_session_stop(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
+    fn handle_session_stop(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
         let params: SessionStopParams = match req.params.map(serde_json::from_value).transpose() {
             Ok(Some(p)) => p,
             Ok(None) => {
@@ -314,6 +308,10 @@ impl<T: BidirectionalTransport> AcpServer<T> {
     }
 
     /// Send a session update notification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transport fails while sending the notification.
     pub async fn send_update(&mut self, session_id: &str, update: SessionUpdate) -> Result<()> {
         let notif = JsonRpcNotification::with_params(
             "session/update",

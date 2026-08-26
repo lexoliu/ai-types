@@ -26,5 +26,8 @@ tracing = "0.1"
 url = "2"
 zenwave.workspace = true
 
+[dev-dependencies]
+tokio = { version = "1.0", features = ["macros", "rt"] }
+
 [lints]
 workspace = true

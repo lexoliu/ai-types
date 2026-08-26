@@ -17,9 +17,9 @@ use futures_lite::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Query a fast LLM about piped content.
+/// Query an LLM about piped content.
 ///
-/// Reads content from stdin and processes it with a fast language model.
+/// Reads content from stdin and processes it with a language model.
 /// Only the model's response is returned to your context - the input content
 /// is not included in the response, saving context space for large inputs.
 ///
@@ -33,6 +33,24 @@ pub struct AskArgs {
     /// Input content (from stdin/pipe).
     #[serde(default)]
     pub input: String,
+
+    /// Which model tier answers: `fast` (default; cheapest, lowest latency),
+    /// `balanced`, or `flagship` (highest quality, for hard reasoning).
+    #[serde(default)]
+    pub model: AskModelTier,
+}
+
+/// Model tier selector for the ask command.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AskModelTier {
+    /// Highest-quality model for hard reasoning.
+    Flagship,
+    /// Balanced quality/cost model.
+    Balanced,
+    /// Cheapest, lowest-latency model (default).
+    #[default]
+    Fast,
 }
 
 #[derive(Serialize)]
@@ -58,15 +76,39 @@ fn serialize_context_xml(content: &str) -> Result<String, quick_xml::SeError> {
 }
 
 /// The ask command tool.
+///
+/// Holds one LLM per selectable tier; [`AskCommand::new`] starts with the
+/// same model on every tier and hosts override individual tiers via the
+/// builder methods.
 #[derive(Debug)]
 pub struct AskCommand<LLM> {
-    llm: LLM,
+    flagship: LLM,
+    balanced: LLM,
+    fast: LLM,
 }
 
-impl<LLM> AskCommand<LLM> {
-    /// Creates a new ask command with the given LLM.
-    pub const fn new(llm: LLM) -> Self {
-        Self { llm }
+impl<LLM: Clone> AskCommand<LLM> {
+    /// Creates a new ask command answering every tier with the given LLM.
+    pub fn new(llm: LLM) -> Self {
+        Self {
+            flagship: llm.clone(),
+            balanced: llm.clone(),
+            fast: llm,
+        }
+    }
+
+    /// Overrides the model used for `model=flagship`.
+    #[must_use]
+    pub fn with_flagship(mut self, llm: LLM) -> Self {
+        self.flagship = llm;
+        self
+    }
+
+    /// Overrides the model used for `model=balanced`.
+    #[must_use]
+    pub fn with_balanced(mut self, llm: LLM) -> Self {
+        self.balanced = llm;
+        self
     }
 }
 
@@ -88,7 +130,12 @@ impl<LLM: LanguageModel> Tool for AskCommand<LLM> {
         let user_content = join_text(&[context_xml.as_str(), "\n\n", args.prompt.as_str()]);
 
         let request = LLMRequest::new(vec![Message::user(user_content)]);
-        let response = self.llm.respond(request);
+        let llm = match args.model {
+            AskModelTier::Flagship => &self.flagship,
+            AskModelTier::Balanced => &self.balanced,
+            AskModelTier::Fast => &self.fast,
+        };
+        let response = llm.respond(request);
 
         // Collect the response text
         futures_lite::pin!(response);

@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
                     eprintln!("Skipped {}: {}", path.display(), reason);
                 }
             }
-            _ => {}
+            IndexStage::Chunking => {}
         })
         .await?;
 
@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
             top_k: 2,
         })
         .await?;
-    println!("\nTool response:\n{}", response.as_str().unwrap_or(""));
+    println!("\nTool response:\n{}", response.render_for_cli()?);
 
     // Direct search
     println!("\nDirect search results:");

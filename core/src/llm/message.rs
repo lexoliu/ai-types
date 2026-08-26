@@ -4,9 +4,80 @@
 //! Messages are represented as an enum with variants for different roles (User, Assistant, System, Tool).
 
 use alloc::{string::String, vec::Vec};
+use mime::Mime;
 use url::Url;
 
 use super::event::ToolCall;
+
+/// A typed media attachment supplied with a user message.
+///
+/// Keeping the MIME type beside the URL lets each provider choose the correct
+/// protocol content block without guessing from a provider-generated URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Attachment {
+    url: Url,
+    #[cfg_attr(feature = "serde", serde(with = "mime_serde"))]
+    media_type: Mime,
+}
+
+impl Attachment {
+    /// Creates an attachment with an explicit MIME type.
+    #[must_use]
+    pub const fn new(url: Url, media_type: Mime) -> Self {
+        Self { url, media_type }
+    }
+
+    /// Returns the attachment URL.
+    #[must_use]
+    pub const fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// Returns the declared MIME type.
+    #[must_use]
+    pub const fn media_type(&self) -> &Mime {
+        &self.media_type
+    }
+
+    /// Replaces the URL while preserving the declared MIME type.
+    #[must_use]
+    pub fn with_url(self, url: Url) -> Self {
+        Self {
+            url,
+            media_type: self.media_type,
+        }
+    }
+
+    /// Splits the attachment into its URL and MIME type.
+    #[must_use]
+    pub fn into_parts(self) -> (Url, Mime) {
+        (self.url, self.media_type)
+    }
+}
+
+#[cfg(feature = "serde")]
+mod mime_serde {
+    use alloc::string::String;
+    use core::str::FromStr;
+    use mime::Mime;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub fn serialize<S>(media_type: &Mime, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(media_type.as_ref())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Mime, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Mime::from_str(&raw).map_err(D::Error::custom)
+    }
+}
 
 /// Conversation participant role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -41,7 +112,7 @@ pub enum Message {
             feature = "serde",
             serde(default, skip_serializing_if = "Vec::is_empty")
         )]
-        attachments: Vec<Url>,
+        attachments: Vec<Attachment>,
     },
     /// Assistant message with content and optional tool calls.
     Assistant {
@@ -91,9 +162,9 @@ impl Message {
         }
     }
 
-    /// Returns the attachment URLs (only for User messages).
+    /// Returns the typed attachments (only for User messages).
     #[must_use]
-    pub fn attachments(&self) -> &[Url] {
+    pub fn attachments(&self) -> &[Attachment] {
         match self {
             Self::User { attachments, .. } => attachments,
             _ => &[],
@@ -160,20 +231,20 @@ impl Message {
         }
     }
 
-    /// Adds an attachment URL to the message (only works for User messages).
+    /// Adds a typed attachment to the message (only works for User messages).
     #[must_use]
-    pub fn with_attachment(mut self, url: Url) -> Self {
+    pub fn with_attachment(mut self, attachment: Attachment) -> Self {
         if let Self::User { attachments, .. } = &mut self {
-            attachments.push(url);
+            attachments.push(attachment);
         }
         self
     }
 
-    /// Adds multiple attachment URLs to the message.
+    /// Adds multiple typed attachments to the message.
     #[must_use]
-    pub fn with_attachments(mut self, urls: impl IntoIterator<Item = Url>) -> Self {
+    pub fn with_attachments(mut self, values: impl IntoIterator<Item = Attachment>) -> Self {
         if let Self::User { attachments, .. } = &mut self {
-            attachments.extend(urls);
+            attachments.extend(values);
         }
         self
     }
@@ -238,26 +309,37 @@ mod tests {
 
     #[test]
     fn message_with_attachment() {
-        let url = "https://example.com".parse::<Url>().unwrap();
-        let message = Message::user("Hello").with_attachment(url.clone());
-        assert_eq!(message.attachments().len(), 1);
-        assert_eq!(message.attachments()[0], url);
+        let attachment = Attachment::new(
+            "https://example.com/image.png".parse::<Url>().unwrap(),
+            mime::IMAGE_PNG,
+        );
+        let message = Message::user("Hello").with_attachment(attachment.clone());
+        assert_eq!(message.attachments(), &[attachment]);
     }
 
     #[test]
     fn message_with_attachments() {
-        let urls = vec![
-            "https://example.com/a".parse::<Url>().unwrap(),
-            "https://example.com/b".parse::<Url>().unwrap(),
+        let attachments = vec![
+            Attachment::new(
+                "https://example.com/a.png".parse::<Url>().unwrap(),
+                mime::IMAGE_PNG,
+            ),
+            Attachment::new(
+                "https://example.com/b.pdf".parse::<Url>().unwrap(),
+                mime::APPLICATION_PDF,
+            ),
         ];
-        let message = Message::user("Hello").with_attachments(urls.clone());
-        assert_eq!(message.attachments(), urls.as_slice());
+        let message = Message::user("Hello").with_attachments(attachments.clone());
+        assert_eq!(message.attachments(), attachments.as_slice());
     }
 
     #[test]
     fn attachments_are_ignored_for_non_user_messages() {
-        let url = "https://example.com/a".parse::<Url>().unwrap();
-        let message = Message::assistant("Hello").with_attachment(url);
+        let attachment = Attachment::new(
+            "https://example.com/a.png".parse::<Url>().unwrap(),
+            mime::IMAGE_PNG,
+        );
+        let message = Message::assistant("Hello").with_attachment(attachment);
         assert!(message.attachments().is_empty());
     }
 

@@ -31,6 +31,9 @@ fn ensure_rustls_provider() {
 /// Default public SearXNG endpoint.
 pub const DEFAULT_SEARXNG_URL: &str = "https://serxng-deployment-production.up.railway.app";
 
+/// Engine enabled by the managed default endpoint for unauthenticated JSON search.
+pub const DEFAULT_SEARXNG_ENGINE: &str = "duckduckgo";
+
 /// SearXNG metasearch engine provider.
 ///
 /// A free, open-source metasearch engine that requires no API key.
@@ -43,7 +46,7 @@ pub struct SearXNG {
 
 impl Default for SearXNG {
     fn default() -> Self {
-        Self::new(DEFAULT_SEARXNG_URL)
+        Self::new(DEFAULT_SEARXNG_URL).with_engines(DEFAULT_SEARXNG_ENGINE)
     }
 }
 
@@ -155,7 +158,15 @@ fn urlencoded(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn default_uses_managed_json_search_engine() {
+        let provider = SearXNG::default();
+        assert_eq!(provider.base_url, DEFAULT_SEARXNG_URL);
+        assert_eq!(provider.engines.as_deref(), Some(DEFAULT_SEARXNG_ENGINE));
+    }
+
     #[tokio::test]
+    #[ignore = "Requires the live SearXNG instance and network access."]
     async fn search_returns_results() {
         let provider = SearXNG::default();
         let results = provider.search("rust programming language", 5).await;
@@ -170,6 +181,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires the live SearXNG instance and network access."]
     async fn search_unicode_query() {
         let provider = SearXNG::default();
         // Test with unicode characters (Japanese: "weather forecast")

@@ -117,25 +117,33 @@ struct TranscriptionResponse {
 fn handle_audio_result(result: Result<Vec<u8>, OpenAIError>, context: &'static str) -> Vec<u8> {
     match result {
         Ok(bytes) => bytes,
-        Err(err) => {
-            assert!(
-                !cfg!(debug_assertions),
-                "OpenAI audio {context} failed: {err}"
-            );
-            Vec::new()
-        }
+        Err(err) => handle_audio_error(&err, context),
     }
 }
 
 fn handle_transcription_result(result: Result<String, OpenAIError>) -> String {
     match result {
         Ok(text) => text,
-        Err(err) => {
-            assert!(
-                !cfg!(debug_assertions),
-                "OpenAI audio transcription failed: {err}"
-            );
-            String::new()
-        }
+        Err(err) => handle_transcription_error(&err),
     }
+}
+
+#[cfg(debug_assertions)]
+fn handle_audio_error(err: &OpenAIError, context: &'static str) -> Vec<u8> {
+    panic!("OpenAI audio {context} failed: {err}");
+}
+
+#[cfg(not(debug_assertions))]
+fn handle_audio_error(_err: &OpenAIError, _context: &'static str) -> Vec<u8> {
+    Vec::new()
+}
+
+#[cfg(debug_assertions)]
+fn handle_transcription_error(err: &OpenAIError) -> String {
+    panic!("OpenAI audio transcription failed: {err}");
+}
+
+#[cfg(not(debug_assertions))]
+fn handle_transcription_error(_err: &OpenAIError) -> String {
+    String::new()
 }

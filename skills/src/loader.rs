@@ -227,7 +227,6 @@ async fn path_exists_async(path: &Path) -> Result<bool, SkillError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_lite::future::block_on;
     use std::fs;
     use std::path::Path;
     use tempfile::{TempDir, tempdir};
@@ -254,8 +253,8 @@ mod tests {
         (dir, loader)
     }
 
-    #[test]
-    fn test_load_skill_from_dir() {
+    #[tokio::test]
+    async fn test_load_skill_from_dir() {
         let (dir, loader) = prepare_loader();
         create_skill_with_content(
             dir.path(),
@@ -263,14 +262,14 @@ mod tests {
             &minimal_skill_content("test-skill", "A test skill"),
         );
 
-        let skills = block_on(loader.load_all()).expect("load skill");
+        let skills = loader.load_all().await.expect("load skill");
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "test-skill");
     }
 
-    #[test]
-    fn test_load_skill_by_name() {
+    #[tokio::test]
+    async fn test_load_skill_by_name() {
         let (dir, loader) = prepare_loader();
         create_skill_with_content(
             dir.path(),
@@ -278,21 +277,21 @@ mod tests {
             &minimal_skill_content("my-skill", "My skill"),
         );
 
-        let skill = block_on(loader.load("my-skill")).expect("load skill by name");
+        let skill = loader.load("my-skill").await.expect("load skill by name");
 
         assert_eq!(skill.name, "my-skill");
     }
 
-    #[test]
-    fn test_load_skill_not_found() {
+    #[tokio::test]
+    async fn test_load_skill_not_found() {
         let (_dir, loader) = prepare_loader();
-        let result = block_on(loader.load("nonexistent"));
+        let result = loader.load("nonexistent").await;
 
         assert!(matches!(result, Err(SkillError::NotFound { .. })));
     }
 
-    #[test]
-    fn test_load_resources() {
+    #[tokio::test]
+    async fn test_load_resources() {
         let (dir, loader) = prepare_loader();
         let skill_dir = create_skill_with_content(
             dir.path(),
@@ -305,7 +304,10 @@ mod tests {
         fs::create_dir(&templates_dir).expect("create templates dir");
         fs::write(templates_dir.join("review.md"), "# Review Template").expect("write template");
 
-        let skill = block_on(loader.load("with-resources")).expect("load skill with resources");
+        let skill = loader
+            .load("with-resources")
+            .await
+            .expect("load skill with resources");
 
         assert_eq!(
             skill.resources.get("templates/review.md"),
@@ -313,26 +315,26 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_load_all_fails_on_missing_skill_file() {
+    #[tokio::test]
+    async fn test_load_all_fails_on_missing_skill_file() {
         let (dir, loader) = prepare_loader();
         create_skill_dir(dir.path(), "missing-markdown");
 
-        let result = block_on(loader.load_all());
+        let result = loader.load_all().await;
         assert!(matches!(result, Err(SkillError::InvalidStructure { .. })));
     }
 
-    #[test]
-    fn test_load_all_fails_on_malformed_frontmatter() {
+    #[tokio::test]
+    async fn test_load_all_fails_on_malformed_frontmatter() {
         let (dir, loader) = prepare_loader();
         create_skill_with_content(dir.path(), "broken", "name: broken");
 
-        let result = block_on(loader.load_all());
+        let result = loader.load_all().await;
         assert!(matches!(result, Err(SkillError::MissingFrontmatter)));
     }
 
-    #[test]
-    fn test_load_all_fails_fast_when_any_skill_is_invalid() {
+    #[tokio::test]
+    async fn test_load_all_fails_fast_when_any_skill_is_invalid() {
         let (dir, loader) = prepare_loader();
         create_skill_with_content(
             dir.path(),
@@ -341,7 +343,7 @@ mod tests {
         );
         create_skill_dir(dir.path(), "invalid-skill");
 
-        let result = block_on(loader.load_all());
+        let result = loader.load_all().await;
         assert!(matches!(result, Err(SkillError::InvalidStructure { .. })));
     }
 }

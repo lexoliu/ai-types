@@ -68,6 +68,9 @@ pub mod builtin;
 /// Background job registry for tracking tasks.
 pub mod job_registry;
 
+/// Declarative host-based network policy.
+pub mod network_policy;
+
 /// Permission handling for terminal modes.
 pub mod permission;
 
@@ -81,7 +84,12 @@ pub use container::{
     ContainerImageSpec, ContainerLaunchSpec, ContainerRuntimeKind, MountAccess, MountRoot,
     MountRootError, MountSpec, RuntimePreference,
 };
+/// Re-export of heel's rolling network audit log for terminal-tool configuration.
+pub use heel::NetworkAuditLog;
 pub use job_registry::{JobInfo, JobRegistry, JobStatus, TerminalDelta};
+pub use network_policy::{
+    CompiledNetworkPolicy, NetworkPolicyConfig, NetworkPolicyError, NetworkPolicyMode,
+};
 pub use output::{Content, MediaResolution, OutputEntry, OutputFormat, OutputStore, PendingUrl};
 pub use permission::{PermissionHandler, TerminalMode};
 pub use shell_session::{
@@ -97,6 +105,6 @@ pub use terminal::{
     BackgroundReason, BackgroundTaskReceiver, CompletedTask, Configured, PermissionEvent,
     PermissionEventReceiver, PermissionEventStage, TerminalArgs, TerminalError,
     TerminalExecutionMode, TerminalResult, TerminalTool, TerminalToolFactory,
-    TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured,
+    TerminalToolFactoryError, TerminalToolFactoryReceiver, Unconfigured, open_network_audit_log,
     terminal_tool_factory_channel,
 };

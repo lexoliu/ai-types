@@ -2,7 +2,6 @@ use crate::{Llama, LlamaError};
 use aither_core::llm::{
     LanguageModelProvider, model::Profile as ModelProfile, provider::Profile as ProviderProfile,
 };
-use async_fs;
 use futures_lite::StreamExt;
 use std::{future::Future, path::PathBuf, sync::Arc};
 
