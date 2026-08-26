@@ -178,7 +178,7 @@ mod tests {
             chunks.push(chunk.expect("mock never fails"));
         }
 
-        assert!(chunks.is_empty());
+        assert!(chunks.is_empty(), "expected no chunks, got {chunks:?}");
     }
 
     #[tokio::test]
@@ -239,7 +239,10 @@ mod tests {
             text_chunks.push(chunk.expect("mock never fails"));
         }
 
-        assert!(text_chunks.is_empty());
+        assert!(
+            text_chunks.is_empty(),
+            "expected no text chunks, got {text_chunks:?}"
+        );
     }
 
     #[test]
@@ -269,13 +272,21 @@ mod tests {
 
         // Test clear
         data.clear();
-        assert!(data.is_empty());
+        assert!(
+            data.is_empty(),
+            "expected no audio data, got {} bytes",
+            data.len()
+        );
     }
 
     #[test]
     fn data_creation() {
         let empty_data: Data = Vec::new();
-        assert!(empty_data.is_empty());
+        assert!(
+            empty_data.is_empty(),
+            "expected no audio data, got {} bytes",
+            empty_data.len()
+        );
 
         let filled_data: Data = vec![42; 100];
         assert_eq!(filled_data.len(), 100);
@@ -305,8 +316,11 @@ mod tests {
         }
 
         // Verify the workflow
-        assert!(!all_audio_data.is_empty());
-        assert!(!transcription_chunks.is_empty());
+        assert!(!all_audio_data.is_empty(), "expected audio data, got none");
+        assert!(
+            !transcription_chunks.is_empty(),
+            "expected transcription chunks, got none"
+        );
 
         let full_transcription: String = transcription_chunks.join("");
         assert_eq!(full_transcription, "This is a longer transcription");

@@ -89,15 +89,16 @@ pub struct Parameters {
     /// Repetition penalty to penalize repeated tokens.
     ///
     /// Values > 1.0 discourage repetition, values < 1.0 encourage it.
+    ///
+    /// Local inference only: this maps onto a llama.cpp sampler and none of the
+    /// hosted provider APIs accept it, so setting it has no effect on them.
     pub repetition_penalty: Option<f32>,
     /// Minimum probability for nucleus sampling.
     ///
     /// Alternative to `top_p` that sets a minimum threshold for token probabilities.
-    pub min_p: Option<f32>,
-    /// Top-a sampling parameter.
     ///
-    /// Adaptive sampling that adjusts the number of considered tokens.
-    pub top_a: Option<f32>,
+    /// Local inference only, like [`Self::repetition_penalty`].
+    pub min_p: Option<f32>,
     /// Random seed for reproducibility.
     ///
     /// Use the same seed to get deterministic outputs.
@@ -199,7 +200,6 @@ impl_with_methods! {
         presence_penalty: f32,
         repetition_penalty: f32,
         min_p: f32,
-        top_a: f32,
         seed: u32,
         max_tokens: u32,
         logit_bias: Vec<(String, f32)>,
@@ -1571,7 +1571,11 @@ mod tests {
         assert_eq!(profile.slug, "test-model");
         assert_eq!(profile.description, "A test model");
         assert_eq!(profile.context_length, 4096);
-        assert!(profile.abilities.is_empty());
+        assert!(
+            profile.abilities.is_empty(),
+            "expected no abilities, got {:?}",
+            profile.abilities
+        );
         assert!(profile.pricing.is_none());
     }
 

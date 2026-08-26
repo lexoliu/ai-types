@@ -381,7 +381,11 @@ mod tests {
             mime::IMAGE_PNG,
         );
         let message = Message::assistant("Hello").with_attachment(attachment);
-        assert!(message.attachments().is_empty());
+        assert!(
+            message.attachments().is_empty(),
+            "expected no attachments, got {:?}",
+            message.attachments()
+        );
     }
 
     #[test]
