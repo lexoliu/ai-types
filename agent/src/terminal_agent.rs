@@ -1040,8 +1040,7 @@ fn get_os_info() -> (String, String) {
                     .output()
                     .ok()
                     .and_then(|o| String::from_utf8(o.stdout).ok())
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
+                    .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string())
             });
         ("Linux".to_string(), version)
     }
@@ -1053,8 +1052,7 @@ fn get_os_info() -> (String, String) {
             .output()
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+            .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
         ("Windows".to_string(), version)
     }
 
