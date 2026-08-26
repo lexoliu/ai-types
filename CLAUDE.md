@@ -110,6 +110,18 @@ Subagent is useful when:
 - You want to isolate context for better focus
 - The task doesn't require interactive user input or feedback. For instance, research a topic or explore a codebase.
 
+## Commit and PR hygiene
+
+Commits and pull request bodies in this repository carry no attribution to the
+tool that wrote them. No `Claude-Session:` trailer, no `Co-Authored-By: Claude`,
+no "Generated with Claude Code" footer.
+
+This has to be stated here because it is not reachable by configuration:
+`includeCoAuthoredBy = false` suppresses the co-author trailer but neither the
+session trailer nor the PR footer, and an agent's own instructions may tell it to
+add them. A rule in this file is what governs work in this repository, so it is
+the only thing that holds across sessions.
+
 ## Bad Smells
 
 Avoid the following bad smells in code:
