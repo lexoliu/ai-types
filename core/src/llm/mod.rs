@@ -84,6 +84,8 @@ pub mod message;
 pub mod model;
 /// Provider module for managing language model providers and their configurations.
 pub mod provider;
+/// Provider-opaque reasoning state carried across turns.
+pub mod reasoning;
 /// Deep research workflows and agent capabilities.
 pub mod researcher;
 /// Tool system for function calling.
@@ -103,6 +105,7 @@ use futures_core::Stream;
 use futures_lite::{StreamExt, pin};
 pub use message::{Attachment, Message, Role};
 pub use provider::LanguageModelProvider;
+pub use reasoning::ReasoningState;
 pub use researcher::{
     ResearchCitation, ResearchEvent, ResearchFinding, ResearchOptions, ResearchReport,
     ResearchRequest, ResearchSource, ResearchStage, Researcher, ResearcherProfile,

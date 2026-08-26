@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
+use crate::PROVIDER_NAME;
 use crate::attachments::parse_openai_file_url;
 use crate::error::OpenAIError;
 #[allow(clippy::struct_excessive_bools)]
@@ -512,9 +513,26 @@ fn response_format(params: &ParameterSnapshot) -> Option<ResponseFormatPayload> 
         })
 }
 
+/// Maps the portable effort ladder onto `OpenAI`'s `reasoning_effort` vocabulary.
+///
+/// `OpenAI` accepts the whole ladder, though which levels a given model honours
+/// varies by model — the API rejects an unsupported one, which is the failure
+/// the caller should see rather than a silently substituted level.
+const fn openai_effort(effort: ReasoningEffort) -> &'static str {
+    match effort {
+        ReasoningEffort::None => "none",
+        ReasoningEffort::Minimal => "minimal",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "medium",
+        ReasoningEffort::High => "high",
+        ReasoningEffort::XHigh => "xhigh",
+        ReasoningEffort::Max => "max",
+    }
+}
+
 fn reasoning(params: &ParameterSnapshot) -> Option<ReasoningPayload> {
     params.reasoning_effort.map(|effort| ReasoningPayload {
-        effort: Some(effort.as_str()),
+        effort: Some(openai_effort(effort)),
         summary: None,
     })
 }
@@ -527,7 +545,7 @@ fn reasoning(params: &ParameterSnapshot) -> Option<ReasoningPayload> {
 /// a no-op.
 fn responses_reasoning(params: &ParameterSnapshot) -> Option<ReasoningPayload> {
     let summary = params.include_reasoning.then_some("auto");
-    let effort = params.reasoning_effort.map(ReasoningEffort::as_str);
+    let effort = params.reasoning_effort.map(openai_effort);
     if effort.is_none() && summary.is_none() {
         return None;
     }
@@ -578,6 +596,19 @@ pub enum ResponsesInputItem {
     Message {
         role: String,
         content: ResponsesMessageContent,
+    },
+    /// A reasoning item replayed verbatim from a previous response.
+    ///
+    /// `OpenAI`'s stateless flow requires the reasoning item to be appended back
+    /// into `input` alongside the function call it produced; without it the
+    /// model loses the reasoning behind the call it is being given a result for.
+    Reasoning {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<String>,
     },
     FunctionCall {
         #[serde(rename = "type")]
@@ -865,6 +896,46 @@ pub enum ResponsesToolChoice {
     },
 }
 
+/// Decodes reasoning this crate previously emitted back into input items.
+///
+/// The payload is this crate's own encoding of the response's `reasoning`
+/// output item. State from another provider, and state that no longer parses,
+/// is dropped rather than replayed into an API that cannot verify it.
+fn replayed_reasoning_items(message: &Message) -> Vec<ResponsesInputItem> {
+    #[derive(serde::Deserialize)]
+    struct Replayed {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        encrypted_content: Option<String>,
+    }
+
+    message
+        .reasoning()
+        .iter()
+        .filter_map(|state| {
+            let payload = state.payload_for(PROVIDER_NAME).or_else(|| {
+                tracing::debug!(
+                    provider = state.provider(),
+                    "dropping reasoning state from another provider"
+                );
+                None
+            })?;
+            match serde_json::from_str::<Replayed>(payload) {
+                Ok(replayed) => Some(ResponsesInputItem::Reasoning {
+                    kind: "reasoning",
+                    id: replayed.id,
+                    encrypted_content: replayed.encrypted_content,
+                }),
+                Err(error) => {
+                    tracing::debug!(%error, "dropping unparsable OpenAI reasoning state");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 pub fn to_responses_input(messages: &[Message]) -> Result<Vec<ResponsesInputItem>, OpenAIError> {
     let mut items = Vec::new();
 
@@ -908,7 +979,10 @@ pub fn to_responses_input(messages: &[Message]) -> Result<Vec<ResponsesInputItem
                         ResponsesMessageContent::Text(flatten_content(message)),
                     ));
                 } else {
-                    // Assistant message with function calls
+                    // Assistant message with function calls.
+                    // Reasoning leads, because it precedes the calls it
+                    // produced in the response it came from.
+                    items.extend(replayed_reasoning_items(message));
                     // First add text content if present
                     if !message.content().is_empty() {
                         items.push(ResponsesInputItem::message(
@@ -961,7 +1035,9 @@ fn validate_responses_input(items: &[ResponsesInputItem]) -> Result<(), OpenAIEr
                     )));
                 }
             }
-            ResponsesInputItem::Message { .. } => {}
+            // Reasoning items carry no call_id to validate; they are replayed
+            // verbatim or not at all.
+            ResponsesInputItem::Message { .. } | ResponsesInputItem::Reasoning { .. } => {}
         }
     }
     Ok(())
@@ -1181,7 +1257,7 @@ mod tests {
         OpenAICodeInterpreterTool, OpenAIFileSearchTool, OpenAIImageGenerationTool, OpenAIMcpTool,
         OpenAINativeTools, OpenAIPromptCacheRetention, OpenAIWebSearchTool, Parameters, ToolChoice,
     };
-    use aither_core::llm::{Attachment, Message, ToolCall};
+    use aither_core::llm::{Attachment, Message, ReasoningState, ToolCall};
 
     #[tokio::test]
     async fn chat_serializes_typed_image_and_audio_parts() {
@@ -1390,6 +1466,46 @@ mod tests {
         let value = serde_json::to_value(payload).expect("serialize reasoning");
         assert_eq!(value["effort"], "high");
         assert_eq!(value.get("summary"), None);
+    }
+
+    /// The round trip OAI-2 was missing: encrypted reasoning must return to
+    /// `input`, ahead of the function call it produced.
+    #[test]
+    fn reasoning_state_round_trips_ahead_of_its_function_call() {
+        let state = ReasoningState::new(
+            PROVIDER_NAME,
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "cipher",
+            })
+            .to_string(),
+        );
+        let message = Message::assistant_with_reasoning(
+            "",
+            vec![ToolCall::new("call_1", "lookup", serde_json::json!({}))],
+            vec![state],
+        );
+        let items = to_responses_input(&[message]).expect("build responses input");
+        let value = serde_json::to_value(&items).expect("serialize input");
+
+        assert_eq!(value[0]["type"], "reasoning");
+        assert_eq!(value[0]["id"], "rs_1");
+        assert_eq!(value[0]["encrypted_content"], "cipher");
+        assert_eq!(value[1]["type"], "function_call");
+    }
+
+    #[test]
+    fn foreign_reasoning_state_is_dropped() {
+        let message = Message::assistant_with_reasoning(
+            "",
+            Vec::new(),
+            vec![ReasoningState::new(
+                "anthropic",
+                serde_json::json!({"type": "thinking", "signature": "sig"}).to_string(),
+            )],
+        );
+        assert!(replayed_reasoning_items(&message).is_empty());
     }
 
     #[test]

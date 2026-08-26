@@ -1,3 +1,4 @@
+use crate::PROVIDER_NAME;
 use crate::{
     DEEPSEEK_BASE_URL, DEFAULT_AUDIO_FORMAT, DEFAULT_AUDIO_MODEL, DEFAULT_AUDIO_VOICE,
     DEFAULT_BASE_URL, DEFAULT_EMBEDDING_DIM, DEFAULT_EMBEDDING_MODEL, DEFAULT_IMAGE_MODEL,
@@ -16,7 +17,7 @@ use crate::{
 use aither_core::{
     LanguageModel,
     llm::{
-        Event, LLMRequest, ToolCall, Usage,
+        Event, LLMRequest, ReasoningState, ToolCall, Usage,
         model::{Ability, Profile as ModelProfile, ToolChoice},
         oneshot,
     },
@@ -789,6 +790,7 @@ fn chat_completions_stream_inner(
                     id,
                     name,
                     arguments,
+                    reasoning_state: None,
                 }));
             }
         }
@@ -906,6 +908,7 @@ fn mark_and_emit_done_function_call(
         id: resolved_call_id,
         name,
         arguments: parse_tool_call_arguments(arguments),
+        reasoning_state: None,
     }
 }
 
@@ -926,6 +929,7 @@ fn drain_pending_function_calls(
                 id: call_id,
                 name,
                 arguments: parse_tool_call_arguments(&acc.arguments),
+                reasoning_state: None,
             })
         })
         .collect()
@@ -1193,6 +1197,23 @@ fn responses_stream_inner(
                                             &arguments,
                                         );
                                         yield Ok(Event::ToolCall(tool_call));
+                                    } else if let ResponsesOutputItem::Reasoning {
+                                        id, encrypted_content, ..
+                                    } = item
+                                    {
+                                        // Only encrypted reasoning is replayable;
+                                        // a summary alone cannot be verified.
+                                        if let Some(encrypted) = encrypted_content {
+                                            let payload = serde_json::json!({
+                                                "type": "reasoning",
+                                                "id": id,
+                                                "encrypted_content": encrypted,
+                                            });
+                                            yield Ok(Event::ReasoningState(ReasoningState::new(
+                                                PROVIDER_NAME,
+                                                payload.to_string(),
+                                            )));
+                                        }
                                     }
                                 }
                                 ResponsesStreamEvent::ResponseCompleted { response } => {

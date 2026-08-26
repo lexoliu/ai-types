@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 
 use aither_core::{
     LanguageModel,
-    llm::{Attachment, Event, LLMRequest, Message, ToolCall, model::Profile as ModelProfile},
+    llm::{
+        Attachment, Event, LLMRequest, Message, ReasoningState, ToolCall,
+        model::Profile as ModelProfile,
+    },
 };
 #[cfg(feature = "skills")]
 use aither_skills::Skill;
@@ -63,6 +66,11 @@ enum ExecutionSignal<T> {
 struct ModelTurn {
     response_text: String,
     tool_calls: Vec<ToolCall>,
+    /// Opaque provider reasoning produced this turn, in the order it arrived.
+    ///
+    /// Replayed on the next request: providers that verify their own reasoning
+    /// reject a turn whose blocks were reordered or partially dropped.
+    reasoning: Vec<ReasoningState>,
     malformed_function_call: bool,
 }
 
@@ -111,7 +119,7 @@ type ToolExecutionResult = Result<(String, String, aither_core::llm::ToolResult)
 type ToolExecutionSignal = ExecutionSignal<ToolExecutionResult>;
 
 macro_rules! drain_model_stream {
-    ($stream:expr, $hooks:expr, $cache_stats:expr, $events:expr, $text_chunks:expr, $tool_calls:expr, $malformed:expr) => {{
+    ($stream:expr, $hooks:expr, $cache_stats:expr, $events:expr, $text_chunks:expr, $tool_calls:expr, $reasoning:expr, $malformed:expr) => {{
         let stream = $stream;
         futures_lite::pin!(stream);
         while let Some(event) = stream.next().await {
@@ -121,6 +129,7 @@ macro_rules! drain_model_stream {
                 event.map_err(|error| error.to_string()),
                 $text_chunks,
                 $tool_calls,
+                $reasoning,
             )
             .await?
             {
@@ -141,6 +150,7 @@ async fn handle_model_event<H: Hook>(
     event: Result<Event, String>,
     text_chunks: &mut Vec<String>,
     tool_calls: &mut Vec<ToolCall>,
+    reasoning: &mut Vec<ReasoningState>,
 ) -> Result<ModelEventAction, AgentError> {
     match event {
         Ok(Event::Text(text)) => {
@@ -162,6 +172,12 @@ async fn handle_model_event<H: Hook>(
         })),
         Ok(Event::ToolCall(call)) => {
             tool_calls.push(call);
+            Ok(ModelEventAction::Continue)
+        }
+        // State, unlike Reasoning, is not for the reader: it is collected so
+        // the next request can hand it back to the provider.
+        Ok(Event::ReasoningState(state)) => {
+            reasoning.push(state);
             Ok(ModelEventAction::Continue)
         }
         Ok(Event::BuiltInToolResult { tool, result }) => {
@@ -505,6 +521,8 @@ enum TurnStep {
 struct Turn {
     text_chunks: Vec<String>,
     tool_calls: Vec<aither_core::llm::ToolCall>,
+    /// Opaque provider reasoning, kept in arrival order for replay.
+    reasoning: Vec<ReasoningState>,
     /// The model emitted a tool call the provider could not parse.
     malformed_function_call: bool,
     /// The provider failed outright.
@@ -538,6 +556,12 @@ impl Turn {
             Event::Reasoning(r) => TurnStep::Emit(AgentEvent::Reasoning(r)),
             Event::ToolCall(call) => {
                 self.tool_calls.push(call);
+                TurnStep::Continue
+            }
+            // Collected rather than emitted: this is for the next request, not
+            // for the reader.
+            Event::ReasoningState(state) => {
+                self.reasoning.push(state);
                 TurnStep::Continue
             }
             // Built-in results are the provider's own tools reporting back, so
@@ -624,6 +648,7 @@ where
     ) -> Result<ModelTurn, AgentError> {
         let mut text_chunks = Vec::new();
         let mut tool_calls = Vec::new();
+        let mut reasoning = Vec::new();
         let mut malformed_function_call = false;
 
         match self.tier {
@@ -635,6 +660,7 @@ where
                     events,
                     &mut text_chunks,
                     &mut tool_calls,
+                    &mut reasoning,
                     malformed_function_call
                 );
             }
@@ -646,6 +672,7 @@ where
                     events,
                     &mut text_chunks,
                     &mut tool_calls,
+                    &mut reasoning,
                     malformed_function_call
                 );
             }
@@ -657,6 +684,7 @@ where
                     events,
                     &mut text_chunks,
                     &mut tool_calls,
+                    &mut reasoning,
                     malformed_function_call
                 );
             }
@@ -665,6 +693,7 @@ where
         Ok(ModelTurn {
             response_text: text_chunks.join(""),
             tool_calls,
+            reasoning,
             malformed_function_call,
         })
     }
@@ -759,9 +788,12 @@ where
             return self.finish_no_tool_turn(response_text, turn, events).await;
         }
 
-        self.context.push(Message::assistant_with_tool_calls(
+        // The reasoning has to travel with the turn that produced these calls,
+        // or the model receives their results without the thinking behind them.
+        self.context.push(Message::assistant_with_reasoning(
             &response_text,
             tool_calls.clone(),
+            model_turn.reasoning,
         ));
         let old_todo_items = self
             .todo_list
