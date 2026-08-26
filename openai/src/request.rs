@@ -746,14 +746,6 @@ pub struct ResponsesRequest {
     #[serde(rename = "max_output_tokens")]
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    presence_penalty: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    frequency_penalty: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    logit_bias: Option<HashMap<String, f32>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    seed: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     top_logprobs: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ResponsesTool>>,
@@ -790,10 +782,6 @@ impl ResponsesRequest {
             temperature: params.temperature,
             top_p: params.top_p,
             max_output_tokens: params.max_tokens,
-            presence_penalty: params.presence_penalty,
-            frequency_penalty: params.frequency_penalty,
-            logit_bias: params.logit_bias.clone(),
-            seed: params.seed,
             top_logprobs: params.top_logprobs,
             tools,
             tool_choice,
@@ -1429,6 +1417,50 @@ mod tests {
             false,
         );
         serde_json::to_value(&req).expect("serialize responses request")
+    }
+
+    /// The Responses API is not Chat Completions. These five are Chat-only —
+    /// verified against `ResponseCreateParamsBase` in the `openai-python` SDK,
+    /// which is generated from OpenAI's own spec and lists none of them.
+    /// Sending them is at best ignored and at worst a 400.
+    #[test]
+    fn responses_request_sends_no_chat_only_sampling_params() {
+        let params = Parameters::default()
+            .presence_penalty(0.5)
+            .frequency_penalty(0.5)
+            .seed(42)
+            .logit_bias(vec![("tok".to_string(), 1.0)])
+            .stop(vec!["END".to_string()]);
+        let value = responses_request_with_tool(&params);
+        for field in [
+            "presence_penalty",
+            "frequency_penalty",
+            "logit_bias",
+            "seed",
+            "stop",
+        ] {
+            assert_eq!(
+                value.get(field),
+                None,
+                "{field} is not a Responses API parameter"
+            );
+        }
+    }
+
+    /// The control for the test above: the same knobs must still reach Chat
+    /// Completions, where they are real.
+    #[test]
+    fn chat_request_still_sends_those_sampling_params() {
+        let params = Parameters::default()
+            .presence_penalty(0.5)
+            .frequency_penalty(0.25)
+            .seed(42)
+            .stop(vec!["END".to_string()]);
+        let value = chat_request_with_tool(&params);
+        assert_eq!(value["presence_penalty"], 0.5);
+        assert_eq!(value["frequency_penalty"], 0.25);
+        assert_eq!(value["seed"], 42);
+        assert_eq!(value["stop"][0], "END");
     }
 
     #[test]
