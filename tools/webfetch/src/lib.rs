@@ -578,8 +578,10 @@ fn html_to_result_with_metadata(
 ) -> Result<FetchResult> {
     let parsed_url = url::Url::parse(url).map_err(|e| anyhow!("Invalid URL: {e}"))?;
 
-    let mut cursor = Cursor::new(html.as_bytes());
-    let extracted = readability::extractor::extract(&mut cursor, &parsed_url)
+    let mut readability = dom_smoothie::Readability::new(html, Some(parsed_url.as_str()), None)
+        .map_err(|e| anyhow!("Content extraction failed: {e}"))?;
+    let extracted = readability
+        .parse()
         .map_err(|e| anyhow!("Content extraction failed: {e}"))?;
 
     let content = htmd::convert(&extracted.content).map_err(|e| anyhow!("{e}"))?;
@@ -600,7 +602,7 @@ fn html_to_result_with_metadata(
 
     Ok(FetchResult {
         url: url.to_string(),
-        title: Some(extracted.title),
+        title: Some(extracted.title.to_string()),
         content: final_content,
         content_type,
         markdown_tokens: None,
