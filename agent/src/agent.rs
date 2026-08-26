@@ -4,6 +4,7 @@
 //! It manages conversation memory, applies context compression, and
 //! handles tool execution in an agent-controlled loop.
 
+use num_traits::ToPrimitive as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -495,9 +496,6 @@ pub struct Agent<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> {
     pub(crate) active_allowed_tools: Option<HashSet<String>>,
 }
 
-/// A finished tool call: its id, the tool's name, and either its output or the
-/// error text it failed with.
-
 impl<LLM: LanguageModel + Clone> Agent<LLM, LLM, LLM, ()> {
     /// Creates a new agent with default configuration.
     ///
@@ -901,9 +899,7 @@ where
         for result in results {
             let (call_id, call_name, tool_result) = result?;
             let is_terminal_call = call_name == "terminal";
-            if !known_tools.iter().any(|name| *name == call_name)
-                && !unknown_tools.contains(&call_name)
-            {
+            if !known_tools.contains(&call_name) && !unknown_tools.contains(&call_name) {
                 unknown_tools.push(call_name.clone());
             }
             if let Some(transcript) = &self.transcript {
@@ -1848,7 +1844,6 @@ where
                 // the window to leave the danger zone; a marginal saving is
                 // not worth the cache invalidation on top of a compaction
                 // that would follow anyway.
-                use num_traits::ToPrimitive as _;
                 let window = self.effective_context_window();
                 let savings_tokens = self.context.estimate_reassembly_savings() / 4;
                 let savings_fraction =
@@ -2255,14 +2250,14 @@ mod tests {
             futures_lite::stream::empty()
         }
 
-        async fn profile(&self) -> ModelProfile {
-            ModelProfile::new(
+        fn profile(&self) -> impl std::future::Future<Output = ModelProfile> + Send {
+            std::future::ready(ModelProfile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "mock model",
                 self.context_length,
-            )
+            ))
         }
     }
 

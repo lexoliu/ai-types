@@ -191,6 +191,12 @@ where
     /// Registers an eager (always-loaded) tool.
     ///
     /// Eager tools are included in every LLM request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
     pub fn tool<T: Tool + 'static>(mut self, tool: T) -> Self {
         self.tools
             .register(tool)
@@ -404,6 +410,12 @@ where
     ///     .terminal(terminal_tool)
     ///     .build();
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
     pub fn terminal<P, E, State>(
         mut self,
         terminal_tool: aither_sandbox::TerminalTool<P, E, State>,
@@ -446,6 +458,12 @@ where
     ///     .todo()
     ///     .build();
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
     pub fn todo(mut self) -> Self {
         let list = TodoList::new();
         let tool = TodoTool::with_list(list.clone());
@@ -460,6 +478,12 @@ where
     ///
     /// Use this when you want to share a todo list between multiple agents
     /// or access the list externally.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
     pub fn todo_with_list(mut self, list: TodoList) -> Self {
         let tool = TodoTool::with_list(list.clone());
         self.tools
@@ -541,14 +565,16 @@ mod tests {
             futures_lite::stream::empty()
         }
 
-        async fn profile(&self) -> aither_core::llm::model::Profile {
-            aither_core::llm::model::Profile::new(
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = aither_core::llm::model::Profile> + Send {
+            std::future::ready(aither_core::llm::model::Profile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "A mock model for testing",
                 100_000,
-            )
+            ))
         }
     }
 
@@ -567,8 +593,11 @@ mod tests {
         type Arguments = MockArgs;
         type Res = aither_core::llm::ToolResult;
 
-        async fn call(&self, _args: Self::Arguments) -> aither_core::Result<Self::Res> {
-            Ok(aither_core::llm::ToolResult::text("ok"))
+        fn call(
+            &self,
+            _args: Self::Arguments,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(aither_core::llm::ToolResult::text("ok")))
         }
     }
 

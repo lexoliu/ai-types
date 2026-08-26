@@ -509,8 +509,8 @@ mod tests {
             stream::iter([Ok(Event::Text(self.name.to_string()))])
         }
 
-        async fn profile(&self) -> Profile {
-            Profile::new("dummy", self.name, "test", "dummy", 0)
+        fn profile(&self) -> impl std::future::Future<Output = Profile> + Send {
+            std::future::ready(Profile::new("dummy", self.name, "test", "dummy", 0))
         }
     }
 

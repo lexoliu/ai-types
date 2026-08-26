@@ -112,8 +112,12 @@ impl InteractivePermissionHandler {
 }
 
 impl PermissionHandler for InteractivePermissionHandler {
-    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
-        match mode {
+    fn check(
+        &self,
+        mode: TerminalMode,
+        script: &str,
+    ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
+        std::future::ready(match mode {
             TerminalMode::Sandboxed => Ok(true), // Always allow
             TerminalMode::Unsafe => {
                 // Display script and ask for permission (show full script, no truncation)
@@ -134,10 +138,29 @@ impl PermissionHandler for InteractivePermissionHandler {
                     Err(PermissionError::Denied("user declined".to_string()))
                 }
             }
-        }
+        })
     }
 
-    async fn check_domain(&self, domain: &str, _port: u16) -> bool {
+    fn check_domain(
+        &self,
+        domain: &str,
+        _port: u16,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        std::future::ready(self.prompt_for_domain(domain))
+    }
+
+    fn will_wait_for_approval(
+        &self,
+        _mode: TerminalMode,
+        _script: &str,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        std::future::ready(true)
+    }
+}
+
+impl InteractivePermissionHandler {
+    /// Prompts once per new domain, remembering the answer.
+    fn prompt_for_domain(&self, domain: &str) -> bool {
         // Check default whitelist
         if DEFAULT_DOMAIN_WHITELIST.contains(&domain) {
             return true;

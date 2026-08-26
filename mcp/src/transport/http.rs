@@ -3,6 +3,7 @@
 //! This transport uses HTTP POST for sending requests to the server,
 //! with support for MCP session management via `Mcp-Session-Id` header.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use tracing::debug;
@@ -163,14 +164,18 @@ impl Transport for HttpTransport {
                 .map_err(|e| McpError::Transport(format!("HTTP notify failed: {e}")))?;
         }
 
-        // Notifications may return empty body, so we ignore parse errors
-        let _ = builder.json_body(&notif).map(|b| async { b.await });
+        // A notification expects no response, but the request still has to be
+        // driven: building the future and dropping it sent nothing at all.
+        // The body is discarded, errors included.
+        if let Ok(request) = builder.json_body(&notif) {
+            let _ = request.await;
+        }
 
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
+    fn close(&mut self) -> impl Future<Output = Result<()>> + Send {
         self.closed = true;
-        Ok(())
+        std::future::ready(Ok(()))
     }
 }
