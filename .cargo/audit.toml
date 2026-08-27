@@ -1,0 +1,22 @@
+# cargo-audit configuration.
+#
+# Kept at the tool level rather than as an input to the CI action, so a local
+# `cargo audit` and the CI job reach the same verdict. An exception that only
+# exists in a workflow file is one a developer cannot reproduce.
+
+[advisories]
+ignore = [
+    # `paste` is unmaintained (the author archived it), not vulnerable. It
+    # reaches us four levels down through LanceDB
+    # (paste <- lance-bitpacking <- lance <- lance-namespace-impls <- lancedb)
+    # so we cannot swap it: `pastey` is the maintained fork, but it is a
+    # different crate name, which `[patch]` cannot substitute — lance-bitpacking
+    # has to adopt it upstream. Its latest release, 10.0.0, still declares
+    # `paste ^1`, and lancedb 0.37.1 is already the newest version, so there is
+    # no upgrade that avoids it either.
+    #
+    # Ignoring it is a judgement that an archived proc-macro this small carries
+    # no meaningful risk, not that the advisory is wrong. Revisit if LanceDB
+    # moves to `pastey`, at which point this line should be deleted.
+    "RUSTSEC-2024-0436",
+]
