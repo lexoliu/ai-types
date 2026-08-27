@@ -1,15 +1,18 @@
 name: CI
 
 on:
-  # Branch pushes and pull requests would otherwise run the whole suite twice
-  # for every branch that has a PR open. Push covers the trunk; pull_request
-  # covers everything else.
   push:
     branches: [main, dev]
   pull_request:
 
+# A branch that has a PR open fires both triggers, so the suite would run
+# twice on the same tree. `github.ref` cannot collapse them -- it reads
+# `refs/heads/dev` for the push and `refs/pull/N/merge` for the pull request.
+# The head branch names both events identically (`head_ref` is set only on
+# pull requests, `ref_name` is the branch on a push), so keying on it also
+# keeps the usual behaviour of cancelling a run its own successor supersedes.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 env:
