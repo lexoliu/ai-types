@@ -31,6 +31,13 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # audit-check reports through a check run, which the default read-only
+    # token cannot create: without this the audit itself passes and the step
+    # then fails on "Resource not accessible by integration", which reads like
+    # a vulnerability was found when none was.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2
