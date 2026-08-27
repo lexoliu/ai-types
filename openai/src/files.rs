@@ -220,7 +220,7 @@ pub async fn upload_bytes(
         .map_err(OpenAIError::from_http)?
         .header(
             header::AUTHORIZATION.as_str(),
-            &format!("Bearer {}", cfg.api_key),
+            format!("Bearer {}", cfg.api_key),
         )
         .map_err(OpenAIError::from_http)?;
 
@@ -283,7 +283,7 @@ pub async fn delete_file(
         .map_err(OpenAIError::from_http)?
         .header(
             header::AUTHORIZATION.as_str(),
-            &format!("Bearer {}", cfg.api_key),
+            format!("Bearer {}", cfg.api_key),
         )
         .map_err(OpenAIError::from_http)?;
 
@@ -314,7 +314,7 @@ pub async fn get_file(cfg: &FilesConfig, file_id: &str) -> Result<OpenAIFile, Op
         .map_err(OpenAIError::from_http)?
         .header(
             header::AUTHORIZATION.as_str(),
-            &format!("Bearer {}", cfg.api_key),
+            format!("Bearer {}", cfg.api_key),
         )
         .map_err(OpenAIError::from_http)?;
 
@@ -352,7 +352,7 @@ pub async fn list_files(
         .map_err(OpenAIError::from_http)?
         .header(
             header::AUTHORIZATION.as_str(),
-            &format!("Bearer {}", cfg.api_key),
+            format!("Bearer {}", cfg.api_key),
         )
         .map_err(OpenAIError::from_http)?;
 
