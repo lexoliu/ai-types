@@ -56,14 +56,16 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # `magika` links ONNX Runtime, so it is opt-in: running bash in a sandbox
 # should not require an ML runtime to be present at link time.
 magika = { version = "1.1", optional = true }
-tree-sitter = "0.22.6"
-rs-tree-sitter-languages = "0.0.2"
+# Both are only referenced under `code-folding`, and building them means
+# compiling 22 tree-sitter grammars from C, so they follow the feature too.
+tree-sitter = { version = "0.22.6", optional = true }
+rs-tree-sitter-languages = { version = "0.0.2", optional = true }
 
 [features]
 default = []
 # Detect source code in command output so it can be folded with tree-sitter.
 # Pulls in ONNX Runtime via `magika`.
-code-folding = ["dep:magika"]
+code-folding = ["dep:magika", "dep:tree-sitter", "dep:rs-tree-sitter-languages"]
 
 [dev-dependencies]
 magika = { version = "1", features = ["_test"] }
