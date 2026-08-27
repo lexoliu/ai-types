@@ -3435,6 +3435,10 @@ mod tests {
         );
     }
 
+    // These four drive a real sandbox running `/bin/pwd`. `heel` reports
+    // `UnsupportedPlatform` off Unix, and the binary they run does not exist
+    // there either, so there is nothing for them to exercise on Windows.
+    #[cfg(unix)]
     #[tokio::test]
     async fn sandboxed_command_output_executes_pwd() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -3460,6 +3464,7 @@ mod tests {
         assert_eq!(output.status.code(), Some(0));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn sandboxed_terminal_executes_pwd() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -3510,6 +3515,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn failed_command_returns_json_with_nonzero_exit_code() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
@@ -3560,6 +3566,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn background_terminal_accepts_terminal_input() {
         let dir = tempfile::tempdir().expect("temp dir should be created");
