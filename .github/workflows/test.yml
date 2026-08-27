@@ -2,6 +2,20 @@ name: Test
 
 on:
   workflow_call:
+    inputs:
+      flags:
+        description: Cargo flags selecting packages and features to test.
+        required: true
+        type: string
+      os:
+        description: JSON array of runners to test on.
+        required: true
+        type: string
+      free-disk:
+        description: Reclaim runner disk before building. Ubuntu only.
+        required: false
+        default: false
+        type: boolean
 
 env:
   CARGO_TERM_COLOR: always
@@ -10,17 +24,29 @@ jobs:
   test:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
-      fail-fast: true
+      # One platform failing must not hide the others: a sandbox that behaves
+      # differently on Linux than on macOS is exactly what this matrix is for,
+      # and cancelling the rest throws that signal away.
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(inputs.os) }}
     steps:
       - uses: actions/checkout@v4
+      - name: Reclaim runner disk
+        if: ${{ inputs.free-disk && runner.os == 'Linux' }}
+        run: |
+          # A hosted runner has ~14 GB free, and this workspace needs more than
+          # that once lancedb, ONNX Runtime and llama.cpp are in the graph.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test-${{ matrix.os }}
+          shared-key: test-${{ matrix.os }}-${{ inputs.flags }}
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - run: cargo test --verbose --all-features
+      - run: cargo test ${{ inputs.flags }}
