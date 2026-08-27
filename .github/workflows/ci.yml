@@ -118,6 +118,7 @@ jobs:
         --exclude aither-llama --exclude aither-ort
         --exclude aither-rag --exclude aither-search
         --no-default-features --features derive,serde,agent,mcp,skills
+      cache-key: portable
       os: '["ubuntu-latest", "windows-latest", "macos-latest"]'
 
   test-full:
@@ -125,6 +126,7 @@ jobs:
     uses: ./.github/workflows/test.yml
     with:
       flags: --workspace --all-features
+      cache-key: full
       os: '["ubuntu-latest"]'
       free-disk: true
 

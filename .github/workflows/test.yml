@@ -7,6 +7,12 @@ on:
         description: Cargo flags selecting packages and features to test.
         required: true
         type: string
+      cache-key:
+        description: >-
+          Short label distinguishing this run's cache. Kept separate from
+          `flags` because a GitHub cache key may not contain commas or spaces.
+        required: true
+        type: string
       os:
         description: JSON array of runners to test on.
         required: true
@@ -45,7 +51,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test-${{ matrix.os }}-${{ inputs.flags }}
+          shared-key: test-${{ matrix.os }}-${{ inputs.cache-key }}
       - uses: arduino/setup-protoc@v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
