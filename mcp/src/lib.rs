@@ -101,7 +101,7 @@
 //! tools.register(AnotherTool::new());
 //!
 //! // Create and run the MCP server over stdio
-//! let mut server = McpServer::stdio(tools, "my-server", "1.0.0")?;
+//! let mut server = McpServer::stdio(tools, "my-server", "1.0.0");
 //! server.run().await?;
 //! ```
 //!

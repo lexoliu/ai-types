@@ -21,7 +21,7 @@ use crate::transport::{BidirectionalTransport, StdioTransport};
 /// let mut tools = Tools::new();
 /// tools.register(my_tool);
 ///
-/// let mut server = McpServer::stdio(tools, "my-server", "1.0.0")?;
+/// let mut server = McpServer::stdio(tools, "my-server", "1.0.0");
 /// server.run().await?;
 /// ```
 pub struct McpServer<T: BidirectionalTransport> {
@@ -52,17 +52,9 @@ impl McpServer<StdioTransport> {
     /// * `tools` - The aither tools to expose.
     /// * `name` - The server name.
     /// * `version` - The server version.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if stdio cannot be initialized.
-    pub fn stdio(
-        tools: Tools,
-        name: impl Into<String>,
-        version: impl Into<String>,
-    ) -> Result<Self, McpError> {
-        let transport = StdioTransport::new().map_err(|e| McpError::Transport(e.to_string()))?;
-        Ok(Self::new(transport, tools, name, version))
+    #[must_use]
+    pub fn stdio(tools: Tools, name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self::new(StdioTransport::new(), tools, name, version)
     }
 }
 

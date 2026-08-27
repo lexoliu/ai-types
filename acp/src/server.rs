@@ -26,7 +26,7 @@ use crate::session::AcpSession;
 /// ```ignore
 /// use aither_acp::AcpServer;
 ///
-/// let mut server = AcpServer::stdio("my-agent", "1.0.0")?;
+/// let mut server = AcpServer::stdio("my-agent", "1.0.0");
 /// server.run(|config| async {
 ///     // Create agent for this session
 ///     let agent = Agent::builder(llm)
@@ -75,22 +75,13 @@ impl<LLM: LanguageModel> AcpServer<StdioTransport, LLM> {
     /// * `version` - The agent version.
     /// * `make_agent` - Builds the agent backing each new session, given the
     ///   session's working directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if stdio cannot be initialized.
-    pub fn stdio<F, Fut>(
-        name: impl Into<String>,
-        version: impl Into<String>,
-        make_agent: F,
-    ) -> Result<Self>
+    pub fn stdio<F, Fut>(name: impl Into<String>, version: impl Into<String>, make_agent: F) -> Self
     where
         F: Fn(PathBuf) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Agent<LLM, LLM, LLM>>> + Send + 'static,
     {
-        let transport = StdioTransport::new().map_err(|e| AcpError::Transport(e.to_string()))?;
-        Ok(Self {
-            transport,
+        Self {
+            transport: StdioTransport::new(),
             info: Implementation {
                 name: name.into(),
                 title: None,
@@ -99,7 +90,7 @@ impl<LLM: LanguageModel> AcpServer<StdioTransport, LLM> {
             sessions: HashMap::new(),
             initialized: false,
             make_agent: Box::new(move |cwd| Box::pin(make_agent(cwd))),
-        })
+        }
     }
 }
 

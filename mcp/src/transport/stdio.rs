@@ -6,7 +6,7 @@
 use std::future::Future;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use async_io::Async;
+use blocking::Unblock;
 use futures_lite::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
 
@@ -21,10 +21,10 @@ use crate::protocol::{
 /// used when running as a subprocess where the parent process communicates
 /// via pipes.
 pub struct StdioTransport {
-    /// Async stdin reader.
-    stdin: BufReader<Async<std::io::Stdin>>,
-    /// Async stdout writer.
-    stdout: Async<std::io::Stdout>,
+    /// Stdin, read on a blocking thread and surfaced as an async reader.
+    stdin: BufReader<Unblock<std::io::Stdin>>,
+    /// Stdout, written on a blocking thread.
+    stdout: Unblock<std::io::Stdout>,
     /// Next request ID.
     next_id: AtomicI64,
     /// Whether the transport is closed.
@@ -42,19 +42,20 @@ impl std::fmt::Debug for StdioTransport {
 impl StdioTransport {
     /// Create a new stdio transport.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if stdin/stdout cannot be made async.
-    pub fn new() -> std::io::Result<Self> {
-        let stdin = Async::new(std::io::stdin())?;
-        let stdout = Async::new(std::io::stdout())?;
-
-        Ok(Self {
-            stdin: BufReader::new(stdin),
-            stdout,
+    /// Standard input and output are driven on blocking threads rather than by
+    /// the reactor. Readiness polling cannot carry them: on Windows the
+    /// reactor reaches its readiness model through AFD, which works only on
+    /// sockets, so a console handle or a pipe cannot be registered at all.
+    /// Completion-based I/O does not help either -- this is why tokio also
+    /// backs its own stdin with a blocking pool.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            stdin: BufReader::new(Unblock::new(std::io::stdin())),
+            stdout: Unblock::new(std::io::stdout()),
             next_id: AtomicI64::new(1),
             closed: false,
-        })
+        }
     }
 
     /// Generate the next request ID.
@@ -76,6 +77,12 @@ impl StdioTransport {
     /// Read a message from stdin.
     async fn read_message(&mut self) -> Result<Option<JsonRpcMessage>> {
         read_message(&mut self.stdin).await
+    }
+}
+
+impl Default for StdioTransport {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

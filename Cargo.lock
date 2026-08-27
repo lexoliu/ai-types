@@ -325,9 +325,9 @@ version = "0.2.0"
 dependencies = [
  "aither-core",
  "aither-sandbox",
- "async-io",
  "async-lock",
  "async-process",
+ "blocking",
  "futures-lite",
  "serde",
  "serde_json",

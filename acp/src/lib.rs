@@ -24,7 +24,7 @@
 //! use aither_acp::AcpServer;
 //!
 //! // Create and run the ACP server over stdio
-//! let mut server = AcpServer::stdio("my-agent", "1.0.0")?;
+//! let mut server = AcpServer::stdio("my-agent", "1.0.0");
 //! server.run().await?;
 //! ```
 //!

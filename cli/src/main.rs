@@ -438,7 +438,7 @@ async fn run_acp_server(cloud: CloudProvider) -> Result<()> {
     let mut server = AcpServer::stdio("aither", env!("CARGO_PKG_VERSION"), move |cwd| {
         let cloud = cloud.clone();
         async move { acp_session_agent(cloud, cwd).await }
-    })?;
+    });
     server.run().await?;
     Ok(())
 }

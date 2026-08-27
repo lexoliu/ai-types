@@ -271,7 +271,7 @@ impl McpConnection {
     ///
     /// Returns an error if stdio cannot be initialized.
     pub async fn stdio() -> Result<Self, McpError> {
-        let transport = StdioTransport::new().map_err(|e| McpError::Transport(e.to_string()))?;
+        let transport = StdioTransport::new();
         let mut client = McpClient::connect(transport).await?;
         let tools = client.list_tools().await?;
         let server_name = client.server_info().map(|i| i.name.clone());
