@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["mistral"]
+
 members = [
     "attachments",
     "claude",
@@ -17,8 +17,10 @@ members = [
     "mem0",
     "skills",
     "models",
+    "tools/browser",
     "tools/websearch",
     "tools/webfetch",
+    "tools/search",
     "tools/fs",
     "tools/command",
     "mcp",
@@ -28,80 +30,84 @@ members = [
 ]
 
 [workspace.package]
+version = "0.2.0"
 edition = "2024"
 authors = ["Lexo Liu <me@lexo.cool>"]
 license = "MIT"
 repository = "https://github.com/lexoliu/aither"
-rust-version = "1.87"
+rust-version = "1.88"
 
 [workspace.lints]
 rust.missing_docs = "warn"
 rust.missing_debug_implementations = "warn"
-clippy.all = "warn"
-clippy.style = "warn"
-clippy.correctness = "warn"
-clippy.complexity = "warn"
-clippy.suspicious = "warn"
-clippy.perf = "warn"
-clippy.pedantic = "warn"
-clippy.nursery = "warn"
-clippy.cargo = "warn"
+clippy.all = { level = "warn", priority = -1 }
+clippy.style = { level = "warn", priority = -1 }
+clippy.correctness = { level = "warn", priority = -1 }
+clippy.complexity = { level = "warn", priority = -1 }
+clippy.suspicious = { level = "warn", priority = -1 }
+clippy.perf = { level = "warn", priority = -1 }
+clippy.pedantic = { level = "warn", priority = -1 }
+clippy.nursery = { level = "warn", priority = -1 }
+clippy.cargo = { level = "warn", priority = -1 }
+clippy.disallowed_methods = "deny"
 clippy.multiple_crate_versions = { level = "allow", priority = 1}
 
 [workspace.dependencies]
-tracing = "0.1.41"
-aither-core = { path = "./core"}
-aither-derive = { path = "./derive", version = "0.1.0"}
-aither-ort = { path = "./ort" }
-zenwave = { path = "../zenwave" }
-aither-skills = { path = "./skills" }
-aither-attachments = { path = "./attachments" }
-aither-websearch = { path = "./tools/websearch" }
-aither-webfetch = { path = "./tools/webfetch" }
-aither-fs = { path = "./tools/fs" }
-aither-command = { path = "./tools/command" }
-aither-mcp = { path = "./mcp" }
-aither-acp = { path = "./acp" }
-aither-sandbox = { path = "./sandbox" }
-aither-agent = { path = "./agent" }
-aither-openai = { path = "./openai" }
-aither-claude = { path = "./claude" }
-aither-cloud = { path = "./cloud" }
-aither-gemini = { path = "./gemini" }
-# aither-mistral = { path = "./mistral" }  # excluded: transitive dep conflicts
-aither-llama = { path = "./llama" }
-aither-copilot = { path = "./copilot" }
-aither-models = { path = "./models" }
+tracing = "0.1.44"
+zenwave = "0.5"
+aither-core = { path = "./core", version = "0.2.0" }
+aither-derive = { path = "./derive", version = "0.2.0" }
+aither-ort = { path = "./ort", version = "0.2.0" }
+aither-skills = { path = "./skills", version = "0.2.0" }
+aither-attachments = { path = "./attachments", version = "0.2.0" }
+aither-browser = { path = "./tools/browser", version = "0.2.0" }
+aither-websearch = { path = "./tools/websearch", version = "0.2.0" }
+aither-webfetch = { path = "./tools/webfetch", version = "0.2.0" }
+aither-search = { path = "./tools/search", version = "0.2.0" }
+aither-fs = { path = "./tools/fs", version = "0.2.0" }
+aither-command = { path = "./tools/command", version = "0.2.0" }
+aither-mcp = { path = "./mcp", version = "0.2.0" }
+aither-acp = { path = "./acp", version = "0.2.0" }
+aither-sandbox = { path = "./sandbox", version = "0.2.0" }
+aither-agent = { path = "./agent", version = "0.2.0" }
+aither-openai = { path = "./openai", version = "0.2.0" }
+aither-claude = { path = "./claude", version = "0.2.0" }
+aither-cloud = { path = "./cloud", version = "0.2.0" }
+aither-gemini = { path = "./gemini", version = "0.2.0" }
+aither-llama = { path = "./llama", version = "0.2.0" }
+aither-copilot = { path = "./copilot", version = "0.2.0" }
+aither-models = { path = "./models", version = "0.2.0" }
+aither-rag = { path = "./rag", version = "0.2.0" }
+aither-mem0 = { path = "./mem0", version = "0.2.0" }
 
 [dependencies]
 aither-core.workspace = true
 aither-derive = { workspace = true, optional = true}
 anyhow = { version = "1.0", default-features = false }
-futures-core = { version = "0.3.31", default-features = false}
 futures-lite = { version = "2.6"}
-pin-project-lite = "0.2.16"
-schemars = { version = "1.0", default-features = false}
+schemars = { version = "1.2", default-features = false}
 serde = { version = "1.0", default-features = false}
 serde_json = { version = "1.0", default-features = false }
 url = { version = "2.5", default-features = false }
 
 # Provider integrations
-aither-openai = { path = "./openai", optional = true }
-aither-claude = { path = "./claude", optional = true }
-aither-gemini = { path = "./gemini", optional = true }
-# aither-mistral = { path = "./mistral", optional = true }  # excluded: transitive dep conflicts
-aither-llama = { path = "./llama", optional = true }
+aither-openai = { workspace = true, optional = true }
+aither-claude = { workspace = true, optional = true }
+aither-gemini = { workspace = true, optional = true }
+aither-llama = { workspace = true, optional = true }
 aither-ort = { workspace = true, optional = true }
 
 # High-level features
-aither-agent = { path = "./agent", optional = true }
-aither-rag = { path = "./rag", optional = true }
-aither-mem0 = { path = "./mem0", optional = true }
+aither-agent = { workspace = true, optional = true }
+aither-rag = { workspace = true, optional = true }
+aither-mem0 = { workspace = true, optional = true }
 aither-skills = { workspace = true, optional = true }
 
 # Tools
+aither-browser = { workspace = true, optional = true }
 aither-websearch = { workspace = true, optional = true }
 aither-webfetch = { workspace = true, optional = true }
+aither-search = { workspace = true, optional = true }
 aither-fs = { workspace = true, optional = true }
 aither-command = { workspace = true, optional = true }
 
@@ -110,22 +116,22 @@ aither-mcp = { workspace = true, optional = true }
 
 
 [dev-dependencies]
-aither-openai = { path = "./openai" }
-aither-gemini = { path = "./gemini" }
-aither-mem0 = { path = "./mem0" }
-aither-webfetch = { path = "./tools/webfetch" }
+aither-openai.workspace = true
+aither-gemini.workspace = true
+aither-mem0.workspace = true
+aither-webfetch.workspace = true
+aither-rag.workspace = true
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-aither-rag = { path = "./rag" }
-tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1.53", features = ["macros", "rt", "rt-multi-thread"] }
 tokio-test = "0.4"
-schemars = { version = "1.0" }
+schemars = { version = "1.2" }
 serde = { version = "1.0", features = ["derive"] }
 futures-lite = { version = "2.6"}
-crossterm = "0.28"
+crossterm = "0.29"
 
 [package]
 name = "aither"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -141,6 +147,11 @@ exclude = [
     ".gitignore",
     "target/",
 ]
+
+[package.metadata.cargo-machete]
+# The `serde` feature below turns on `url/serde` for the whole dependency graph,
+# so `url` is load-bearing here even though no code in this crate names it.
+ignored = ["url"]
 
 [badges]
 maintenance = { status = "actively-developed" }
@@ -158,7 +169,6 @@ derive = ["aither-derive"]
 openai = ["aither-openai"]
 claude = ["aither-claude"]
 gemini = ["aither-gemini"]
-# mistral = ["aither-mistral"]  # excluded: transitive dep conflicts
 llama = ["aither-llama"]
 ort = ["aither-ort"]
 
@@ -169,8 +179,10 @@ mem0 = ["aither-mem0"]
 skills = ["aither-skills"]
 
 # Tools
+browser = ["aither-browser"]
 websearch = ["aither-websearch"]
 webfetch = ["aither-webfetch"]
+search = ["aither-search"]
 fs = ["aither-fs"]
 command = ["aither-command"]
 
@@ -181,7 +193,7 @@ mcp = ["aither-mcp"]
 all-providers = ["openai", "claude", "gemini", "llama", "ort"]
 
 # Convenience feature to enable all tools
-all-tools = ["websearch", "webfetch", "fs", "command"]
+all-tools = ["browser", "websearch", "webfetch", "search", "fs", "command"]
 
 # Convenience feature to enable everything
 full = ["all-providers", "all-tools", "agent", "rag", "mem0", "skills", "mcp"]

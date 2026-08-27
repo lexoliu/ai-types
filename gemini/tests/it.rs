@@ -21,6 +21,7 @@ fn api_key() -> String {
 }
 
 #[tokio::test]
+#[ignore = "Requires external Gemini API quota and network access."]
 async fn test_provider_list_models() {
     let provider = GeminiProvider::new(api_key());
     let models = provider.list_models().await.expect("Failed to list models");
@@ -93,7 +94,7 @@ async fn test_audio_cycle() {
 
     let mut audio_data = Vec::new();
     while let Some(chunk) = stream.next().await {
-        audio_data.extend_from_slice(&chunk);
+        audio_data.extend_from_slice(&chunk.expect("audio generation should succeed"));
     }
     assert!(!audio_data.is_empty(), "Should generate audio data");
 
@@ -103,7 +104,7 @@ async fn test_audio_cycle() {
 
     let mut transcribed_text = String::new();
     while let Some(chunk) = stream.next().await {
-        transcribed_text.push_str(&chunk);
+        transcribed_text.push_str(&chunk.expect("transcription should succeed"));
     }
 
     println!("Original: {text}");

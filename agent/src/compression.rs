@@ -1,8 +1,17 @@
 //! Smart context compression for managing conversation history.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 use aither_core::{LanguageModel, llm::Message};
+use num_traits::ToPrimitive;
+
+const CONTENT_WITH_URLS_PLACEHOLDER: &str = "{content_with_urls}";
+const COMMANDS_PLACEHOLDER: &str = "{commands}";
+const DIALOGUE_PLACEHOLDER: &str = "{dialogue}";
+const ERRORS_PLACEHOLDER: &str = "{errors}";
+const FILE_PATHS_PLACEHOLDER: &str = "{file_paths}";
+const RUNNING_JOBS_PLACEHOLDER: &str = "{running_jobs}";
 
 /// Strategy for managing conversation context.
 #[derive(Debug, Clone)]
@@ -52,6 +61,9 @@ impl Default for SmartCompressionConfig {
 }
 
 /// Configuration for what content to preserve during compression.
+// Each flag is an independent, orthogonal preservation choice; grouping them
+// into an enum would not describe the domain any better.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct PreserveConfig {
     /// Keep file paths verbatim.
@@ -60,10 +72,6 @@ pub struct PreserveConfig {
     pub errors: bool,
     /// Keep shell commands verbatim.
     pub commands: bool,
-    /// Keep code snippets verbatim (if false, summarize instead).
-    pub code_snippets: bool,
-    /// Keep tool results verbatim (if false, compress).
-    pub tool_results: bool,
 }
 
 impl Default for PreserveConfig {
@@ -72,8 +80,6 @@ impl Default for PreserveConfig {
             file_paths: true,
             errors: true,
             commands: true,
-            code_snippets: false,
-            tool_results: false,
         }
     }
 }
@@ -114,7 +120,9 @@ pub const fn estimate_tokens(content: &str) -> usize {
 #[must_use]
 pub fn estimate_context_usage(messages: &[Message], context_window: usize) -> f32 {
     let message_tokens: usize = messages.iter().map(|m| estimate_tokens(m.content())).sum();
-    message_tokens as f32 / context_window as f32
+    let message_tokens = message_tokens.to_f32().unwrap_or(f32::MAX);
+    let context_window = context_window.to_f32().unwrap_or(f32::MAX);
+    message_tokens / context_window
 }
 
 // Prompt templates loaded from files
@@ -196,25 +204,22 @@ impl SmartCompressionConfig {
             }
 
             // Track file reads that may be superseded
-            if content.contains("read_file") || content.contains("Read") {
-                if let Some(path) = extract_single_path(content) {
-                    if let Some(&later_idx) = file_versions.get(&path) {
-                        if later_idx > idx {
-                            stale.insert(idx);
-                        }
-                    }
-                }
+            if (content.contains("read_file") || content.contains("Read"))
+                && let Some(path) = extract_single_path(content)
+                && let Some(&later_idx) = file_versions.get(&path)
+                && later_idx > idx
+            {
+                stale.insert(idx);
             }
 
             // Track file modifications
-            if content.contains("write_file")
+            if (content.contains("write_file")
                 || content.contains("edit_file")
                 || content.contains("Write")
-                || content.contains("Edit")
+                || content.contains("Edit"))
+                && let Some(path) = extract_single_path(content)
             {
-                if let Some(path) = extract_single_path(content) {
-                    file_versions.insert(path, idx);
-                }
+                file_versions.insert(path, idx);
             }
         }
 
@@ -239,12 +244,15 @@ impl SmartCompressionConfig {
                 format!("- Running background jobs:\n{jobs}")
             });
 
+        // The braces below are template placeholders for `str::replace`, not
+        // format arguments.
+        #[allow(clippy::literal_string_with_formatting_args)]
         let prompt = COMPRESSION_USER_TEMPLATE
-            .replace("{file_paths}", &preserved.file_paths.join(", "))
-            .replace("{errors}", &preserved.errors.join("\n"))
-            .replace("{commands}", &preserved.commands.join("\n"))
-            .replace("{running_jobs}", &running_jobs)
-            .replace("{dialogue}", &format_messages(messages));
+            .replace(FILE_PATHS_PLACEHOLDER, &preserved.file_paths.join(", "))
+            .replace(ERRORS_PLACEHOLDER, &preserved.errors.join("\n"))
+            .replace(COMMANDS_PLACEHOLDER, &preserved.commands.join("\n"))
+            .replace(RUNNING_JOBS_PLACEHOLDER, &running_jobs)
+            .replace(DIALOGUE_PLACEHOLDER, &format_messages(messages));
 
         let request = aither_core::llm::oneshot(COMPRESSION_SYSTEM_PROMPT, prompt);
         let stream = llm.respond(request);
@@ -288,12 +296,15 @@ impl SmartCompressionConfig {
                 format!("- Running background jobs:\n{jobs}")
             });
 
+        // The braces below are template placeholders for `str::replace`, not
+        // format arguments.
+        #[allow(clippy::literal_string_with_formatting_args)]
         let prompt = COMPRESSION_URLS_TEMPLATE
-            .replace("{content_with_urls}", &content_with_urls)
-            .replace("{file_paths}", &preserved.file_paths.join(", "))
-            .replace("{errors}", &preserved.errors.join("\n"))
-            .replace("{commands}", &preserved.commands.join("\n"))
-            .replace("{running_jobs}", &running_jobs);
+            .replace(CONTENT_WITH_URLS_PLACEHOLDER, &content_with_urls)
+            .replace(FILE_PATHS_PLACEHOLDER, &preserved.file_paths.join(", "))
+            .replace(ERRORS_PLACEHOLDER, &preserved.errors.join("\n"))
+            .replace(COMMANDS_PLACEHOLDER, &preserved.commands.join("\n"))
+            .replace(RUNNING_JOBS_PLACEHOLDER, &running_jobs);
 
         let request = aither_core::llm::oneshot(COMPRESSION_SYSTEM_PROMPT, prompt);
         let stream = llm.respond(request);
@@ -381,8 +392,8 @@ fn extract_commands(content: &str) -> Vec<String> {
 
         // Common command prefixes
         let cmd_prefixes = [
-            "cargo ", "npm ", "git ", "docker ", "make ", "rustc ", "python ", "node ", "go ",
-            "cd ", "ls ", "cat ", "mkdir ", "rm ", "mv ", "cp ",
+            "cargo ", "bun ", "bunx ", "npm ", "git ", "docker ", "make ", "rustc ", "python ",
+            "node ", "go ", "cd ", "ls ", "cat ", "mkdir ", "rm ", "mv ", "cp ",
         ];
         if cmd_prefixes.iter().any(|p| trimmed.starts_with(p)) {
             commands.push(trimmed.to_string());
@@ -429,10 +440,10 @@ fn format_content_with_urls(messages: &[Message], pending_urls: &[ContentWithUrl
 
         if let Some(url_info) = url {
             // Format with URL header
-            output.push_str(&format!("### [URL: {}]\n{}\n\n", url_info.url, content));
+            let _ = writeln!(output, "### [URL: {}]\n{}\n", url_info.url, content);
         } else {
             // Format without URL (inline content)
-            output.push_str(&format!("### [Inline - {:?}]\n{}\n\n", msg.role(), content));
+            let _ = writeln!(output, "### [Inline - {:?}]\n{}\n", msg.role(), content);
         }
     }
 

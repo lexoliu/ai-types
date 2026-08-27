@@ -45,6 +45,11 @@ pub struct Llama {
 
 impl Llama {
     /// Load a GGUF model from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot start or the model cannot be
+    /// loaded from `model_path`.
     pub fn from_file(model_path: impl AsRef<Path>) -> Result<Self, LlamaError> {
         Self::builder(model_path).build()
     }
@@ -111,7 +116,8 @@ impl LanguageModel for Llama {
 
 impl EmbeddingModel for Llama {
     fn dim(&self) -> usize {
-        self.model.n_embd() as usize
+        usize::try_from(self.model.n_embd())
+            .expect("llama embedding dimension must be non-negative")
     }
 
     fn embed(
@@ -147,7 +153,8 @@ impl EmbeddingModel for Llama {
                 return Ok(embedding.to_vec());
             }
 
-            let last_index = (tokens.len() - 1) as i32;
+            let last_index = i32::try_from(tokens.len() - 1)
+                .map_err(|_| LlamaError::Unsupported("token sequence is too long".to_string()))?;
             let embedding = context
                 .embeddings_ith(last_index)
                 .map_err(|err| LlamaError::Decode(err.to_string()))?;
@@ -235,6 +242,11 @@ impl Builder {
     }
 
     /// Build the local llama provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot start or the model file cannot be
+    /// loaded.
     pub fn build(self) -> Result<Llama, LlamaError> {
         let model_params = LlamaModelParams::default()
             .with_n_gpu_layers(self.n_gpu_layers)
@@ -272,8 +284,13 @@ fn response_stream(
     match thread::Builder::new()
         .name("aither-llama-respond".to_string())
         .spawn(move || {
-            if let Err(err) = run_response_generation(model, backend, cfg, request, &worker_sender)
-            {
+            if let Err(err) = run_response_generation(
+                model.as_ref(),
+                backend.as_ref(),
+                cfg.as_ref(),
+                request,
+                &worker_sender,
+            ) {
                 let _ = worker_sender.send_blocking(Err(err));
             }
         }) {
@@ -289,9 +306,9 @@ fn response_stream(
 }
 
 fn run_response_generation(
-    model: Arc<LlamaModel>,
-    backend: Arc<LlamaBackend>,
-    cfg: Arc<LlamaConfig>,
+    model: &LlamaModel,
+    backend: &LlamaBackend,
+    cfg: &LlamaConfig,
     request: LLMRequest,
     sender: &async_channel::Sender<Result<Event, LlamaError>>,
 ) -> Result<(), LlamaError> {
@@ -304,16 +321,10 @@ fn run_response_generation(
     }
 
     let tool_defs = filter_tool_definitions(tool_defs, &parameters.tool_choice);
-    let template = resolve_chat_template(model.as_ref(), cfg.as_ref())?;
-    let prompt = build_prompt(
-        model.as_ref(),
-        &template,
-        &messages,
-        &parameters,
-        &tool_defs,
-    )?;
+    let template = resolve_chat_template(model, cfg)?;
+    let prompt = build_prompt(model, &template, &messages, &parameters, &tool_defs)?;
 
-    let mut context = create_context(model.as_ref(), backend.as_ref(), cfg.as_ref(), false)?;
+    let mut context = create_context(model, backend, cfg, false)?;
     let prompt_tokens = model
         .str_to_token(&prompt.template_result.prompt, AddBos::Never)
         .map_err(|err| LlamaError::Token(err.to_string()))?;
@@ -337,10 +348,11 @@ fn run_response_generation(
 
     let mut generated = String::new();
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut pos = prompt_tokens.len() as i32;
+    let start_pos = i32::try_from(prompt_tokens.len())
+        .map_err(|_| LlamaError::Unsupported("prompt is too long".to_string()))?;
     let max_tokens = parameters.max_tokens.unwrap_or(512);
 
-    for _ in 0..max_tokens {
+    for pos in (start_pos..).take(usize::try_from(max_tokens).unwrap_or(usize::MAX)) {
         let token = sampler.sample(&context, -1);
         sampler.accept(token);
 
@@ -365,7 +377,6 @@ fn run_response_generation(
         context
             .decode(&mut step_batch)
             .map_err(|err| LlamaError::Decode(err.to_string()))?;
-        pos += 1;
     }
 
     if let Ok(parsed) = prompt
@@ -412,12 +423,11 @@ fn resolve_chat_template(
     if let Some(template) = &cfg.chat_template {
         return LlamaChatTemplate::new(template).map_err(|err| LlamaError::Model(err.to_string()));
     }
-    match model.chat_template(None) {
-        Ok(template) => Ok(template),
-        Err(_) => {
-            LlamaChatTemplate::new("chatml").map_err(|err| LlamaError::Model(err.to_string()))
-        }
-    }
+    // Fall back to ChatML when the model carries no template of its own.
+    model.chat_template(None).map_or_else(
+        |_| LlamaChatTemplate::new("chatml").map_err(|err| LlamaError::Model(err.to_string())),
+        Ok,
+    )
 }
 
 struct Prompt {
@@ -574,7 +584,7 @@ fn build_sampler(parameters: &Parameters) -> LlamaSampler {
     }
 
     if let Some(top_k) = parameters.top_k {
-        samplers.push(LlamaSampler::top_k(top_k as i32));
+        samplers.push(LlamaSampler::top_k(top_k.cast_signed()));
     }
     if let Some(top_p) = parameters.top_p {
         samplers.push(LlamaSampler::top_p(top_p, 1));
@@ -603,9 +613,11 @@ fn sampling_seed(seed: Option<u32>) -> u32 {
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos() as u64)
-        .unwrap_or(1);
-    ((now ^ (now >> 32)) & 0xFFFF_FFFF) as u32
+        .map_or(1, |value| {
+            u64::try_from(value.as_nanos()).unwrap_or(u64::MAX)
+        });
+    let mixed = now ^ (now >> 32);
+    u32::try_from(mixed & u64::from(u32::MAX)).expect("masked seed fits in u32")
 }
 
 fn parse_openai_message(json_text: &str) -> Result<Vec<ToolCall>, LlamaError> {
@@ -643,11 +655,13 @@ fn parse_openai_message(json_text: &str) -> Result<Vec<ToolCall>, LlamaError> {
         let arguments = function
             .get("arguments")
             .and_then(Value::as_str)
-            .map(|raw| {
-                serde_json::from_str::<Value>(raw)
-                    .unwrap_or_else(|_| Value::String(raw.to_string()))
-            })
-            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            .map_or_else(
+                || Value::Object(serde_json::Map::new()),
+                |raw| {
+                    serde_json::from_str::<Value>(raw)
+                        .unwrap_or_else(|_| Value::String(raw.to_string()))
+                },
+            );
 
         calls.push(ToolCall::new(id, name, arguments));
     }

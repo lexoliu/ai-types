@@ -2,7 +2,9 @@
 //!
 //! All registered tools are always loaded into the LLM context.
 
-use aither_core::llm::tool::{Tool, ToolDefinition, ToolOutput, Tools as CoreTools};
+use aither_core::llm::tool::{
+    IntoToolResult, RegisterError, Tool, ToolDefinition, ToolResult, Tools as CoreTools,
+};
 #[cfg(feature = "mcp")]
 use aither_mcp::{McpConnection, McpToolService};
 
@@ -46,28 +48,46 @@ impl AgentTools {
     }
 
     /// Registers an eager (always-loaded) tool.
-    pub fn register<T: Tool + 'static>(&mut self, tool: T) {
-        self.eager.register(tool);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegisterError`] if the name collides with a tool that is
+    /// already registered, or the tool has no description for the model to
+    /// read.
+    pub fn register<T: Tool + 'static>(&mut self, tool: T) -> Result<(), RegisterError> {
+        self.eager.register(tool)
     }
 
-    /// Registers a dynamic bash tool (type-erased).
+    /// Registers a dynamic terminal tool (type-erased).
     ///
-    /// This is used for child bash tools in subagents where the concrete type
+    /// This is used for child terminal tools in subagents where the concrete type
     /// is not known at compile time.
-    pub fn register_dyn_bash(&mut self, dyn_tool: aither_sandbox::DynBashTool) {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
+    pub fn register_dyn_terminal(&mut self, dyn_tool: aither_sandbox::DynTerminalTool) {
         use futures_core::Future;
         use std::pin::Pin;
 
-        let handler = dyn_tool.handler;
-        self.eager
-            .register_dyn(dyn_tool.definition, move |args: &str| -> Pin<Box<dyn Future<Output = aither_core::Result<ToolOutput>> + Send>> {
+        for entry in dyn_tool.into_entries() {
+            let handler = entry.handler;
+            self.eager.register_dyn(
+                entry.definition,
+                move |args: &str| -> Pin<
+                    Box<dyn Future<Output = aither_core::Result<ToolResult>> + Send>,
+                > {
                 let handler = handler.clone();
                 let args = args.to_string();
                 Box::pin(async move {
-                    let result = handler(&args).await;
-                    Ok(ToolOutput::text(result))
+                    handler(&args).await.into_tool_result()
                 })
-            });
+                },
+            )
+            .expect("dynamic terminal tool registration must succeed: duplicate name or missing description");
+        }
     }
 
     /// Returns definitions of all registered tools.
@@ -101,7 +121,7 @@ impl AgentTools {
     /// # Errors
     ///
     /// Returns an error if the tool is not found or execution fails.
-    pub async fn call(&self, name: &str, args: &str) -> aither_core::Result<ToolOutput> {
+    pub async fn call(&self, name: &str, args: &str) -> aither_core::Result<ToolResult> {
         if self.eager.definitions().iter().any(|d| d.name() == name) {
             return self.eager.call(name, args).await;
         }
@@ -130,7 +150,7 @@ impl AgentTools {
                 return if result.is_error {
                     Err(anyhow::anyhow!("{output}"))
                 } else {
-                    Ok(ToolOutput::text(output))
+                    output.into_tool_result()
                 };
             }
         }
@@ -193,6 +213,7 @@ mod tests {
         name: String,
     }
 
+    /// Arguments for the dummy test tool.
     #[derive(Debug, JsonSchema, Deserialize)]
     struct DummyArgs {}
 
@@ -203,17 +224,24 @@ mod tests {
 
         type Arguments = DummyArgs;
 
-        async fn call(&self, _args: Self::Arguments) -> aither_core::Result<ToolOutput> {
-            Ok(ToolOutput::text("ok"))
+        type Res = ToolResult;
+
+        fn call(
+            &self,
+            _args: Self::Arguments,
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(ToolResult::text("ok")))
         }
     }
 
     #[test]
     fn test_register_eager() {
         let mut tools = AgentTools::new();
-        tools.register(DummyTool {
-            name: "test".to_string(),
-        });
+        tools
+            .register(DummyTool {
+                name: "test".to_string(),
+            })
+            .expect("dummy tool should register");
 
         assert_eq!(tools.definitions().len(), 1);
     }

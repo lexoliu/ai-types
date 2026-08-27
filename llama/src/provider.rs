@@ -2,6 +2,7 @@ use crate::{Llama, LlamaError};
 use aither_core::llm::{
     LanguageModelProvider, model::Profile as ModelProfile, provider::Profile as ProviderProfile,
 };
+use futures_lite::StreamExt;
 use std::{future::Future, path::PathBuf, sync::Arc};
 
 /// Provider for local llama.cpp GGUF models from disk.
@@ -29,10 +30,11 @@ impl LanguageModelProvider for LlamaProvider {
         let cfg = self.inner.clone();
         async move {
             let mut profiles = Vec::new();
-            let entries = std::fs::read_dir(&cfg.models_dir)
+            let mut entries = async_fs::read_dir(&cfg.models_dir)
+                .await
                 .map_err(|err| LlamaError::Model(err.to_string()))?;
 
-            for entry in entries {
+            while let Some(entry) = entries.next().await {
                 let entry = entry.map_err(|err| LlamaError::Model(err.to_string()))?;
                 let path = entry.path();
                 let Some(ext) = path.extension().and_then(|s| s.to_str()) else {

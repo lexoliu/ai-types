@@ -16,7 +16,7 @@ use crate::protocol::{
 /// Transport that spawns and communicates with a child process.
 ///
 /// This is typically used to connect to MCP servers that run as separate processes,
-/// such as npm packages or standalone binaries.
+/// such as JavaScript packages launched through Bun or standalone binaries.
 pub struct ChildProcessTransport {
     /// Child process handle.
     child: Child,
@@ -113,8 +113,7 @@ impl ChildProcessTransport {
     }
 
     /// Write a message to the child's stdin.
-    async fn write_message(&mut self, msg: &impl serde::Serialize) -> Result<()> {
-        let json = serde_json::to_string(msg)?;
+    async fn write_message(&mut self, json: String) -> Result<()> {
         debug!("MCP TX: {}", json);
 
         self.stdin.write_all(json.as_bytes()).await?;
@@ -154,7 +153,7 @@ impl Transport for ChildProcessTransport {
         req.id = id.clone();
 
         // Send request
-        self.write_message(&req).await?;
+        self.write_message(serde_json::to_string(&req)?).await?;
 
         // Read response
         loop {
@@ -162,10 +161,7 @@ impl Transport for ChildProcessTransport {
                 Some(JsonRpcMessage::Response(response)) if response.id == id => {
                     return Ok(response);
                 }
-                Some(_) => {
-                    // Skip non-matching messages
-                    continue;
-                }
+                Some(_) => {}
                 None => {
                     return Err(McpError::ConnectionClosed);
                 }
@@ -177,7 +173,7 @@ impl Transport for ChildProcessTransport {
         if self.closed {
             return Err(McpError::ConnectionClosed);
         }
-        self.write_message(&notif).await
+        self.write_message(serde_json::to_string(&notif)?).await
     }
 
     async fn close(&mut self) -> Result<()> {

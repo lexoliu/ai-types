@@ -1,7 +1,7 @@
 //! Tool trait implementation for RAG.
 
 use aither_core::embedding::EmbeddingModel;
-use aither_core::llm::tool::{Tool, ToolOutput};
+use aither_core::llm::tool::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::borrow::Cow;
@@ -45,8 +45,9 @@ where
     }
 
     type Arguments = RagToolArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
         let results = self
             .store()
             .search_with_k(&arguments.query, arguments.top_k)
@@ -62,7 +63,7 @@ where
             })
             .collect();
 
-        ToolOutput::json(&response)
+        ToolResult::json(&response)
     }
 }
 
@@ -95,13 +96,17 @@ mod tests {
             self.dimension
         }
 
-        async fn embed(&self, text: &str) -> aither_core::Result<Vec<f32>> {
+        fn embed(
+            &self,
+            text: &str,
+        ) -> impl std::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {
-                *value = ((text.len() + idx) % 10) as f32 / 10.0;
+                let digit = u8::try_from((text.len() + idx) % 10).expect("modulo result fits u8");
+                *value = f32::from(digit) / 10.0;
             }
-            Ok(vec)
+            std::future::ready(Ok(vec))
         }
     }
 
@@ -127,6 +132,6 @@ mod tests {
         };
 
         let result = rag.call(args).await.unwrap();
-        assert!(result.as_str().unwrap().contains("Rust"));
+        assert!(result.render_for_model().unwrap().contains("Rust"));
     }
 }

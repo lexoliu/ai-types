@@ -1,6 +1,7 @@
 //! Adapter for converting aither agent events to ACP session updates.
 
 use aither_agent::{AgentEvent, TodoItem, TodoStatus};
+use aither_core::llm::ToolResult;
 
 use crate::protocol::{
     ContentBlock, ContentChunk, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, SessionUpdate,
@@ -43,33 +44,65 @@ pub fn agent_event_to_session_update(event: &AgentEvent) -> Option<SessionUpdate
             raw_output: None,
         })),
 
+        AgentEvent::ToolCallDelta {
+            id,
+            name,
+            arguments_fragment,
+        } => Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+            tool_call_id: id.clone(),
+            status: Some(ToolCallStatus::Pending),
+            content: None,
+            title: Some(format_tool_title(name, arguments_fragment)),
+            kind: Some(infer_tool_kind(name)),
+            locations: None,
+            raw_input: Some(serde_json::Value::String(arguments_fragment.clone())),
+            raw_output: None,
+        })),
+
         AgentEvent::ToolCallEnd {
             id,
             name: _,
             result,
-        } => {
-            let (status, output) = match result {
-                Ok(output) => (ToolCallStatus::Completed, Some(output.clone())),
-                Err(error) => (ToolCallStatus::Error, Some(error.clone())),
-            };
+        } => Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
+            tool_call_id: id.clone(),
+            status: Some(tool_result_status(result)),
+            content: None,
+            title: None,
+            kind: None,
+            locations: None,
+            raw_input: None,
+            raw_output: Some(tool_result_raw_output(result)),
+        })),
 
-            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate {
-                tool_call_id: id.clone(),
-                status: Some(status),
-                content: None,
-                title: None,
-                kind: None,
-                locations: None,
-                raw_input: None,
-                raw_output: output.map(serde_json::Value::String),
-            }))
+        AgentEvent::RunStart { .. }
+        | AgentEvent::Checkpoint { .. }
+        | AgentEvent::BackgroundTaskStarted { .. }
+        | AgentEvent::BackgroundTaskCompleted { .. }
+        | AgentEvent::TerminalInputNeeded { .. }
+        | AgentEvent::RunPaused { .. }
+        | AgentEvent::RunResumed { .. }
+        | AgentEvent::SkillActivated { .. }
+        | AgentEvent::TurnComplete { .. }
+        | AgentEvent::Complete { .. }
+        | AgentEvent::Error(_)
+        | AgentEvent::Usage(_) => None,
+    }
+}
+
+const fn tool_result_status(result: &ToolResult) -> ToolCallStatus {
+    if result.is_error() {
+        ToolCallStatus::Error
+    } else {
+        ToolCallStatus::Completed
+    }
+}
+
+fn tool_result_raw_output(result: &ToolResult) -> serde_json::Value {
+    match serde_json::to_value(result) {
+        Ok(value) => value,
+        Err(error) => {
+            panic!("failed to serialize ToolResult for ACP raw_output: {error}");
         }
-
-        // These events are handled at a higher level
-        AgentEvent::TurnComplete { .. } => None,
-        AgentEvent::Complete { .. } => None,
-        AgentEvent::Error(_) => None,
-        AgentEvent::Usage(_) => None,
     }
 }
 
@@ -102,41 +135,41 @@ pub const fn todo_status_to_plan_status(status: TodoStatus) -> PlanEntryStatus {
 fn format_tool_title(name: &str, arguments: &str) -> String {
     // Try to extract relevant info from arguments for better titles
     match name {
-        "bash" => {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
-                if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-                    // Truncate long commands
-                    let truncated = if cmd.len() > 50 {
-                        format!("{}...", &cmd[..47])
-                    } else {
-                        cmd.to_string()
-                    };
-                    return format!("Running: {truncated}");
-                }
+        "terminal" => {
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments)
+                && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
+            {
+                // Truncate long commands
+                let truncated = if cmd.len() > 50 {
+                    format!("{}...", &cmd[..47])
+                } else {
+                    cmd.to_string()
+                };
+                return format!("Running: {truncated}");
             }
             "Running command".to_string()
         }
         "read" | "Read" => {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
-                if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
-                    return format!("Reading {path}");
-                }
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments)
+                && let Some(path) = args.get("file_path").and_then(|v| v.as_str())
+            {
+                return format!("Reading {path}");
             }
             "Reading file".to_string()
         }
         "write" | "Write" => {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
-                if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
-                    return format!("Writing {path}");
-                }
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments)
+                && let Some(path) = args.get("file_path").and_then(|v| v.as_str())
+            {
+                return format!("Writing {path}");
             }
             "Writing file".to_string()
         }
         "edit" | "Edit" => {
-            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments) {
-                if let Some(path) = args.get("file_path").and_then(|v| v.as_str()) {
-                    return format!("Editing {path}");
-                }
+            if let Ok(args) = serde_json::from_str::<serde_json::Value>(arguments)
+                && let Some(path) = args.get("file_path").and_then(|v| v.as_str())
+            {
+                return format!("Editing {path}");
             }
             "Editing file".to_string()
         }
@@ -155,7 +188,7 @@ fn infer_tool_kind(name: &str) -> ToolKind {
         "read" | "glob" | "grep" | "webfetch" => ToolKind::Read,
         "write" | "edit" => ToolKind::Edit,
         "websearch" => ToolKind::Search,
-        "bash" | "command" => ToolKind::Execute,
+        "terminal" | "command" => ToolKind::Execute,
         _ => ToolKind::Other,
     }
 }
@@ -184,7 +217,7 @@ mod tests {
     fn test_tool_call_conversion() {
         let event = AgentEvent::ToolCallStart {
             id: "123".to_string(),
-            name: "bash".to_string(),
+            name: "terminal".to_string(),
             arguments: r#"{"command": "ls -la"}"#.to_string(),
         };
         let update = agent_event_to_session_update(&event).unwrap();

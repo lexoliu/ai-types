@@ -42,12 +42,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("Gemini (executing code): ");
         let mut stream = backend.respond(request);
-        let mut full_response = String::new();
         while let Some(event) = stream.next().await {
             if let Event::Text(text) = event? {
                 print!("{text}");
                 io::stdout().flush()?;
-                full_response.push_str(&text);
             }
         }
         println!();

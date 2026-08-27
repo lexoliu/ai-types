@@ -11,7 +11,7 @@ pub use error::MistralError;
 #[cfg(feature = "llm")]
 pub use provider::MistralProvider;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use aither_core::{
     EmbeddingModel, LanguageModel,
@@ -22,6 +22,7 @@ use aither_core::{
         tool::ToolDefinition,
     },
 };
+use async_lock::OnceCell;
 use futures_core::Stream;
 use futures_lite::StreamExt;
 use mistralrs::core::{EmbeddingLoaderType, ImageChoice, NormalLoaderType};
@@ -44,28 +45,54 @@ use std::collections::HashMap;
 /// Local mistral.rs-backed model implementing `aither` traits.
 #[derive(Clone)]
 pub struct Mistral {
-    inner: Arc<Mutex<Inner>>,
+    config: Arc<MistralConfig>,
+    caches: Arc<ModelCaches>,
     embedding_dimensions: usize,
 }
 
 impl core::fmt::Debug for Mistral {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Mistral")
+            .field("config", &self.config)
             .field("embedding_dimensions", &self.embedding_dimensions)
             .finish_non_exhaustive()
     }
 }
 
-struct Inner {
+#[derive(Debug, Clone)]
+struct MistralConfig {
     llm_model_id: Option<String>,
     embedding_model_id: Option<String>,
     image_model_id: Option<String>,
     llm_loader: NormalLoaderType,
     embedding_loader: EmbeddingLoaderType,
     image_loader: DiffusionLoaderType,
-    llm: Option<Arc<Model>>,
-    embedding: Option<Arc<Model>>,
-    image: Option<Arc<Model>>,
+}
+
+impl Default for MistralConfig {
+    fn default() -> Self {
+        Self {
+            llm_model_id: None,
+            embedding_model_id: None,
+            image_model_id: None,
+            llm_loader: NormalLoaderType::Mistral,
+            embedding_loader: EmbeddingLoaderType::Qwen3Embedding,
+            image_loader: DiffusionLoaderType::Flux,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ModelCaches {
+    llm: OnceCell<Arc<Model>>,
+    embedding: OnceCell<Arc<Model>>,
+    image: OnceCell<Arc<Model>>,
+}
+
+impl core::fmt::Debug for ModelCaches {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ModelCaches").finish_non_exhaustive()
+    }
 }
 
 impl Default for Mistral {
@@ -79,91 +106,58 @@ impl Mistral {
     #[must_use] 
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Inner {
-                llm_model_id: None,
-                embedding_model_id: None,
-                image_model_id: None,
-                llm_loader: NormalLoaderType::Mistral,
-                embedding_loader: EmbeddingLoaderType::Qwen3Embedding,
-                image_loader: DiffusionLoaderType::Flux,
-                llm: None,
-                embedding: None,
-                image: None,
-            })),
+            config: Arc::new(MistralConfig::default()),
+            caches: Arc::new(ModelCaches::default()),
             embedding_dimensions: 1024,
         }
     }
 
     /// Set model ID used for LLM inference.
     #[must_use]
-    pub fn with_llm_model(self, model_id: impl Into<String>) -> Self {
-        let this = self;
-        {
-            let mut inner = this.inner.lock().expect("mistral state poisoned");
-            inner.llm_model_id = Some(model_id.into());
-            inner.llm = None;
-        }
-        this
+    pub fn with_llm_model(mut self, model_id: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.config).llm_model_id = Some(model_id.into());
+        self.caches = Arc::new(ModelCaches::default());
+        self
     }
 
     /// Set model ID used for embeddings.
     #[must_use]
-    pub fn with_embedding_model(self, model_id: impl Into<String>) -> Self {
-        let this = self;
-        {
-            let mut inner = this.inner.lock().expect("mistral state poisoned");
-            inner.embedding_model_id = Some(model_id.into());
-            inner.embedding = None;
-        }
-        this
+    pub fn with_embedding_model(mut self, model_id: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.config).embedding_model_id = Some(model_id.into());
+        self.caches = Arc::new(ModelCaches::default());
+        self
     }
 
     /// Set model ID used for image generation.
     #[must_use]
-    pub fn with_image_model(self, model_id: impl Into<String>) -> Self {
-        let this = self;
-        {
-            let mut inner = this.inner.lock().expect("mistral state poisoned");
-            inner.image_model_id = Some(model_id.into());
-            inner.image = None;
-        }
-        this
+    pub fn with_image_model(mut self, model_id: impl Into<String>) -> Self {
+        Arc::make_mut(&mut self.config).image_model_id = Some(model_id.into());
+        self.caches = Arc::new(ModelCaches::default());
+        self
     }
 
     /// Set LLM loader type used by mistral.rs.
     #[must_use]
-    pub fn with_llm_loader(self, loader: NormalLoaderType) -> Self {
-        let this = self;
-        {
-            let mut inner = this.inner.lock().expect("mistral state poisoned");
-            inner.llm_loader = loader;
-            inner.llm = None;
-        }
-        this
+    pub fn with_llm_loader(mut self, loader: NormalLoaderType) -> Self {
+        Arc::make_mut(&mut self.config).llm_loader = loader;
+        self.caches = Arc::new(ModelCaches::default());
+        self
     }
 
     /// Set embedding loader type used by mistral.rs.
     #[must_use]
-    pub fn with_embedding_loader(self, loader: EmbeddingLoaderType) -> Self {
-        let this = self;
-        {
-            let mut inner = this.inner.lock().expect("mistral state poisoned");
-            inner.embedding_loader = loader;
-            inner.embedding = None;
-        }
-        this
+    pub fn with_embedding_loader(mut self, loader: EmbeddingLoaderType) -> Self {
+        Arc::make_mut(&mut self.config).embedding_loader = loader;
+        self.caches = Arc::new(ModelCaches::default());
+        self
     }
 
     /// Set image loader type used by mistral.rs.
     #[must_use]
-    pub fn with_image_loader(self, loader: DiffusionLoaderType) -> Self {
-        let this = self;
-        {
-            let mut inner = this.inner.lock().expect("mistral state poisoned");
-            inner.image_loader = loader;
-            inner.image = None;
-        }
-        this
+    pub fn with_image_loader(mut self, loader: DiffusionLoaderType) -> Self {
+        Arc::make_mut(&mut self.config).image_loader = loader;
+        self.caches = Arc::new(ModelCaches::default());
+        self
     }
 
     /// Override the advertised embedding dimensions.
@@ -174,106 +168,74 @@ impl Mistral {
     }
 
     #[cfg(feature = "llm")]
-    async fn ensure_llm(inner: &Arc<Mutex<Inner>>) -> Result<Arc<Model>, MistralError> {
-        if let Some(model) = inner.lock().expect("mistral state poisoned").llm.clone() {
-            return Ok(model);
-        }
-
-        let (model_id, loader) = {
-            let guard = inner.lock().expect("mistral state poisoned");
-            (
-                guard
-                    .llm_model_id
-                    .clone()
-                    .ok_or(MistralError::MissingModel("llm_model_id"))?,
-                guard.llm_loader.clone(),
-            )
-        };
-
-        let built = Arc::new(
-            TextModelBuilder::new(model_id)
-                .with_loader_type(loader)
-                .build()
-                .await?,
-        );
-
-        let mut guard = inner.lock().expect("mistral state poisoned");
-        if guard.llm.is_none() {
-            guard.llm = Some(built);
-        }
-        Ok(guard.llm.clone().expect("llm model must be initialized"))
+    async fn ensure_llm(
+        config: &MistralConfig,
+        caches: &ModelCaches,
+    ) -> Result<Arc<Model>, MistralError> {
+        let model_id = config
+            .llm_model_id
+            .clone()
+            .ok_or(MistralError::MissingModel("llm_model_id"))?;
+        let loader = config.llm_loader.clone();
+        let model = caches
+            .llm
+            .get_or_try_init(|| async move {
+                Ok::<Arc<Model>, MistralError>(Arc::new(
+                    TextModelBuilder::new(model_id)
+                        .with_loader_type(loader)
+                        .build()
+                        .await?,
+                ))
+            })
+            .await?;
+        Ok(model.clone())
     }
 
     #[cfg(feature = "embedding")]
-    async fn ensure_embedding(inner: &Arc<Mutex<Inner>>) -> Result<Arc<Model>, MistralError> {
-        if let Some(model) = inner
-            .lock()
-            .expect("mistral state poisoned")
-            .embedding
+    async fn ensure_embedding(
+        config: &MistralConfig,
+        caches: &ModelCaches,
+    ) -> Result<Arc<Model>, MistralError> {
+        let model_id = config
+            .embedding_model_id
             .clone()
-        {
-            return Ok(model);
-        }
-
-        let (model_id, loader) = {
-            let guard = inner.lock().expect("mistral state poisoned");
-            (
-                guard
-                    .embedding_model_id
-                    .clone()
-                    .ok_or(MistralError::MissingModel("embedding_model_id"))?,
-                guard.embedding_loader.clone(),
-            )
-        };
-
-        let built = Arc::new(
-            EmbeddingModelBuilder::new(model_id)
-                .with_loader_type(loader)
-                .build()
-                .await?,
-        );
-
-        let mut guard = inner.lock().expect("mistral state poisoned");
-        if guard.embedding.is_none() {
-            guard.embedding = Some(built);
-        }
-        Ok(guard
+            .ok_or(MistralError::MissingModel("embedding_model_id"))?;
+        let loader = config.embedding_loader.clone();
+        let model = caches
             .embedding
-            .clone()
-            .expect("embedding model must be initialized"))
+            .get_or_try_init(|| async move {
+                Ok::<Arc<Model>, MistralError>(Arc::new(
+                    EmbeddingModelBuilder::new(model_id)
+                        .with_loader_type(loader)
+                        .build()
+                        .await?,
+                ))
+            })
+            .await?;
+        Ok(model.clone())
     }
 
     #[cfg(feature = "image")]
-    async fn ensure_image(inner: &Arc<Mutex<Inner>>) -> Result<Arc<Model>, MistralError> {
-        if let Some(model) = inner.lock().expect("mistral state poisoned").image.clone() {
-            return Ok(model);
-        }
-
-        let (model_id, loader) = {
-            let guard = inner.lock().expect("mistral state poisoned");
-            (
-                guard
-                    .image_model_id
-                    .clone()
-                    .ok_or(MistralError::MissingModel("image_model_id"))?,
-                guard.image_loader.clone(),
-            )
-        };
-
-        let built = Arc::new(
-            mistralrs::DiffusionModelBuilder::new(model_id, loader)
-                .build()
-                .await?,
-        );
-
-        let mut guard = inner.lock().expect("mistral state poisoned");
-        if guard.image.is_none() {
-            guard.image = Some(built);
-        }
-        Ok(guard
-            .image
+    async fn ensure_image(
+        config: &MistralConfig,
+        caches: &ModelCaches,
+    ) -> Result<Arc<Model>, MistralError> {
+        let model_id = config
+            .image_model_id
             .clone()
-            .expect("image model must be initialized"))
+            .ok_or(MistralError::MissingModel("image_model_id"))?;
+        let loader = config.image_loader.clone();
+        let model = caches
+            .image
+            .get_or_try_init(|| async move {
+                Ok::<Arc<Model>, MistralError>(Arc::new(
+                    mistralrs::DiffusionModelBuilder::new(model_id, loader)
+                        .build()
+                        .await?,
+                ))
+            })
+            .await?;
+        Ok(model.clone())
     }
 }
 
@@ -285,10 +247,11 @@ impl LanguageModel for Mistral {
         &self,
         request: LLMRequest,
     ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
-        let inner = self.inner.clone();
+        let config = self.config.clone();
+        let caches = self.caches.clone();
         async_stream::stream! {
             let (messages, parameters, tool_defs) = request.into_parts();
-            let model = match Self::ensure_llm(&inner).await {
+            let model = match Self::ensure_llm(config.as_ref(), caches.as_ref()).await {
                 Ok(model) => model,
                 Err(err) => {
                     yield Err(err);
@@ -344,20 +307,26 @@ impl LanguageModel for Mistral {
                 cache_read_tokens: None,
                 cache_write_tokens: None,
                 cost_usd: None,
+                stop_reason: None,
             }));
         }
     }
 
     fn profile(&self) -> impl core::future::Future<Output = Profile> + Send {
-        let inner = self.inner.clone();
+        let config = self.config.clone();
         async move {
-            let guard = inner.lock().expect("mistral state poisoned");
-            let name = guard
+            let name = config
                 .llm_model_id
                 .clone()
                 .unwrap_or_else(|| "mistral-local".to_string());
             let context_length = aither_models::lookup(&name)
-                .map_or(32_768, |model| model.context_window);
+                .and_then(aither_models::ModelEntry::max_input_tokens)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Mistral model '{}' missing context metadata in aither-models",
+                        name
+                    )
+                });
 
             Profile::new(
                 name.clone(),
@@ -381,10 +350,11 @@ impl EmbeddingModel for Mistral {
         &self,
         text: &str,
     ) -> impl core::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
-        let inner = self.inner.clone();
+        let config = self.config.clone();
+        let caches = self.caches.clone();
         let text = text.to_string();
         async move {
-            let model = Self::ensure_embedding(&inner).await?;
+            let model = Self::ensure_embedding(config.as_ref(), caches.as_ref()).await?;
             model.generate_embedding(text).await}
     }
 }
@@ -398,7 +368,8 @@ impl ImageGenerator for Mistral {
         prompt: Prompt,
         size: Size,
     ) -> impl Stream<Item = Result<ImageData, Self::Error>> + Send {
-        let inner = self.inner.clone();
+        let config = self.config.clone();
+        let caches = self.caches.clone();
         let prompt_text = prompt.text().to_owned();
         let params = DiffusionGenerationParams {
             width: size.width() as usize,
@@ -406,7 +377,7 @@ impl ImageGenerator for Mistral {
         };
 
         futures_lite::stream::iter(vec![async move {
-            let model = Self::ensure_image(&inner).await?;
+            let model = Self::ensure_image(config.as_ref(), caches.as_ref()).await?;
             let response = model
                 .generate_image(prompt_text, ImageGenerationResponseFormat::B64Json, params)
                 .await?;

@@ -1,4 +1,14 @@
-//! MCP client for connecting to MCP servers.
+//! MCP client implementation.
+//!
+//! The client connects to MCP servers and provides methods to list and call
+//! tools, read resources, and so on. [`McpConnection`] wraps a client together
+//! with the transport that drives it, ready to hand to an agent.
+
+mod toolset;
+
+pub use toolset::{
+    McpConnection, McpServerConfig, McpServersConfig, McpToolService, register_terminal_commands,
+};
 
 use tracing::debug;
 

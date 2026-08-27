@@ -4,9 +4,14 @@
 //! Type-safe tool calling system for Large Language Models. Enables LLMs to execute external
 //! functions, access APIs, and interact with systems through well-defined interfaces.
 //!
-//! //! ## How LLM call external tools?
+//! ## How a model calls a tool
 //!
-//! TODO
+//! A [`Tool`] declares a name, a description, and an `Arguments` type whose
+//! JSON schema is sent to the provider. When the model decides to use a tool it
+//! emits a [`ToolCall`](crate::llm::ToolCall) event carrying the tool name and
+//! arguments as JSON; this crate does not execute it. Executing the call and
+//! feeding the result back is the job of a higher layer such as `aither-agent`,
+//! which keeps tool execution under the caller's control.
 //!
 //! ## Core Components
 //!
@@ -16,29 +21,34 @@
 //!
 //! ## Quick Start
 //!
-//! ```rust,ignore
-//! use aither::llm::Tool;
+//! ```rust
+//! use aither_core::llm::{Tool, ToolResult};
 //! use schemars::JsonSchema;
 //! use serde::Deserialize;
+//! use std::borrow::Cow;
 //!
+//! /// Performs basic math operations.
 //! #[derive(JsonSchema, Deserialize)]
 //! struct MathArgs {
 //!     /// Operation: "add", "subtract", "multiply", "divide"
 //!     operation: String,
 //!     /// First number
 //!     a: f64,
-//!     /// Second number  
+//!     /// Second number
 //!     b: f64,
 //! }
 //!
 //! struct Calculator;
 //!
 //! impl Tool for Calculator {
-//!     const NAME: &str = "calculator";
-//!     const DESCRIPTION: &str = "Performs basic math operations";
-//!     type Arguments = MathArgs;
+//!     fn name(&self) -> Cow<'static, str> {
+//!         Cow::Borrowed("calculator")
+//!     }
 //!
-//!     async fn call(&self, args: Self::Arguments) -> aither::Result<ToolOutput> {
+//!     type Arguments = MathArgs;
+//!     type Res = ToolResult;
+//!
+//!     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
 //!         let result = match args.operation.as_str() {
 //!             "add" => args.a + args.b,
 //!             "subtract" => args.a - args.b,
@@ -47,7 +57,7 @@
 //!             "divide" => return Err(anyhow::Error::msg("Division by zero")),
 //!             _ => return Err(anyhow::Error::msg("Unknown operation")),
 //!         };
-//!         Ok(ToolOutput::text(result.to_string()))
+//!         Ok(ToolResult::text(result.to_string()))
 //!     }
 //! }
 //! ```
@@ -151,87 +161,123 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::{boxed::Box, collections::BTreeMap};
 use core::any::Any;
-use core::fmt::Debug;
+use core::fmt::{Debug, Display};
 use core::{future::Future, pin::Pin};
 pub use mime::Mime;
 use schemars::{JsonSchema, Schema, schema_for};
 use serde::{Serialize, de::DeserializeOwned};
 
-/// Output from a tool execution.
+/// Final structured result from a tool execution.
 ///
-/// Tools return either:
-/// - `Done` - operation completed with no output (e.g., "file deleted")
-/// - `Output` - operation produced content with a MIME type
+/// This keeps successful content and tool-level failures in distinct variants so
+/// UIs and runtimes do not need to infer errors from free-form strings.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use aither::llm::tool::ToolOutput;
+/// use aither::llm::tool::ToolResult;
 ///
-/// // Tool that produces text
-/// fn search_tool() -> ToolOutput {
-///     ToolOutput::text("Found 3 results...")
+/// fn search_tool() -> ToolResult {
+///     ToolResult::text("Found 3 results...")
 /// }
 ///
-/// // Tool that completes without output
-/// fn delete_tool() -> ToolOutput {
-///     ToolOutput::Done
+/// fn delete_tool() -> ToolResult {
+///     ToolResult::Done
 /// }
 /// ```
-#[derive(Debug, Clone)]
-pub enum ToolOutput {
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "snake_case"))]
+pub enum ToolResult {
     /// Tool completed with no output to return.
-    /// No file will be created, nothing to save.
     Done,
 
-    /// Tool produced output with content and MIME type.
-    Output {
-        /// MIME type of the content (e.g., `text/plain`, `image/png`)
-        mime: Mime,
-        /// Raw content bytes
+    /// UTF-8 plain text output.
+    Text {
+        /// Plain text content.
+        text: String,
+    },
+
+    /// Tab-separated tabular output.
+    Tsv {
+        /// TSV content.
+        text: String,
+    },
+
+    /// Structured JSON output.
+    Json {
+        /// JSON content.
+        value: Value,
+    },
+
+    /// Binary or media payload.
+    Binary {
+        /// MIME type of the payload (for example `image/png`).
+        mime: String,
+        /// Raw content bytes.
         content: Vec<u8>,
+    },
+
+    /// Tool-level error. This is distinct from transport/runtime failures.
+    Error {
+        /// Tool-level error message.
+        message: String,
     },
 }
 
-impl ToolOutput {
-    /// Creates a text output (UTF-8 string).
+impl ToolResult {
+    /// Creates a plain text result.
     #[must_use]
     pub fn text(s: impl Into<String>) -> Self {
-        let s = s.into();
-        Self::Output {
-            mime: mime::TEXT_PLAIN_UTF_8,
-            content: s.into_bytes(),
-        }
+        Self::Text { text: s.into() }
     }
 
-    /// Creates a JSON output from a serializable value.
+    /// Creates a TSV result.
+    #[must_use]
+    pub fn tsv(s: impl Into<String>) -> Self {
+        Self::Tsv { text: s.into() }
+    }
+
+    /// Creates a JSON result from a serializable value.
     ///
     /// # Errors
     ///
     /// Returns an error if serialization fails.
     pub fn json<T: Serialize>(value: &T) -> Result<Self> {
-        let bytes = serde_json::to_vec(value)?;
-        Ok(Self::Output {
-            mime: mime::APPLICATION_JSON,
-            content: bytes,
+        Ok(Self::Json {
+            value: serde_json::to_value(value)?,
         })
     }
 
-    /// Creates an image output.
+    /// Creates a JSON result from an already-materialized JSON value.
+    #[must_use]
+    pub const fn json_value(value: Value) -> Self {
+        Self::Json { value }
+    }
+
+    /// Creates an image result.
     #[must_use]
     pub fn image(data: Vec<u8>, media_type: &str) -> Self {
-        Self::Output {
-            mime: media_type.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM),
+        Self::Binary {
+            mime: parse_media_type_or_octet_stream(media_type),
             content: data,
         }
     }
 
-    /// Creates a binary output.
+    /// Creates a binary result.
     #[must_use]
-    pub const fn binary(data: Vec<u8>) -> Self {
-        Self::Output {
-            mime: mime::APPLICATION_OCTET_STREAM,
+    pub fn binary(data: Vec<u8>) -> Self {
+        Self::Binary {
+            mime: mime::APPLICATION_OCTET_STREAM.essence_str().to_string(),
             content: data,
+        }
+    }
+
+    /// Creates a typed tool error result.
+    #[must_use]
+    pub fn error(message: impl Into<String>) -> Self {
+        Self::Error {
+            message: message.into(),
         }
     }
 
@@ -241,36 +287,295 @@ impl ToolOutput {
         matches!(self, Self::Done)
     }
 
-    /// Returns the content if this is an `Output` variant.
+    /// Returns `true` if this is a typed tool error.
+    #[must_use]
+    pub const fn is_error(&self) -> bool {
+        matches!(self, Self::Error { .. })
+    }
+
+    /// Returns plain textual content for text-like variants.
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text { text } | Self::Tsv { text } => Some(text),
+            Self::Error { message } => Some(message),
+            Self::Done | Self::Json { .. } | Self::Binary { .. } => None,
+        }
+    }
+
+    /// Returns the error message if this is a typed tool error.
+    #[must_use]
+    pub fn error_message(&self) -> Option<&str> {
+        match self {
+            Self::Error { message } => Some(message),
+            Self::Done
+            | Self::Text { .. }
+            | Self::Tsv { .. }
+            | Self::Json { .. }
+            | Self::Binary { .. } => None,
+        }
+    }
+
+    /// Projects the result into a textual representation safe to re-inject into model context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if JSON serialization fails.
+    pub fn render_for_model(&self) -> Result<String> {
+        match self {
+            Self::Done => Ok(String::new()),
+            Self::Text { text } | Self::Tsv { text } => Ok(text.clone()),
+            Self::Json { value } => Ok(serde_json::to_string(value)?),
+            Self::Binary { mime, content } => {
+                let mut rendered = String::new();
+                rendered.push_str("[binary tool result: ");
+                rendered.push_str(mime);
+                rendered.push_str(", ");
+                rendered.push_str(content.len().to_string().as_str());
+                rendered.push_str(" bytes]");
+                Ok(rendered)
+            }
+            Self::Error { message } => Ok(message.clone()),
+        }
+    }
+
+    /// Renders the result for CLI display.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if JSON serialization fails.
+    pub fn render_for_cli(&self) -> Result<String> {
+        match self {
+            Self::Done => Ok(String::new()),
+            Self::Text { text } | Self::Tsv { text } => Ok(text.clone()),
+            Self::Json { value } => Ok(serde_json::to_string_pretty(value)?),
+            Self::Binary { mime, content } => {
+                let mut rendered = String::new();
+                rendered.push_str("[binary tool result: ");
+                rendered.push_str(mime);
+                rendered.push_str(", ");
+                rendered.push_str(content.len().to_string().as_str());
+                rendered.push_str(" bytes]");
+                Ok(rendered)
+            }
+            Self::Error { message } => Ok(message.clone()),
+        }
+    }
+
+    /// Parses and returns the MIME type when this result carries binary content.
+    #[must_use]
+    pub fn mime(&self) -> Option<Mime> {
+        match self {
+            Self::Binary { mime, .. } => mime.parse().ok(),
+            Self::Done
+            | Self::Text { .. }
+            | Self::Tsv { .. }
+            | Self::Json { .. }
+            | Self::Error { .. } => None,
+        }
+    }
+
+    /// Returns raw bytes for binary results.
     #[must_use]
     pub fn content(&self) -> Option<&[u8]> {
         match self {
-            Self::Done => None,
-            Self::Output { content, .. } => Some(content),
+            Self::Binary { content, .. } => Some(content),
+            Self::Done
+            | Self::Text { .. }
+            | Self::Tsv { .. }
+            | Self::Json { .. }
+            | Self::Error { .. } => None,
         }
     }
+}
 
-    /// Returns the MIME type if this is an `Output` variant.
-    #[must_use]
-    pub const fn mime(&self) -> Option<&Mime> {
-        match self {
-            Self::Done => None,
-            Self::Output { mime, .. } => Some(mime),
-        }
-    }
-
-    /// Converts the output to a string if it's text content.
+/// Conversion trait for values returned by [`Tool::call`].
+///
+/// The conversion itself is fallible so tool authors can return types like
+/// `Result<T: Serialize, E: Error>` and still surface serialization failures as
+/// framework errors while preserving typed tool errors inside [`ToolResult`].
+pub trait IntoToolResult {
+    /// Converts the value into a final [`ToolResult`].
     ///
-    /// Returns `None` if:
-    /// - This is a `Done` variant
-    /// - The content is not valid UTF-8
-    #[must_use]
-    pub fn as_str(&self) -> Option<&str> {
+    /// # Errors
+    ///
+    /// Returns an error if the conversion cannot be completed.
+    fn into_tool_result(self) -> Result<ToolResult>;
+}
+
+impl IntoToolResult for ToolResult {
+    fn into_tool_result(self) -> Result<ToolResult> {
+        Ok(self)
+    }
+}
+
+impl IntoToolResult for () {
+    fn into_tool_result(self) -> Result<ToolResult> {
+        Ok(ToolResult::Done)
+    }
+}
+
+impl IntoToolResult for String {
+    fn into_tool_result(self) -> Result<ToolResult> {
+        Ok(ToolResult::text(self))
+    }
+}
+
+impl IntoToolResult for &str {
+    fn into_tool_result(self) -> Result<ToolResult> {
+        Ok(ToolResult::text(self))
+    }
+}
+
+impl IntoToolResult for Cow<'_, str> {
+    fn into_tool_result(self) -> Result<ToolResult> {
+        Ok(ToolResult::text(self.into_owned()))
+    }
+}
+
+impl IntoToolResult for Value {
+    fn into_tool_result(self) -> Result<ToolResult> {
+        Ok(ToolResult::json_value(self))
+    }
+}
+
+impl<T> IntoToolResult for Option<T>
+where
+    T: IntoToolResult,
+{
+    fn into_tool_result(self) -> Result<ToolResult> {
+        self.map_or_else(|| Ok(ToolResult::Done), IntoToolResult::into_tool_result)
+    }
+}
+
+impl<T, E> IntoToolResult for core::result::Result<T, E>
+where
+    T: Serialize,
+    E: Display,
+{
+    fn into_tool_result(self) -> Result<ToolResult> {
         match self {
-            Self::Done => None,
-            Self::Output { content, .. } => core::str::from_utf8(content).ok(),
+            Ok(value) => serialize_success_value(&value),
+            Err(error) => Ok(ToolResult::error(error.to_string())),
         }
     }
+}
+
+fn parse_media_type_or_octet_stream(media_type: &str) -> String {
+    media_type
+        .parse::<Mime>()
+        .unwrap_or(mime::APPLICATION_OCTET_STREAM)
+        .essence_str()
+        .to_string()
+}
+
+fn serialize_success_value<T: Serialize>(value: &T) -> Result<ToolResult> {
+    let value = serde_json::to_value(value)?;
+    if let Some(tsv) = json_value_to_tsv(&value) {
+        return Ok(ToolResult::tsv(tsv));
+    }
+
+    match value {
+        Value::String(text) => Ok(ToolResult::text(text)),
+        other => Ok(ToolResult::json_value(other)),
+    }
+}
+
+/// Converts a JSON value into TSV when it represents an object or non-empty array.
+#[must_use]
+pub fn json_value_to_tsv(value: &Value) -> Option<String> {
+    let rows = match value {
+        Value::Array(arr) if !arr.is_empty() => arr
+            .iter()
+            .map(|value| flatten_json_value(value, ""))
+            .collect::<Vec<_>>(),
+        Value::Object(_) => alloc::vec![flatten_json_value(value, "")],
+        Value::Array(_) | Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {
+            return None;
+        }
+    };
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut columns: Vec<String> = Vec::new();
+    let mut seen: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
+    for row in &rows {
+        for (key, _) in row {
+            if seen.insert(key.clone()) {
+                columns.push(key.clone());
+            }
+        }
+    }
+
+    if columns.is_empty() {
+        return None;
+    }
+
+    let mut tsv = String::new();
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            tsv.push('\t');
+        }
+        tsv.push_str(&escape_tsv_field(column));
+    }
+    tsv.push('\n');
+
+    for row in &rows {
+        let row_map: alloc::collections::BTreeMap<&str, &str> = row
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<alloc::collections::BTreeMap<&str, &str>>();
+        for (index, column) in columns.iter().enumerate() {
+            if index > 0 {
+                tsv.push('\t');
+            }
+            if let Some(value) = row_map.get(column.as_str()) {
+                tsv.push_str(&escape_tsv_field(value));
+            }
+        }
+        tsv.push('\n');
+    }
+
+    Some(tsv)
+}
+
+fn flatten_json_value(value: &Value, prefix: &str) -> Vec<(String, String)> {
+    let mut flattened = Vec::new();
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let full_key = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                flattened.extend(flatten_json_value(child, &full_key));
+            }
+        }
+        Value::Array(_) => {
+            let serialized = serde_json::to_string(value).unwrap_or_default();
+            flattened.push((prefix.to_string(), serialized));
+        }
+        Value::String(text) => {
+            flattened.push((prefix.to_string(), text.clone()));
+        }
+        Value::Number(number) => {
+            flattened.push((prefix.to_string(), number.to_string()));
+        }
+        Value::Bool(boolean) => {
+            flattened.push((prefix.to_string(), boolean.to_string()));
+        }
+        Value::Null => {
+            flattened.push((prefix.to_string(), String::new()));
+        }
+    }
+    flattened
+}
+
+fn escape_tsv_field(value: &str) -> String {
+    value.replace(['\t', '\n', '\r'], " ")
 }
 
 /// Tools that can be called by language models.
@@ -278,7 +583,7 @@ impl ToolOutput {
 /// # Example
 ///
 /// ```rust,ignore
-/// use aither::llm::{Tool, ToolOutput};
+/// use aither::llm::{Tool, ToolResult};
 /// use schemars::JsonSchema;
 /// use serde::Deserialize;
 ///
@@ -292,18 +597,17 @@ impl ToolOutput {
 /// struct Calculator;
 ///
 /// impl Tool for Calculator {
-///     const NAME: &str = "calculator";
-///     const DESCRIPTION: &str = "Performs basic mathematical operations";
 ///     type Arguments = CalculatorArgs;
+///     type Res = ToolResult;
 ///
-///     async fn call(&mut self, args: Self::Arguments) -> aither::Result<ToolOutput> {
+///     async fn call(&mut self, args: Self::Arguments) -> aither::Result<Self::Res> {
 ///         match args.operation.as_str() {
-///             "add" => Ok(ToolOutput::text((args.a + args.b).to_string())),
-///             "subtract" => Ok(ToolOutput::text((args.a - args.b).to_string())),
-///             "multiply" => Ok(ToolOutput::text((args.a * args.b).to_string())),
+///             "add" => Ok(ToolResult::text((args.a + args.b).to_string())),
+///             "subtract" => Ok(ToolResult::text((args.a - args.b).to_string())),
+///             "multiply" => Ok(ToolResult::text((args.a * args.b).to_string())),
 ///             "divide" => {
 ///                 if args.b != 0.0 {
-///                     Ok(ToolOutput::text((args.a / args.b).to_string()))
+///                     Ok(ToolResult::text((args.a / args.b).to_string()))
 ///                 } else {
 ///                     Err(anyhow::Error::msg("Division by zero"))
 ///                 }
@@ -317,16 +621,32 @@ pub trait Tool: Send + Sync {
     /// Tool name. Must be unique.
     fn name(&self) -> Cow<'static, str>;
 
+    /// What the tool does, as shown to the model.
+    ///
+    /// This is the single most important thing a model uses to decide whether
+    /// to call a tool, so it must not be empty — [`Tools::register`] rejects a
+    /// tool whose description is blank.
+    ///
+    /// The default implementation reads the rustdoc comment on
+    /// [`Self::Arguments`], which `schemars` records in the generated schema.
+    /// Override it to supply the description directly.
+    fn description(&self) -> Cow<'static, str> {
+        description_from_schema::<Self::Arguments>().unwrap_or_default()
+    }
+
     /// Tool arguments type. Must implement [`schemars::JsonSchema`] and [`serde::de::DeserializeOwned`].
-    /// Description is extracted from the rustdoc on this type via `JsonSchema`.
+    /// Its rustdoc becomes the default tool description.
     type Arguments: Send + JsonSchema + DeserializeOwned;
+
+    /// Raw return type from the tool implementation.
+    type Res: IntoToolResult + Send;
 
     /// Executes the tool with the provided arguments.
     ///
-    /// Returns a [`ToolOutput`] containing the tool's output or [`ToolOutput::Done`] for no output.
+    /// Returns a value that can be converted into a final [`ToolResult`].
     ///
     /// Tools that need mutable state should use interior mutability (e.g., `Mutex`).
-    fn call(&self, arguments: Self::Arguments) -> impl Future<Output = Result<ToolOutput>> + Send;
+    fn call(&self, arguments: Self::Arguments) -> impl Future<Output = Result<Self::Res>> + Send;
 }
 
 /// Utility to convert a serializable value to a pretty-printed JSON string.
@@ -348,27 +668,39 @@ pub trait Tool: Send + Sync {
 /// println!("{}", json_str);
 /// ```
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics when converting the input value into JSON fails.
-#[must_use]
-pub fn json<T: Serialize>(value: &T) -> String {
-    let value = serde_json::to_value(value).expect("Failed to convert value to JSON");
+/// Returns an error if the value cannot be serialized to JSON, which happens
+/// for types such as maps with non-string keys.
+pub fn json<T: Serialize>(value: &T) -> Result<String> {
+    let value = serde_json::to_value(value)?;
 
-    value
+    Ok(value
         .as_str()
-        .map_or_else(|| format!("{value:#}"), ToString::to_string)
+        .map_or_else(|| format!("{value:#}"), ToString::to_string))
 }
 
 trait ToolImpl: Send + Sync + Any {
-    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + '_>>;
-    fn definition(&self) -> ToolDefinition;
+    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>>;
+
+    /// The cached definition. Borrowed, so registering a tool does not have to
+    /// clone its argument schema.
+    fn definition(&self) -> &ToolDefinition;
+
+    /// Upcast to [`Any`] so [`Tools::get`] can recover the concrete tool.
+    ///
+    /// Casting the `Box<dyn ToolImpl>` itself would downcast the box rather
+    /// than the tool inside it, and so never match.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Mutable counterpart of [`Self::as_any`].
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// Dynamic tool implementation for type-erased tools.
 struct DynToolImpl<F>
 where
-    F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send>> + Send + Sync,
+    F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>> + Send + Sync,
 {
     definition: ToolDefinition,
     handler: F,
@@ -376,21 +708,28 @@ where
 
 impl<F> ToolImpl for DynToolImpl<F>
 where
-    F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send>> + Send + Sync + 'static,
+    F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>> + Send + Sync + 'static,
 {
-    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + '_>> {
+    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>> {
         (self.handler)(args)
     }
 
-    fn definition(&self) -> ToolDefinition {
-        self.definition.clone()
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
-fn is_object<T: JsonSchema>() -> bool {
-    let schema = schema_for!(T);
-    let value: Value = schema.to_value();
-
+/// Whether a schema describes a JSON object, and so can be sent to a provider
+/// as tool arguments without being wrapped in [`ToolArgument`].
+fn schema_is_object(value: &Value) -> bool {
     matches!(value.get("type").and_then(Value::as_str), Some("object"))
         || value.get("properties").is_some()
         || value.get("oneOf").is_some()
@@ -398,22 +737,68 @@ fn is_object<T: JsonSchema>() -> bool {
         || value.get("$defs").is_some()
 }
 
-impl<T: Tool + 'static> ToolImpl for T {
-    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send + '_>> {
-        let is_object = is_object::<T::Arguments>();
+fn is_object<T: JsonSchema>() -> bool {
+    schema_is_object(&schema_for!(T).to_value())
+}
 
-        let result = if is_object {
+/// Builds the argument schema for a tool, wrapping scalars so the root is
+/// always an object as providers require.
+fn arguments_schema<T: JsonSchema>() -> Schema {
+    if is_object::<T>() {
+        schema_for!(T)
+    } else {
+        schema_for!(ToolArgument<T>)
+    }
+}
+
+/// Reads the `description` a `JsonSchema` derive records from a type's rustdoc.
+fn description_from_schema<T: JsonSchema>() -> Option<Cow<'static, str>> {
+    schema_for!(T)
+        .to_value()
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| Cow::Owned(text.to_string()))
+}
+
+/// A registered tool together with everything derived from its type.
+///
+/// The argument schema and the "are these arguments an object?" decision are
+/// properties of `T::Arguments` alone, so they are computed once here rather
+/// than rebuilt on every invocation.
+struct RegisteredTool<T: Tool> {
+    tool: T,
+    definition: ToolDefinition,
+    args_are_object: bool,
+}
+
+impl<T: Tool> RegisteredTool<T> {
+    fn new(tool: T) -> Self {
+        let definition = ToolDefinition::new(&tool);
+        let args_are_object = is_object::<T::Arguments>();
+        Self {
+            tool,
+            definition,
+            args_are_object,
+        }
+    }
+}
+
+impl<T: Tool + 'static> ToolImpl for RegisteredTool<T> {
+    fn call(&self, args: &str) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send + '_>> {
+        let result = if self.args_are_object {
             serde_json::from_str::<T::Arguments>(args)
         } else {
             serde_json::from_str::<ToolArgument<T::Arguments>>(args).map(|wrapper| wrapper.value)
         };
 
         let Ok(arguments) = result else {
-            let name = self.name();
-            let mut schema = schema_for!(T::Arguments).to_value();
-            clean_schema(&mut schema);
+            // Cold path: spelling the schema out for the model is worth the
+            // allocation only when it has actually got the call wrong.
+            let name = self.definition.name().to_string();
             let schema_str =
-                serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".to_string());
+                serde_json::to_string_pretty(&self.definition.arguments_openai_schema())
+                    .unwrap_or_else(|_| "{}".to_string());
             return Box::pin(async move {
                 Err(anyhow::Error::msg(format!(
                     "Invalid arguments for tool '{name}'. Expected schema:\n{schema_str}"
@@ -421,13 +806,83 @@ impl<T: Tool + 'static> ToolImpl for T {
             });
         };
 
-        Box::pin(async move { Tool::call(self, arguments).await })
+        Box::pin(async move { Tool::call(&self.tool, arguments).await?.into_tool_result() })
     }
 
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition::new(self)
+    fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        &self.tool
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        &mut self.tool
     }
 }
+
+/// A tool definition carried something that is not a JSON schema.
+///
+/// JSON Schema allows an object or a bare boolean; anything else — a string, an
+/// array, a number — describes nothing a model could fill in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidSchema {
+    /// The tool whose schema was rejected.
+    name: Cow<'static, str>,
+}
+
+impl InvalidSchema {
+    /// The name of the tool whose schema was rejected.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Display for InvalidSchema {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "tool '{}' has an argument schema that is neither an object nor a boolean",
+            self.name
+        )
+    }
+}
+
+impl core::error::Error for InvalidSchema {}
+
+/// Why a tool could not be added to a [`Tools`] registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegisterError {
+    /// A tool with this name is already registered.
+    ///
+    /// Names address tools in a model's tool-call, so they must be unique.
+    DuplicateName(Cow<'static, str>),
+
+    /// The tool's description is empty.
+    ///
+    /// A description is what a model uses to decide whether to call a tool, so
+    /// an empty one makes the tool unusable rather than merely undocumented.
+    EmptyDescription(Cow<'static, str>),
+}
+
+impl Display for RegisterError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::DuplicateName(name) => {
+                write!(f, "a tool named '{name}' is already registered")
+            }
+            Self::EmptyDescription(name) => write!(
+                f,
+                "tool '{name}' has an empty description; add a rustdoc comment to its \
+                 Arguments type or implement Tool::description"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for RegisterError {}
 
 /// Tool registry for managing and calling tools by name.
 ///
@@ -471,30 +926,14 @@ pub struct ToolDefinition {
 impl ToolDefinition {
     /// Creates a tool definition for a given tool type.
     ///
-    /// The description is extracted from the Arguments struct's rustdoc comment
-    /// (via `schemars::JsonSchema`). Falls back to `Tool::description()` if no
-    /// rustdoc is present on the Args struct.
+    /// The description comes from [`Tool::description`], which by default reads
+    /// the rustdoc on the tool's `Arguments` type.
     #[must_use]
     pub fn new<T: Tool>(tool: &T) -> Self {
-        let arguments = if is_object::<T::Arguments>() {
-            schema_for!(T::Arguments)
-        } else {
-            schema_for!(ToolArgument<T::Arguments>)
-        };
-
-        // Extract description from schema (rustdoc on Args struct)
-        let description = arguments
-            .clone()
-            .to_value()
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(|s| Cow::Owned(s.to_string()))
-            .unwrap_or_default();
-
         Self {
             name: tool.name(),
-            description,
-            arguments,
+            description: tool.description(),
+            arguments: arguments_schema::<T::Arguments>(),
         }
     }
 
@@ -502,24 +941,26 @@ impl ToolDefinition {
     ///
     /// This is useful for creating definitions from external sources like MCP servers.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the schema value is not a valid JSON schema (must be object or bool).
-    #[must_use]
+    /// Returns [`InvalidSchema`] if the value is not a JSON schema — that is,
+    /// anything other than an object or a boolean. The schema often comes from
+    /// a remote server, so this is a rejection to report, not a bug to panic
+    /// on.
     pub fn from_parts(
         name: Cow<'static, str>,
         description: Cow<'static, str>,
         schema: Value,
-    ) -> Self {
+    ) -> core::result::Result<Self, InvalidSchema> {
         let arguments: Schema = schema
             .try_into()
-            .expect("Schema must be a JSON object or boolean");
+            .map_err(|_| InvalidSchema { name: name.clone() })?;
 
-        Self {
+        Ok(Self {
             name,
             description,
             arguments,
-        }
+        })
     }
 
     /// Returns the tool's name.
@@ -573,10 +1014,10 @@ fn clean_schema(value: &mut Value) {
 
 /// Extracts `$defs` or `definitions` from the root schema.
 fn extract_defs(value: &Value) -> serde_json::Map<String, Value> {
-    if let Value::Object(map) = value {
-        if let Some(Value::Object(defs)) = map.get("$defs").or_else(|| map.get("definitions")) {
-            return defs.clone();
-        }
+    if let Value::Object(map) = value
+        && let Some(Value::Object(defs)) = map.get("$defs").or_else(|| map.get("definitions"))
+    {
+        return defs.clone();
     }
     serde_json::Map::new()
 }
@@ -597,18 +1038,18 @@ fn resolve_and_clean_inner(
     match value {
         Value::Object(map) => {
             // Handle $ref - inline the referenced definition, preserving sibling properties
-            if let Some(Value::String(ref_path)) = map.remove("$ref") {
-                if let Some(Value::Object(resolved_map)) = resolve_ref(&ref_path, defs) {
-                    // Merge resolved definition with any existing properties (like description)
-                    // Resolved definition takes precedence for conflicts except description
-                    let existing_description = map.remove("description");
-                    for (k, v) in resolved_map {
-                        map.entry(k).or_insert(v);
-                    }
-                    // Preserve the field-level description if it exists
-                    if let Some(desc) = existing_description {
-                        map.insert("description".to_string(), desc);
-                    }
+            if let Some(Value::String(ref_path)) = map.remove("$ref")
+                && let Some(Value::Object(resolved_map)) = resolve_ref(&ref_path, defs)
+            {
+                // Merge resolved definition with any existing properties (like description)
+                // Resolved definition takes precedence for conflicts except description
+                let existing_description = map.remove("description");
+                for (k, v) in resolved_map {
+                    map.entry(k).or_insert(v);
+                }
+                // Preserve the field-level description if it exists
+                if let Some(desc) = existing_description {
+                    map.insert("description".to_string(), desc);
                 }
             }
 
@@ -638,10 +1079,10 @@ fn resolve_and_clean_inner(
 
                     for variant in &variants {
                         if let Value::Object(vm) = variant {
-                            if let Some(const_val) = vm.get("const") {
-                                if !enum_values.contains(const_val) {
-                                    enum_values.push(const_val.clone());
-                                }
+                            if let Some(const_val) = vm.get("const")
+                                && !enum_values.contains(const_val)
+                            {
+                                enum_values.push(const_val.clone());
                             }
                             if let Some(Value::Array(arr)) = vm.get("enum") {
                                 for val in arr {
@@ -650,10 +1091,10 @@ fn resolve_and_clean_inner(
                                     }
                                 }
                             }
-                            if variant_type.is_none() {
-                                if let Some(Value::String(t)) = vm.get("type") {
-                                    variant_type = Some(t.clone());
-                                }
+                            if variant_type.is_none()
+                                && let Some(Value::String(t)) = vm.get("type")
+                            {
+                                variant_type = Some(t.clone());
                             }
                         }
                     }
@@ -669,53 +1110,50 @@ fn resolve_and_clean_inner(
                     let mut all_properties = serde_json::Map::new();
 
                     for variant in variants {
-                        if let Value::Object(variant_map) = variant {
-                            if let Some(Value::Object(props)) = variant_map.get("properties") {
-                                for (key, val) in props {
-                                    // Extract enum value - handle both "enum" and "const"
-                                    let new_values: Option<alloc::vec::Vec<Value>> =
-                                        if let Value::Object(val_obj) = val {
-                                            if let Some(Value::Array(arr)) = val_obj.get("enum") {
-                                                Some(arr.clone())
-                                            } else if let Some(const_val) = val_obj.get("const") {
-                                                Some(alloc::vec![const_val.clone()])
-                                            } else {
-                                                None
-                                            }
+                        if let Value::Object(variant_map) = variant
+                            && let Some(Value::Object(props)) = variant_map.get("properties")
+                        {
+                            for (key, val) in props {
+                                // Extract enum value - handle both "enum" and "const"
+                                let new_values: Option<alloc::vec::Vec<Value>> =
+                                    if let Value::Object(val_obj) = val {
+                                        if let Some(Value::Array(arr)) = val_obj.get("enum") {
+                                            Some(arr.clone())
                                         } else {
-                                            None
-                                        };
-
-                                    if all_properties.contains_key(key) {
-                                        // Merge enum/const values into existing
-                                        if let Some(values) = new_values {
-                                            if let Some(Value::Object(existing_obj)) =
-                                                all_properties.get_mut(key)
-                                            {
-                                                if let Some(Value::Array(existing_enum)) =
-                                                    existing_obj.get_mut("enum")
-                                                {
-                                                    for e in values {
-                                                        if !existing_enum.contains(&e) {
-                                                            existing_enum.push(e);
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                            val_obj
+                                                .get("const")
+                                                .map(|const_val| alloc::vec![const_val.clone()])
                                         }
                                     } else {
-                                        // First time seeing this property - convert const to enum
-                                        let mut val_clone = val.clone();
-                                        if let Value::Object(obj) = &mut val_clone {
-                                            if let Some(const_val) = obj.remove("const") {
-                                                obj.insert(
-                                                    "enum".to_string(),
-                                                    Value::Array(alloc::vec![const_val]),
-                                                );
+                                        None
+                                    };
+
+                                if all_properties.contains_key(key) {
+                                    // Merge enum/const values into existing
+                                    if let Some(values) = new_values
+                                        && let Some(Value::Object(existing_obj)) =
+                                            all_properties.get_mut(key)
+                                        && let Some(Value::Array(existing_enum)) =
+                                            existing_obj.get_mut("enum")
+                                    {
+                                        for e in values {
+                                            if !existing_enum.contains(&e) {
+                                                existing_enum.push(e);
                                             }
                                         }
-                                        all_properties.insert(key.clone(), val_clone);
                                     }
+                                } else {
+                                    // First time seeing this property - convert const to enum
+                                    let mut val_clone = val.clone();
+                                    if let Value::Object(obj) = &mut val_clone
+                                        && let Some(const_val) = obj.remove("const")
+                                    {
+                                        obj.insert(
+                                            "enum".to_string(),
+                                            Value::Array(alloc::vec![const_val]),
+                                        );
+                                    }
+                                    all_properties.insert(key.clone(), val_clone);
                                 }
                             }
                         }
@@ -807,7 +1245,7 @@ impl Tools {
     {
         self.tools
             .values()
-            .find_map(|tool| (tool as &dyn Any).downcast_ref::<T>())
+            .find_map(|tool| tool.as_any().downcast_ref::<T>())
     }
 
     /// Retrieves a mutable reference to a tool by type.
@@ -820,61 +1258,70 @@ impl Tools {
     {
         self.tools
             .values_mut()
-            .find_map(|tool| (tool as &mut dyn Any).downcast_mut::<T>())
+            .find_map(|tool| tool.as_any_mut().downcast_mut::<T>())
     }
 
     /// Returns definitions of all registered tools.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.values().map(|tool| tool.definition()).collect()
+        self.tools
+            .values()
+            .map(|tool| tool.definition().clone())
+            .collect()
     }
 
-    /// Registers a new tool. Replaces existing tool with same name.
+    /// Registers a new tool.
     ///
     /// The tool must implement [`Tool`] and be `'static`.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if a tool with the same name is already registered.
-    pub fn register<T: Tool + 'static>(&mut self, tool: T) {
-        let name = tool.name();
-        // Check if conflict exists
-        assert!(
-            !self.tools.contains_key(&name),
-            "Tool with name '{name}' is already registered"
-        );
-
-        self.tools.insert(name, Box::new(tool) as Box<dyn ToolImpl>);
+    /// Returns [`RegisterError::DuplicateName`] if a tool of that name is
+    /// already registered, or [`RegisterError::EmptyDescription`] if the tool
+    /// has no description — a model cannot use a tool it cannot read about, so
+    /// this is rejected rather than silently passed on.
+    pub fn register<T: Tool + 'static>(
+        &mut self,
+        tool: T,
+    ) -> core::result::Result<(), RegisterError> {
+        self.insert(Box::new(RegisteredTool::new(tool)))
     }
 
     /// Registers a dynamic tool with a pre-made definition and handler.
     ///
-    /// This is useful for type-erased tools (e.g., child bash tools for subagents)
+    /// This is useful for type-erased tools (e.g., child terminal tools for subagents)
     /// where the concrete type isn't known at compile time.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if a tool with the same name is already registered.
-    pub fn register_dyn<F>(&mut self, definition: ToolDefinition, handler: F)
+    /// Same conditions as [`Self::register`].
+    pub fn register_dyn<F>(
+        &mut self,
+        definition: ToolDefinition,
+        handler: F,
+    ) -> core::result::Result<(), RegisterError>
     where
-        F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolOutput>> + Send>>
+        F: Fn(&str) -> Pin<Box<dyn Future<Output = Result<ToolResult>> + Send>>
             + Send
             + Sync
             + 'static,
     {
-        let name = definition.name.clone();
-        assert!(
-            !self.tools.contains_key(&name),
-            "Tool with name '{name}' is already registered"
-        );
+        self.insert(Box::new(DynToolImpl {
+            definition,
+            handler,
+        }))
+    }
 
-        self.tools.insert(
-            name,
-            Box::new(DynToolImpl {
-                definition,
-                handler,
-            }),
-        );
+    fn insert(&mut self, tool: Box<dyn ToolImpl>) -> core::result::Result<(), RegisterError> {
+        let name = tool.definition().name.clone();
+        if self.tools.contains_key(&name) {
+            return Err(RegisterError::DuplicateName(name));
+        }
+        if tool.definition().description().trim().is_empty() {
+            return Err(RegisterError::EmptyDescription(name));
+        }
+        self.tools.insert(name, tool);
+        Ok(())
     }
 
     /// Removes a tool from the registry.
@@ -888,7 +1335,7 @@ impl Tools {
     ///
     /// Returns an error if the tool is not found, arguments cannot be parsed,
     /// or tool execution fails.
-    pub async fn call(&self, name: &str, args: &str) -> Result<ToolOutput> {
+    pub async fn call(&self, name: &str, args: &str) -> Result<ToolResult> {
         if let Some(tool) = self.tools.get(name) {
             tool.call(args).await
         } else {
@@ -900,9 +1347,9 @@ impl Tools {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{format, string::ToString};
+    use alloc::{format, string::ToString, vec};
     use schemars::JsonSchema;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
 
     /// Performs basic mathematical operations.
     #[derive(JsonSchema, Deserialize, Debug, PartialEq)]
@@ -919,24 +1366,25 @@ mod tests {
             "calculator".into()
         }
         type Arguments = CalculatorArgs;
+        type Res = ToolResult;
 
-        async fn call(&self, args: Self::Arguments) -> Result<ToolOutput> {
-            match args.operation.as_str() {
-                "add" => Ok(ToolOutput::text((args.a + args.b).to_string())),
-                "subtract" => Ok(ToolOutput::text((args.a - args.b).to_string())),
-                "multiply" => Ok(ToolOutput::text((args.a * args.b).to_string())),
+        fn call(&self, args: Self::Arguments) -> impl Future<Output = Result<Self::Res>> + Send {
+            core::future::ready(match args.operation.as_str() {
+                "add" => Ok(ToolResult::text((args.a + args.b).to_string())),
+                "subtract" => Ok(ToolResult::text((args.a - args.b).to_string())),
+                "multiply" => Ok(ToolResult::text((args.a * args.b).to_string())),
                 "divide" => {
                     if args.b == 0.0 {
                         Err(anyhow::Error::msg("Division by zero"))
                     } else {
-                        Ok(ToolOutput::text((args.a / args.b).to_string()))
+                        Ok(ToolResult::text((args.a / args.b).to_string()))
                     }
                 }
                 _ => Err(anyhow::Error::msg(format!(
                     "Unknown operation: {}",
                     args.operation
                 ))),
-            }
+            })
         }
     }
 
@@ -953,9 +1401,43 @@ mod tests {
             "greeter".into()
         }
         type Arguments = GreetArgs;
+        type Res = ToolResult;
 
-        async fn call(&self, args: Self::Arguments) -> Result<ToolOutput> {
-            Ok(ToolOutput::text(format!("Hello, {}!", args.name)))
+        fn call(&self, args: Self::Arguments) -> impl Future<Output = Result<Self::Res>> + Send {
+            core::future::ready(Ok(ToolResult::text(format!("Hello, {}!", args.name))))
+        }
+    }
+
+    #[test]
+    fn from_parts_accepts_object_and_boolean_schemas() {
+        // JSON Schema allows a bare boolean as well as an object.
+        for schema in [
+            serde_json::json!({"type": "object"}),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                ToolDefinition::from_parts("t".into(), "does a thing".into(), schema.clone())
+                    .is_ok(),
+                "{schema} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn from_parts_rejects_non_schema_values() {
+        // A server that sends any of these describes nothing a model could
+        // fill in. Rejecting must not panic: the value came off the wire.
+        for schema in [
+            serde_json::json!("a string"),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!(7),
+            serde_json::json!(null),
+        ] {
+            let result = ToolDefinition::from_parts("weird".into(), "d".into(), schema.clone());
+            let Err(err) = result else {
+                panic!("{schema} should be rejected");
+            };
+            assert_eq!(err.name(), "weird");
         }
     }
 
@@ -966,7 +1448,7 @@ mod tests {
             "value": 42
         });
 
-        let json_str = json(&value);
+        let json_str = json(&value).expect("a JSON value always serializes");
         assert!(json_str.contains("\"name\": \"test\""));
         assert!(json_str.contains("\"value\": 42"));
     }
@@ -1000,7 +1482,7 @@ mod tests {
     #[tokio::test]
     async fn tools_register_and_call() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
+        tools.register(Calculator).expect("calculator registers");
 
         let definitions = tools.definitions();
         assert_eq!(definitions.len(), 1);
@@ -1010,19 +1492,19 @@ mod tests {
             .call("calculator", r#"{"operation": "add", "a": 5, "b": 3}"#)
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().as_str(), Some("8"));
+        assert_eq!(result.unwrap().as_text(), Some("8"));
     }
 
     #[tokio::test]
     async fn calculator_operations() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
+        tools.register(Calculator).expect("calculator registers");
 
         // Test addition
         let result = tools
             .call("calculator", r#"{"operation": "add", "a": 10, "b": 5}"#)
             .await;
-        assert_eq!(result.unwrap().as_str(), Some("15"));
+        assert_eq!(result.unwrap().as_text(), Some("15"));
 
         // Test subtraction
         let result = tools
@@ -1031,25 +1513,25 @@ mod tests {
                 r#"{"operation": "subtract", "a": 10, "b": 3}"#,
             )
             .await;
-        assert_eq!(result.unwrap().as_str(), Some("7"));
+        assert_eq!(result.unwrap().as_text(), Some("7"));
 
         // Test multiplication
         let result = tools
             .call("calculator", r#"{"operation": "multiply", "a": 4, "b": 3}"#)
             .await;
-        assert_eq!(result.unwrap().as_str(), Some("12"));
+        assert_eq!(result.unwrap().as_text(), Some("12"));
 
         // Test division
         let result = tools
             .call("calculator", r#"{"operation": "divide", "a": 15, "b": 3}"#)
             .await;
-        assert_eq!(result.unwrap().as_str(), Some("5"));
+        assert_eq!(result.unwrap().as_text(), Some("5"));
     }
 
     #[tokio::test]
     async fn calculator_division_by_zero() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
+        tools.register(Calculator).expect("calculator registers");
 
         let result = tools
             .call("calculator", r#"{"operation": "divide", "a": 10, "b": 0}"#)
@@ -1061,7 +1543,7 @@ mod tests {
     #[tokio::test]
     async fn calculator_unknown_operation() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
+        tools.register(Calculator).expect("calculator registers");
 
         let result = tools
             .call("calculator", r#"{"operation": "modulo", "a": 10, "b": 3}"#)
@@ -1078,8 +1560,8 @@ mod tests {
     #[tokio::test]
     async fn multiple_tools() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
-        tools.register(Greeter);
+        tools.register(Calculator).expect("calculator registers");
+        tools.register(Greeter).expect("greeter registers");
 
         let definitions = tools.definitions();
         assert_eq!(definitions.len(), 2);
@@ -1098,10 +1580,134 @@ mod tests {
         let calc_result = tools
             .call("calculator", r#"{"operation": "add", "a": 2, "b": 3}"#)
             .await;
-        assert_eq!(calc_result.unwrap().as_str(), Some("5"));
+        assert_eq!(calc_result.unwrap().as_text(), Some("5"));
 
         let greet_result = tools.call("greeter", r#"{"name": "Alice"}"#).await;
-        assert_eq!(greet_result.unwrap().as_str(), Some("Hello, Alice!"));
+        assert_eq!(greet_result.unwrap().as_text(), Some("Hello, Alice!"));
+    }
+
+    #[derive(Debug, Serialize)]
+    struct TableRow {
+        name: &'static str,
+        count: u32,
+    }
+
+    #[derive(Debug, Serialize)]
+    struct NestedTableRow {
+        user: TableRow,
+        ok: bool,
+    }
+
+    #[derive(Debug)]
+    struct ToolFailure(&'static str);
+
+    impl core::fmt::Display for ToolFailure {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl core::error::Error for ToolFailure {}
+
+    #[test]
+    fn into_tool_result_string_is_plain_text() {
+        assert_eq!(
+            String::from("hello").into_tool_result().unwrap(),
+            ToolResult::text("hello")
+        );
+    }
+
+    #[test]
+    fn into_tool_result_str_is_plain_text() {
+        assert_eq!(
+            "hello".into_tool_result().unwrap(),
+            ToolResult::text("hello")
+        );
+    }
+
+    #[test]
+    fn into_tool_result_option_none_is_done() {
+        let result = Option::<String>::None.into_tool_result().unwrap();
+        assert_eq!(result, ToolResult::Done);
+    }
+
+    #[test]
+    fn into_tool_result_option_some_delegates() {
+        let result = Some("hello").into_tool_result().unwrap();
+        assert_eq!(result, ToolResult::text("hello"));
+    }
+
+    #[test]
+    fn into_tool_result_result_ok_string_is_text() {
+        let result = core::result::Result::<String, ToolFailure>::Ok(String::from("hello"))
+            .into_tool_result()
+            .unwrap();
+        assert_eq!(result, ToolResult::text("hello"));
+    }
+
+    #[test]
+    fn into_tool_result_result_ok_object_is_tsv() {
+        let result = core::result::Result::<TableRow, ToolFailure>::Ok(TableRow {
+            name: "alpha",
+            count: 3,
+        })
+        .into_tool_result()
+        .unwrap();
+
+        assert_eq!(result, ToolResult::tsv("count\tname\n3\talpha\n"));
+    }
+
+    #[test]
+    fn into_tool_result_result_ok_array_of_objects_is_tsv() {
+        let result = core::result::Result::<Vec<TableRow>, ToolFailure>::Ok(vec![
+            TableRow {
+                name: "alpha",
+                count: 3,
+            },
+            TableRow {
+                name: "beta",
+                count: 5,
+            },
+        ])
+        .into_tool_result()
+        .unwrap();
+
+        assert_eq!(result, ToolResult::tsv("count\tname\n3\talpha\n5\tbeta\n"));
+    }
+
+    #[test]
+    fn into_tool_result_result_ok_scalar_is_json() {
+        let result = core::result::Result::<bool, ToolFailure>::Ok(true)
+            .into_tool_result()
+            .unwrap();
+        assert_eq!(result, ToolResult::json_value(Value::Bool(true)));
+    }
+
+    #[test]
+    fn into_tool_result_result_err_is_typed_error() {
+        let result = core::result::Result::<TableRow, ToolFailure>::Err(ToolFailure("boom"))
+            .into_tool_result()
+            .unwrap();
+        assert_eq!(result, ToolResult::error("boom"));
+        assert!(result.is_error());
+        assert_eq!(result.error_message(), Some("boom"));
+    }
+
+    #[test]
+    fn json_value_to_tsv_flattens_nested_objects() {
+        let value = serde_json::to_value(NestedTableRow {
+            user: TableRow {
+                name: "alpha",
+                count: 3,
+            },
+            ok: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            json_value_to_tsv(&value),
+            Some("ok\tuser.count\tuser.name\ntrue\t3\talpha\n".to_string())
+        );
     }
 
     #[tokio::test]
@@ -1121,7 +1727,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_json() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
+        tools.register(Calculator).expect("calculator registers");
 
         let result = tools.call("calculator", "invalid json").await;
         assert!(result.is_err());
@@ -1130,8 +1736,8 @@ mod tests {
     #[test]
     fn tools_unregister() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
-        tools.register(Greeter);
+        tools.register(Calculator).expect("calculator registers");
+        tools.register(Greeter).expect("greeter registers");
 
         assert_eq!(tools.definitions().len(), 2);
 
@@ -1148,8 +1754,8 @@ mod tests {
     #[test]
     fn tools_debug() {
         let mut tools = Tools::new();
-        tools.register(Calculator);
-        tools.register(Greeter);
+        tools.register(Calculator).expect("calculator registers");
+        tools.register(Greeter).expect("greeter registers");
 
         let debug_str = format!("{tools:?}");
         assert!(debug_str.contains("Tools"));
@@ -1207,9 +1813,13 @@ mod tests {
                 "test".into()
             }
             type Arguments = Args;
+            type Res = ToolResult;
 
-            async fn call(&self, _args: Self::Arguments) -> Result<ToolOutput> {
-                Ok(ToolOutput::text("ok"))
+            fn call(
+                &self,
+                _args: Self::Arguments,
+            ) -> impl Future<Output = Result<Self::Res>> + Send {
+                core::future::ready(Ok(ToolResult::text("ok")))
             }
         }
 

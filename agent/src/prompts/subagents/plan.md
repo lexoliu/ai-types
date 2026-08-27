@@ -1,4 +1,5 @@
 ---
+version: 1
 name: plan
 description: Plans implementation strategies for complex tasks. Use when you need to design architecture, break down work into steps, or create actionable implementation plans.
 ---

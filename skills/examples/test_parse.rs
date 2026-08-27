@@ -1,9 +1,9 @@
 #![allow(missing_docs)]
 
 use aither_skills::{Skill, SkillLoader};
-use futures_lite::future::block_on;
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     // Test parsing the skill file directly
     let content = std::fs::read_to_string("./outputs/slide/SKILL.md").unwrap();
     println!(
@@ -23,7 +23,7 @@ fn main() {
     // Test loader
     println!("\nTesting loader...");
     let loader = SkillLoader::new().add_path("./outputs");
-    match block_on(loader.load_all()) {
+    match loader.load_all().await {
         Ok(skills) => {
             println!("Loaded {} skills", skills.len());
             for skill in skills {

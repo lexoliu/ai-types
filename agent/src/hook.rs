@@ -24,6 +24,10 @@
 
 use std::time::Duration;
 
+use aither_core::llm::ToolResult;
+
+use crate::{ContextCheckpoint, TodoItem, context_window::ContextWindowSnapshot};
+
 /// Context provided to hooks before a tool is called.
 #[derive(Debug)]
 pub struct ToolUseContext<'a> {
@@ -44,8 +48,8 @@ pub struct ToolResultContext<'a> {
     pub tool_name: &'a str,
     /// JSON-encoded arguments that were passed.
     pub arguments: &'a str,
-    /// Result of the tool execution.
-    pub result: Result<&'a str, &'a str>,
+    /// Structured result of the tool execution.
+    pub result: &'a ToolResult,
     /// Time taken to execute the tool.
     pub duration: Duration,
 }
@@ -59,6 +63,53 @@ pub struct StopContext<'a> {
     pub turns: usize,
     /// Reason for stopping.
     pub reason: StopReason,
+}
+
+/// Context provided to hooks at a safe iteration boundary.
+///
+/// This boundary happens after the agent has fully processed the last batch of
+/// tool results and updated its internal context, but before it starts the next
+/// model request.
+#[derive(Debug)]
+pub struct TurnBoundaryContext<'a> {
+    /// Assistant text produced before the last tool batch.
+    pub assistant_text: &'a str,
+    /// Current turn number (1-indexed within the agent loop).
+    pub turn: usize,
+    /// Number of recent conversation messages after processing the tool batch.
+    pub message_count: usize,
+}
+
+/// Reason why a checkpoint is being emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointReason {
+    /// A full tool/result cycle was committed and the next model request has not started yet.
+    TurnBoundary,
+    /// The run is about to stop with the current context state.
+    Stop,
+}
+
+/// Structured checkpoint payload emitted from the runtime.
+#[derive(Debug)]
+pub struct CheckpointContext<'a> {
+    /// Why this checkpoint was emitted.
+    pub reason: CheckpointReason,
+    /// Assistant text produced in the current turn before this checkpoint.
+    pub assistant_text: &'a str,
+    /// Current turn number (1-indexed within the agent loop).
+    pub turn: usize,
+    /// Number of recent conversation messages currently in memory.
+    pub message_count: usize,
+    /// Structured runtime context after the latest turn mutations.
+    pub context: &'a ContextCheckpoint,
+    /// Current todo list state.
+    pub todo_items: &'a [TodoItem],
+    /// Hash of the currently exposed tool surface.
+    pub tool_surface_hash: &'a str,
+    /// Whether background work is still active.
+    pub has_background_tasks: bool,
+    /// Structured snapshot of the currently assembled context window.
+    pub window: &'a ContextWindowSnapshot,
 }
 
 /// Reason why the agent stopped.
@@ -91,9 +142,18 @@ pub enum PostToolAction {
     /// Keep the original tool result.
     Keep,
     /// Replace the tool result with a custom value.
-    Replace(String),
+    Replace(ToolResult),
     /// Abort the agent run entirely with an error.
     Abort(String),
+}
+
+/// Action to take at a safe turn boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnBoundaryAction {
+    /// Continue with the next model request.
+    Continue,
+    /// End the current run cleanly after the processed tool batch.
+    EndTurn,
 }
 
 /// Trait for intercepting agent operations.
@@ -141,6 +201,25 @@ pub trait Hook: Send + Sync {
     /// This is for observation only.
     fn on_text(&self, _text: &str) -> impl std::future::Future<Output = ()> + Send {
         async {}
+    }
+
+    /// Called after a full tool/result cycle is committed into agent memory,
+    /// before the next model request begins.
+    fn on_turn_boundary(
+        &self,
+        _ctx: &TurnBoundaryContext<'_>,
+    ) -> impl std::future::Future<Output = TurnBoundaryAction> + Send {
+        async { TurnBoundaryAction::Continue }
+    }
+
+    /// Called when the runtime emits a structured checkpoint.
+    ///
+    /// Return `Some(error)` to fail the run immediately.
+    fn on_checkpoint(
+        &self,
+        _ctx: &CheckpointContext<'_>,
+    ) -> impl std::future::Future<Output = Option<String>> + Send {
+        async { None }
     }
 }
 
@@ -206,6 +285,20 @@ where
         self.head.on_text(text).await;
         self.tail.on_text(text).await;
     }
+
+    async fn on_turn_boundary(&self, ctx: &TurnBoundaryContext<'_>) -> TurnBoundaryAction {
+        match self.head.on_turn_boundary(ctx).await {
+            TurnBoundaryAction::Continue => self.tail.on_turn_boundary(ctx).await,
+            other @ TurnBoundaryAction::EndTurn => other,
+        }
+    }
+
+    async fn on_checkpoint(&self, ctx: &CheckpointContext<'_>) -> Option<String> {
+        if let Some(err) = self.head.on_checkpoint(ctx).await {
+            return Some(err);
+        }
+        self.tail.on_checkpoint(ctx).await
+    }
 }
 
 #[cfg(test)]
@@ -225,9 +318,12 @@ mod tests {
     }
 
     impl Hook for CountingHook {
-        async fn pre_tool_use(&self, _ctx: &ToolUseContext<'_>) -> PreToolAction {
+        fn pre_tool_use(
+            &self,
+            _ctx: &ToolUseContext<'_>,
+        ) -> impl std::future::Future<Output = PreToolAction> + Send {
             self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            PreToolAction::Allow
+            std::future::ready(PreToolAction::Allow)
         }
     }
 

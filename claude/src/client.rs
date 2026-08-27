@@ -19,8 +19,9 @@ use crate::{
     constant::{ANTHROPIC_VERSION, CLAUDE_BASE_URL, DEFAULT_MAX_TOKENS, DEFAULT_MODEL},
     error::ClaudeError,
     request::{
-        CacheControlPayload, MessagesRequest, ParameterSnapshot, convert_tools,
-        filter_tool_definitions, to_claude_messages, tool_choice_payload,
+        MessagesRequest, ParameterSnapshot, apply_cache_strategy, build_output_config,
+        build_thinking, convert_native_tools, convert_tools, filter_tool_definitions,
+        to_claude_messages, tool_choice_payload,
     },
     response::{StreamState, parse_event, should_skip_event},
 };
@@ -88,27 +89,47 @@ impl Claude {
 impl LanguageModel for Claude {
     type Error = ClaudeError;
 
+    #[allow(clippy::too_many_lines)]
     fn respond(
         &self,
         request: LLMRequest,
     ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
         let cfg = self.config();
         let (core_messages, parameters, tool_definitions) = request.into_parts();
-        let (system_prompt, claude_messages) = to_claude_messages(&core_messages);
         let snapshot = ParameterSnapshot::from(&parameters);
         let filtered_tool_definitions =
             filter_tool_definitions(tool_definitions, &snapshot.tool_choice);
         let missing_exact_tool = match &snapshot.tool_choice {
-            ToolChoice::Exact(name) if filtered_tool_definitions.is_empty() => Some(name.clone()),
+            ToolChoice::Exact(name)
+                if filtered_tool_definitions.is_empty()
+                    && !native_tool_name_enabled(&snapshot, name) =>
+            {
+                Some(name.clone())
+            }
             _ => None,
         };
-        let has_tools = !filtered_tool_definitions.is_empty();
-        let claude_tools = has_tools.then(|| convert_tools(&filtered_tool_definitions));
-        let claude_tool_choice = tool_choice_payload(&snapshot.tool_choice, has_tools);
+        let mut claude_tool_payloads = convert_tools(&filtered_tool_definitions);
+        claude_tool_payloads.extend(convert_native_tools(&snapshot.native_tools));
+        let has_tools = !claude_tool_payloads.is_empty();
+        let mut claude_tools = has_tools.then_some(claude_tool_payloads);
+        let claude_tool_choice = tool_choice_payload(
+            &snapshot.tool_choice,
+            has_tools,
+            snapshot.parallel_tool_calls,
+        );
 
         let max_tokens = snapshot.max_tokens.unwrap_or(cfg.default_max_tokens);
 
         async_stream::stream! {
+            let (mut system_prompt, mut claude_messages) =
+                match to_claude_messages(&core_messages).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        yield Err(ClaudeError::Api(error));
+                        return;
+                    }
+                };
+
             if parameters.cache.openai.is_some() || parameters.cache.gemini.is_some() {
                 yield Err(ClaudeError::Api(
                     "Claude provider only accepts cache.claude settings".to_string(),
@@ -123,6 +144,32 @@ impl LanguageModel for Claude {
                 return;
             }
 
+            let top_level_cache_control = if let Some(cache) = snapshot.cache {
+                match apply_cache_strategy(
+                    &mut system_prompt,
+                    &mut claude_messages,
+                    &mut claude_tools,
+                    cache,
+                ) {
+                    Ok(control) => control,
+                    Err(error) => {
+                        yield Err(ClaudeError::Api(error));
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let thinking = build_thinking(&snapshot);
+            let output_config = match build_output_config(&snapshot) {
+                Ok(config) => config,
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            };
+
             // Build and send request
             let request_body = MessagesRequest {
                 model: cfg.model.clone(),
@@ -136,7 +183,9 @@ impl LanguageModel for Claude {
                 stop_sequences: snapshot.stop_sequences.clone(),
                 tools: claude_tools,
                 tool_choice: claude_tool_choice,
-                cache_control: snapshot.cache.map(CacheControlPayload::from),
+                thinking,
+                output_config,
+                cache_control: top_level_cache_control,
             };
 
             debug!("Claude request: {:?}", request_body);
@@ -160,7 +209,6 @@ impl LanguageModel for Claude {
                     return;
                 }
             };
-
             let sse_stream = match builder.sse().await {
                 Ok(stream) => stream,
                 Err(e) => {
@@ -170,40 +218,41 @@ impl LanguageModel for Claude {
             };
             futures_lite::pin!(sse_stream);
 
-            // Process SSE events
             let mut state = StreamState::new();
 
             while let Some(event) = sse_stream.next().await {
-                match event {
-                    Ok(e) => {
-                        if should_skip_event(&e) {
-                            continue;
-                        }
-                        match parse_event(&e, &mut state) {
-                            Ok(llm_events) => {
-                                for llm_event in llm_events {
-                                    yield Ok(llm_event);
-                                }
-                            }
-                            Err(e) => {
-                                yield Err(e);
-                                return;
-                            }
+                let event = match event {
+                    Ok(event) => event,
+                    Err(e) => {
+                        yield Err(ClaudeError::from(e));
+                        return;
+                    }
+                };
+                if should_skip_event(&event) {
+                    continue;
+                }
+                match parse_event(&event, &mut state) {
+                    Ok(llm_events) => {
+                        for llm_event in llm_events {
+                            yield Ok(llm_event);
                         }
                     }
                     Err(e) => {
-                        yield Err(ClaudeError::from(e));
+                        yield Err(e);
                         return;
                     }
                 }
             }
 
-            // Yield tool call events (NOT executed - consumer handles execution)
+            // Tool calls are reported, never executed: the consumer decides.
             for call in state.tool_calls {
+                // Claude scopes thinking to the turn, not to the individual
+                // call, so the state rides on the assistant message instead.
                 yield Ok(Event::ToolCall(aither_core::llm::ToolCall {
                     id: call.id,
                     name: call.name,
                     arguments: call.input,
+                    reasoning_state: None,
                 }));
             }
 
@@ -229,7 +278,7 @@ impl LanguageModel for Claude {
                     tracing::debug!("API did not return context_length: {e}");
                     // Fallback to models database
                     aither_models::lookup(&cfg.model)
-                        .map(|info| info.context_window)
+                        .and_then(aither_models::ModelEntry::max_input_tokens)
                         .unwrap_or_else(|| {
                             panic!(
                                 "Claude model '{}' missing context metadata from provider and aither-models",
@@ -256,6 +305,26 @@ impl LanguageModel for Claude {
             profile
         }
     }
+}
+
+fn native_tool_name_enabled(snapshot: &ParameterSnapshot, name: &str) -> bool {
+    let tools = &snapshot.native_tools;
+    matches!(
+        name,
+        "web_search" if tools.web_search
+    ) || matches!(
+        name,
+        "web_fetch" if tools.web_fetch
+    ) || matches!(
+        name,
+        "code_execution" if tools.code_execution
+    ) || matches!(
+        name,
+        "bash" if tools.bash
+    ) || matches!(
+        name,
+        "str_replace_based_edit_tool" if tools.text_editor.is_some()
+    )
 }
 
 /// Try to fetch context length from the models endpoint.
@@ -295,10 +364,10 @@ async fn fetch_model_context_length(cfg: &Config) -> Result<u32, ClaudeError> {
     let response: ModelsResponse = req.json().await.map_err(ClaudeError::Http)?;
 
     for model in response.data {
-        if model.id == cfg.model {
-            if let Some(ctx) = model.context_length {
-                return Ok(ctx);
-            }
+        if model.id == cfg.model
+            && let Some(ctx) = model.context_length
+        {
+            return Ok(ctx);
         }
     }
 

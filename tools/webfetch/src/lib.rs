@@ -47,11 +47,14 @@
 //! # }
 //! ```
 
+pub mod guard;
+
 use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::io::Cursor;
 use std::time::{Duration, Instant};
 
-use aither_core::llm::{Tool, ToolOutput};
+use aither_core::llm::{Tool, ToolResult};
 use anyhow::{Result, anyhow};
 use regex::Regex;
 use schemars::JsonSchema;
@@ -460,6 +463,7 @@ pub async fn fetch(url: &str) -> Result<FetchResult> {
 /// Fetch using an explicit request object.
 pub async fn fetch_with_request(request: FetchRequest) -> Result<FetchResult> {
     ensure_rustls_provider();
+    guard::guard_url(&request.url).await?;
     let mut ctx = FetchContext::new(request.deadline);
 
     let pipeline = default_fetcher();
@@ -479,6 +483,7 @@ pub async fn fetch_with_request(request: FetchRequest) -> Result<FetchResult> {
 #[cfg(feature = "headless")]
 pub async fn fetch_with_browser(url: &str) -> Result<FetchResult> {
     ensure_rustls_provider();
+    guard::guard_url(url).await?;
     let mut ctx = FetchContext::new(DEFAULT_TOTAL_BUDGET);
     HeadlessFetcher
         .fetch(&FetchRequest::new(url), &mut ctx)
@@ -489,6 +494,7 @@ pub async fn fetch_with_browser(url: &str) -> Result<FetchResult> {
 /// Fetches raw HTML using a headless browser (for debugging).
 #[cfg(feature = "headless")]
 pub async fn fetch_html_raw(url: &str) -> Result<String> {
+    guard::guard_url(url).await?;
     fetch_html_headless(url).await
 }
 
@@ -572,8 +578,10 @@ fn html_to_result_with_metadata(
 ) -> Result<FetchResult> {
     let parsed_url = url::Url::parse(url).map_err(|e| anyhow!("Invalid URL: {e}"))?;
 
-    let mut cursor = Cursor::new(html.as_bytes());
-    let extracted = readability::extractor::extract(&mut cursor, &parsed_url)
+    let mut readability = dom_smoothie::Readability::new(html, Some(parsed_url.as_str()), None)
+        .map_err(|e| anyhow!("Content extraction failed: {e}"))?;
+    let extracted = readability
+        .parse()
         .map_err(|e| anyhow!("Content extraction failed: {e}"))?;
 
     let content = htmd::convert(&extracted.content).map_err(|e| anyhow!("{e}"))?;
@@ -594,7 +602,7 @@ fn html_to_result_with_metadata(
 
     Ok(FetchResult {
         url: url.to_string(),
-        title: Some(extracted.title),
+        title: Some(extracted.title.to_string()),
         content: final_content,
         content_type,
         markdown_tokens: None,
@@ -649,6 +657,7 @@ fn get_user_agent(url: &str) -> &'static str {
 
 /// Fetches raw bytes from a URL with browser-like headers.
 async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
+    guard::guard_url(url).await?;
     let user_agent = get_user_agent(url);
 
     let mut backend = client();
@@ -1357,8 +1366,9 @@ impl Tool for WebFetchTool {
     }
 
     type Arguments = WebFetchArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
         let WebFetchArgs {
             url,
             jina_api_key,
@@ -1367,13 +1377,13 @@ impl Tool for WebFetchTool {
 
         // Check whitelist/blacklist
         if !self.is_url_allowed(&url) {
-            return Ok(ToolOutput::text(format!("URL not allowed: {url}")));
+            return Ok(ToolResult::text(format!("URL not allowed: {url}")));
         }
 
         // Check if URL looks like an image
         if is_image_url(&url) {
             let (jpeg_data, mime) = fetch_image(&url).await?;
-            return Ok(ToolOutput::image(jpeg_data, &mime));
+            return Ok(ToolResult::image(jpeg_data, &mime));
         }
 
         let mut request = FetchRequest::new(url.clone());
@@ -1388,26 +1398,26 @@ impl Tool for WebFetchTool {
 
         let mut output = String::new();
         if let Some(title) = &result.title {
-            output.push_str(&format!("# {title}\n\n"));
+            let _ = writeln!(output, "# {title}\n");
         }
-        output.push_str(&format!("Source: {}\n\n", result.url));
+        let _ = writeln!(output, "Source: {}\n", result.url);
         if let Some(content_type) = &result.content_type {
-            output.push_str(&format!("Content-Type: {content_type}\n"));
+            let _ = writeln!(output, "Content-Type: {content_type}");
         }
         if let Some(markdown_tokens) = result.markdown_tokens {
-            output.push_str(&format!("X-Markdown-Tokens: {markdown_tokens}\n"));
+            let _ = writeln!(output, "X-Markdown-Tokens: {markdown_tokens}");
         }
         if let Some(content_signal) = &result.content_signal {
-            output.push_str(&format!("Content-Signal: {content_signal}\n"));
+            let _ = writeln!(output, "Content-Signal: {content_signal}");
         }
         if let Some(extractor) = &result.extractor {
-            output.push_str(&format!("Extractor: {extractor}\n"));
+            let _ = writeln!(output, "Extractor: {extractor}");
         }
         if let Some(quality_score) = result.quality_score {
-            output.push_str(&format!("Quality-Score: {quality_score:.2}\n"));
+            let _ = writeln!(output, "Quality-Score: {quality_score:.2}");
         }
         if !result.warnings.is_empty() {
-            output.push_str(&format!("Warnings: {}\n", result.warnings.join(" | ")));
+            let _ = writeln!(output, "Warnings: {}", result.warnings.join(" | "));
         }
         if result.content_type.is_some()
             || result.markdown_tokens.is_some()
@@ -1420,7 +1430,7 @@ impl Tool for WebFetchTool {
         }
         output.push_str(&result.content);
 
-        Ok(ToolOutput::text(output))
+        Ok(ToolResult::text(output))
     }
 }
 
@@ -1648,6 +1658,7 @@ mod headless_tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "Requires a Chromium install and network access."]
     async fn fetch_with_browser_works() {
         let result = fetch_with_browser("https://example.com").await;
         assert!(result.is_ok(), "Headless fetch failed: {:?}", result.err());
@@ -1657,6 +1668,7 @@ mod headless_tests {
     }
 
     #[tokio::test]
+    #[ignore = "Requires network access."]
     async fn smart_fetch_works() {
         let result = fetch_smart("https://example.com").await;
         assert!(result.is_ok(), "Smart fetch failed: {:?}", result.err());

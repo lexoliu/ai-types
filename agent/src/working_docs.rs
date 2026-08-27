@@ -1,42 +1,79 @@
 //! Working document utilities for long-task execution.
 //!
-//! TODO.md and PLAN.md are regular markdown files in the sandbox that the
-//! framework treats specially by loading into context and supervising progress.
+//! `tasks.md` is a regular markdown file in the sandbox that the framework
+//! treats specially by loading into context and supervising progress.
 
 use std::path::Path;
 
 use async_fs as fs;
+use similar::{ChangeTag, TextDiff};
 
 /// Snapshot of working documents currently present in the sandbox.
 #[derive(Debug, Clone, Default)]
 pub struct WorkingDocsSnapshot {
-    pub todo_md: Option<String>,
-    pub plan_md: Option<String>,
+    /// Contents of `tasks.md`, when present.
+    pub tasks_md: Option<String>,
 }
 
 impl WorkingDocsSnapshot {
-    /// Returns true when either TODO.md or PLAN.md has unchecked markdown tasks.
+    /// Returns true when `tasks.md` has unchecked markdown tasks.
     #[must_use]
     pub fn has_unchecked_items(&self) -> bool {
-        self.todo_md
+        self.tasks_md
             .as_deref()
             .is_some_and(has_unchecked_markdown_tasks)
-            || self
-                .plan_md
-                .as_deref()
-                .is_some_and(has_unchecked_markdown_tasks)
     }
 }
 
-/// Reads TODO.md and PLAN.md from the given sandbox directory.
+/// Reads `tasks.md` from the given sandbox directory.
 pub async fn read_snapshot(sandbox_dir: &Path) -> WorkingDocsSnapshot {
-    let todo_path = sandbox_dir.join("TODO.md");
-    let plan_path = sandbox_dir.join("PLAN.md");
+    let tasks_path = sandbox_dir.join("tasks.md");
 
-    let todo_md = read_file_if_exists(&todo_path).await;
-    let plan_md = read_file_if_exists(&plan_path).await;
+    let tasks_md = read_file_if_exists(&tasks_path).await;
 
-    WorkingDocsSnapshot { todo_md, plan_md }
+    WorkingDocsSnapshot { tasks_md }
+}
+
+/// Returns a compact changed-line diff for `tasks.md` when it changed.
+#[must_use]
+pub fn tasks_md_diff(
+    previous: &WorkingDocsSnapshot,
+    current: &WorkingDocsSnapshot,
+) -> Option<String> {
+    if previous.tasks_md == current.tasks_md {
+        return None;
+    }
+
+    let diff = TextDiff::from_lines(
+        previous.tasks_md.as_deref().unwrap_or_default(),
+        current.tasks_md.as_deref().unwrap_or_default(),
+    );
+
+    let mut lines = Vec::new();
+    for change in diff.iter_all_changes() {
+        let prefix = match change.tag() {
+            ChangeTag::Delete => "- ",
+            ChangeTag::Insert => "+ ",
+            ChangeTag::Equal => continue,
+        };
+        let value = change.value().trim_end_matches('\n');
+        if value.is_empty() {
+            continue;
+        }
+        let mut line = String::from(prefix);
+        line.push_str(value);
+        lines.push(line);
+        if lines.len() == 48 {
+            lines.push("...".to_string());
+            break;
+        }
+    }
+
+    if lines.is_empty() {
+        return Some("tasks.md changed.".to_string());
+    }
+
+    Some(lines.join("\n"))
 }
 
 /// Detects unfinished markdown checklist items (`- [ ]`).

@@ -21,13 +21,14 @@ use crate::transport::{BidirectionalTransport, StdioTransport};
 /// let mut tools = Tools::new();
 /// tools.register(my_tool);
 ///
-/// let mut server = McpServer::stdio(tools, "my-server", "1.0.0")?;
+/// let mut server = McpServer::stdio(tools, "my-server", "1.0.0");
 /// server.run().await?;
 /// ```
 pub struct McpServer<T: BidirectionalTransport> {
     transport: T,
     tools: Tools,
     info: ServerInfo,
+    instructions: Option<String>,
     initialized: bool,
 }
 
@@ -51,32 +52,16 @@ impl McpServer<StdioTransport> {
     /// * `tools` - The aither tools to expose.
     /// * `name` - The server name.
     /// * `version` - The server version.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if stdio cannot be initialized.
-    pub fn stdio(
-        tools: Tools,
-        name: impl Into<String>,
-        version: impl Into<String>,
-    ) -> Result<Self, McpError> {
-        let transport = StdioTransport::new().map_err(|e| McpError::Transport(e.to_string()))?;
-        Ok(Self {
-            transport,
-            tools,
-            info: ServerInfo {
-                name: name.into(),
-                version: Some(version.into()),
-            },
-            initialized: false,
-        })
+    #[must_use]
+    pub fn stdio(tools: Tools, name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self::new(StdioTransport::new(), tools, name, version)
     }
 }
 
-impl<T: BidirectionalTransport> McpServer<T> {
+impl<T: BidirectionalTransport + Sync> McpServer<T> {
     /// Create a new MCP server with a custom transport.
     ///
-    /// For most use cases, prefer `McpServer::stdio()` instead.
+    /// For most use cases, prefer [`McpServer::stdio`] instead.
     ///
     /// # Arguments
     ///
@@ -85,7 +70,7 @@ impl<T: BidirectionalTransport> McpServer<T> {
     /// * `name` - The server name.
     /// * `version` - The server version.
     #[must_use]
-    pub(crate) fn new(
+    pub fn new(
         transport: T,
         tools: Tools,
         name: impl Into<String>,
@@ -98,8 +83,16 @@ impl<T: BidirectionalTransport> McpServer<T> {
                 name: name.into(),
                 version: Some(version.into()),
             },
+            instructions: None,
             initialized: false,
         }
+    }
+
+    /// Adds server-wide instructions returned during MCP initialization.
+    #[must_use]
+    pub fn with_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = Some(instructions.into());
+        self
     }
 
     /// Run the server main loop.
@@ -155,7 +148,7 @@ impl<T: BidirectionalTransport> McpServer<T> {
         match req.method.as_str() {
             "initialize" => self.handle_initialize(req),
             "tools/list" => self.handle_list_tools(req),
-            "tools/call" => self.handle_call_tool(req).await,
+            "tools/call" => Self::handle_call_tool(&self.tools, req).await,
             method => JsonRpcResponse::error(req.id, JsonRpcError::method_not_found(method)),
         }
     }
@@ -178,7 +171,7 @@ impl<T: BidirectionalTransport> McpServer<T> {
                 ..Default::default()
             },
             server_info: self.info.clone(),
-            instructions: None,
+            instructions: self.instructions.clone(),
         };
 
         JsonRpcResponse::success(req.id, result)
@@ -206,7 +199,10 @@ impl<T: BidirectionalTransport> McpServer<T> {
     }
 
     /// Handle tools/call request.
-    async fn handle_call_tool(&mut self, req: JsonRpcRequest) -> JsonRpcResponse {
+    ///
+    /// Takes the tool table rather than `&self` so the returned future does not
+    /// borrow the transport, which is only `Send`, and so stays `Send` itself.
+    async fn handle_call_tool(tools: &Tools, req: JsonRpcRequest) -> JsonRpcResponse {
         let params: CallToolParams = match req.params.map(serde_json::from_value).transpose() {
             Ok(Some(p)) => p,
             Ok(None) => {
@@ -222,15 +218,23 @@ impl<T: BidirectionalTransport> McpServer<T> {
 
         let args_str = serde_json::to_string(&params.arguments).unwrap_or_default();
 
-        match self.tools.call(&params.name, &args_str).await {
+        match tools.call(&params.name, &args_str).await {
             Ok(output) => {
-                let text = output.as_str().unwrap_or("").to_string();
+                let text = match output.render_for_model() {
+                    Ok(text) => text,
+                    Err(error) => {
+                        return JsonRpcResponse::error(
+                            req.id,
+                            JsonRpcError::internal_error(error.to_string()),
+                        );
+                    }
+                };
                 let result = CallToolResult {
                     content: vec![crate::protocol::Content::Text(TextContent {
                         text,
                         annotations: None,
                     })],
-                    is_error: false,
+                    is_error: output.is_error(),
                 };
                 JsonRpcResponse::success(req.id, result)
             }

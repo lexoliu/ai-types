@@ -1,21 +1,22 @@
 [package]
 name = "aither-sandbox"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Bash-based tool execution with leash sandboxing"
+description = "Terminal-first command execution with heel sandboxing"
 readme = "../README.md"
-keywords = ["sandbox", "agent", "tooling", "bash"]
+keywords = ["sandbox", "agent", "tooling", "terminal"]
 categories = ["api-bindings"]
 
 [dependencies]
 aither-core.workspace = true
 
 # Sandboxing
-leash = { path = "../../native-sandbox" }
+heel = "0.2.0"
+rmp-serde = "1"
 
 # Executor for tokio integration
 executor-core = { version = "0.7", features = ["tokio"] }
@@ -24,36 +25,52 @@ executor-core = { version = "0.7", features = ["tokio"] }
 async-fs = "2"
 async-process = "2"
 async-io = "2"
-bollard = "0.20"
+bollard = "0.21"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-schemars = "1.0"
+schemars = "1.2"
 
 # Process control (for killing background tasks)
 libc = "0.2"
 
 # Utilities
-url = "2"
+globset = "0.4"
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
 anyhow = "1"
 thiserror = "2"
-base64 = "0.22"
+base64 = "0.23"
 futures-lite = "2.6"
 async-channel = "2"
+tokio = { version = "1", features = ["io-util", "macros", "rt"] }
 strsim = "0.11.1"
 human-hash = "0.4"
+askama = "0.14"
+quick-xml = { version = "0.42", features = ["serialize"] }
+shell-words = "1.1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
-# Output compression: content detection + code folding
-magika = "1"
-tree-sitter = "0.22"
-rs-tree-sitter-languages = "0.0.2"
+# Output compression: content detection + code folding.
+# `magika` links ONNX Runtime, so it is opt-in: running bash in a sandbox
+# should not require an ML runtime to be present at link time.
+magika = { version = "1.1", optional = true }
+# Both are only referenced under `code-folding`, and building them means
+# compiling 22 tree-sitter grammars from C, so they follow the feature too.
+tree-sitter = { version = "0.22.6", optional = true }
+rs-tree-sitter-languages = { version = "0.0.2", optional = true }
+
+[features]
+default = []
+# Detect source code in command output so it can be folded with tree-sitter.
+# Pulls in ONNX Runtime via `magika`.
+code-folding = ["dep:magika", "dep:tree-sitter", "dep:rs-tree-sitter-languages"]
 
 [dev-dependencies]
+magika = { version = "1", features = ["_test"] }
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt", "rt-multi-thread"] }
 
 [lints]
 workspace = true

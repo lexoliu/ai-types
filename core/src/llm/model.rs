@@ -41,6 +41,7 @@
 
 use alloc::{string::String, vec::Vec};
 use schemars::Schema;
+use serde_json::Value;
 
 /// Parameters for configuring the behavior of a language model.
 ///
@@ -88,15 +89,16 @@ pub struct Parameters {
     /// Repetition penalty to penalize repeated tokens.
     ///
     /// Values > 1.0 discourage repetition, values < 1.0 encourage it.
+    ///
+    /// Local inference only: this maps onto a llama.cpp sampler and none of the
+    /// hosted provider APIs accept it, so setting it has no effect on them.
     pub repetition_penalty: Option<f32>,
     /// Minimum probability for nucleus sampling.
     ///
     /// Alternative to `top_p` that sets a minimum threshold for token probabilities.
-    pub min_p: Option<f32>,
-    /// Top-a sampling parameter.
     ///
-    /// Adaptive sampling that adjusts the number of considered tokens.
-    pub top_a: Option<f32>,
+    /// Local inference only, like [`Self::repetition_penalty`].
+    pub min_p: Option<f32>,
     /// Random seed for reproducibility.
     ///
     /// Use the same seed to get deterministic outputs.
@@ -126,6 +128,13 @@ pub struct Parameters {
     /// Controls whether tools are allowed, required, or constrained to a specific tool.
     pub tool_choice: ToolChoice,
 
+    /// Whether the model may request several tools in a single turn.
+    ///
+    /// `None` leaves the decision to the provider's own default. Set it only to
+    /// override that default — forcing `false` serializes an agent loop that
+    /// could otherwise fan its tool calls out concurrently.
+    pub parallel_tool_calls: Option<bool>,
+
     /// Preferred reasoning effort when supported.
     pub reasoning_effort: Option<ReasoningEffort>,
 
@@ -145,6 +154,12 @@ pub struct Parameters {
     pub websearch: bool,
     /// Whether to enable native Code Execution tool.
     pub code_execution: bool,
+    /// Provider-native tools that are not portable across API families.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "NativeTools::is_empty")
+    )]
+    pub native_tools: NativeTools,
     /// Provider-specific prompt cache controls.
     #[cfg_attr(
         feature = "serde",
@@ -185,13 +200,13 @@ impl_with_methods! {
         presence_penalty: f32,
         repetition_penalty: f32,
         min_p: f32,
-        top_a: f32,
         seed: u32,
         max_tokens: u32,
         logit_bias: Vec<(String, f32)>,
         logprobs: bool,
         top_logprobs: u8,
         stop: Vec<String>,
+        parallel_tool_calls: bool,
     }
 }
 
@@ -224,6 +239,34 @@ impl Parameters {
         self
     }
 
+    /// Sets provider-native tools.
+    #[must_use]
+    pub fn native_tools(mut self, tools: NativeTools) -> Self {
+        self.native_tools = tools;
+        self
+    }
+
+    /// Sets `OpenAI` Responses-native tools.
+    #[must_use]
+    pub fn openai_tools(mut self, tools: OpenAINativeTools) -> Self {
+        self.native_tools.openai = tools;
+        self
+    }
+
+    /// Sets Gemini-native tools.
+    #[must_use]
+    pub const fn gemini_tools(mut self, tools: GeminiNativeTools) -> Self {
+        self.native_tools.gemini = tools;
+        self
+    }
+
+    /// Sets Claude-native tools.
+    #[must_use]
+    pub const fn claude_tools(mut self, tools: ClaudeNativeTools) -> Self {
+        self.native_tools.claude = tools;
+        self
+    }
+
     /// Sets the OpenAI-compatible prompt cache key.
     #[must_use]
     pub fn prompt_cache_key(mut self, key: impl Into<String>) -> Self {
@@ -253,6 +296,35 @@ impl Parameters {
         self
     }
 
+    /// Sets Claude prompt caching with automatic top-level cache control.
+    #[must_use]
+    pub const fn claude_prompt_cache_automatic(mut self, ttl: ClaudePromptCacheTtl) -> Self {
+        self.cache.claude = Some(ClaudePromptCache::automatic(ttl));
+        self
+    }
+
+    /// Sets Claude prompt caching with explicit block-level cache breakpoints.
+    #[must_use]
+    pub const fn claude_prompt_cache_explicit(
+        mut self,
+        ttl: ClaudePromptCacheTtl,
+        breakpoints: ClaudeExplicitCacheBreakpoints,
+    ) -> Self {
+        self.cache.claude = Some(ClaudePromptCache::explicit(ttl, breakpoints));
+        self
+    }
+
+    /// Sets Claude prompt caching with automatic and explicit breakpoint modes combined.
+    #[must_use]
+    pub const fn claude_prompt_cache_automatic_with_explicit(
+        mut self,
+        ttl: ClaudePromptCacheTtl,
+        breakpoints: ClaudeExplicitCacheBreakpoints,
+    ) -> Self {
+        self.cache.claude = Some(ClaudePromptCache::automatic_with_explicit(ttl, breakpoints));
+        self
+    }
+
     /// Sets the Gemini cached content resource name.
     #[must_use]
     pub fn gemini_cached_content(mut self, cached_content: impl Into<String>) -> Self {
@@ -279,6 +351,553 @@ impl Parameters {
     }
 }
 
+/// Provider-native tool configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct NativeTools {
+    /// `OpenAI` Responses API hosted tools.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "OpenAINativeTools::is_empty")
+    )]
+    pub openai: OpenAINativeTools,
+    /// Gemini hosted and client-side tools.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "GeminiNativeTools::is_empty")
+    )]
+    pub gemini: GeminiNativeTools,
+    /// Claude Anthropic-defined and server tools.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "ClaudeNativeTools::is_empty")
+    )]
+    pub claude: ClaudeNativeTools,
+}
+
+impl NativeTools {
+    /// Returns true when no provider-native tools are configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.openai.is_empty() && self.gemini.is_empty() && self.claude.is_empty()
+    }
+}
+
+/// `OpenAI` Responses API native tools.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAINativeTools {
+    /// Hosted web search.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub web_search: Option<OpenAIWebSearchTool>,
+    /// Hosted file search over vector stores.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub file_search: Vec<OpenAIFileSearchTool>,
+    /// Hosted code interpreter.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub code_interpreter: Option<OpenAICodeInterpreterTool>,
+    /// Hosted image generation.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub image_generation: Option<OpenAIImageGenerationTool>,
+    /// Remote MCP servers.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub mcp: Vec<OpenAIMcpTool>,
+    /// Computer use preview.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub computer_use: Option<OpenAIComputerUseTool>,
+}
+
+impl OpenAINativeTools {
+    /// Returns true when no `OpenAI` native tools are configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.web_search.is_none()
+            && self.file_search.is_empty()
+            && self.code_interpreter.is_none()
+            && self.image_generation.is_none()
+            && self.mcp.is_empty()
+            && self.computer_use.is_none()
+    }
+
+    /// Enables hosted web search with default API settings.
+    #[must_use]
+    pub fn with_web_search(mut self, tool: OpenAIWebSearchTool) -> Self {
+        self.web_search = Some(tool);
+        self
+    }
+
+    /// Enables hosted web search with default API settings.
+    #[must_use]
+    pub fn enable_web_search(mut self) -> Self {
+        self.web_search = Some(OpenAIWebSearchTool::default());
+        self
+    }
+
+    /// Adds a file search tool.
+    #[must_use]
+    pub fn with_file_search(mut self, tool: OpenAIFileSearchTool) -> Self {
+        self.file_search.push(tool);
+        self
+    }
+
+    /// Enables hosted code interpreter.
+    #[must_use]
+    pub fn with_code_interpreter(mut self, tool: OpenAICodeInterpreterTool) -> Self {
+        self.code_interpreter = Some(tool);
+        self
+    }
+
+    /// Enables hosted image generation.
+    #[must_use]
+    pub const fn with_image_generation(mut self, tool: OpenAIImageGenerationTool) -> Self {
+        self.image_generation = Some(tool);
+        self
+    }
+
+    /// Adds a remote MCP server.
+    #[must_use]
+    pub fn with_mcp(mut self, tool: OpenAIMcpTool) -> Self {
+        self.mcp.push(tool);
+        self
+    }
+
+    /// Enables computer use preview.
+    #[must_use]
+    pub fn with_computer_use(mut self, tool: OpenAIComputerUseTool) -> Self {
+        self.computer_use = Some(tool);
+        self
+    }
+}
+
+/// `OpenAI` hosted web search configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAIWebSearchTool {
+    /// Whether live web access is allowed. `None` uses `OpenAI`'s default.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub external_web_access: Option<bool>,
+    /// Official filter object, such as `allowed_domains`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub filters: Option<Value>,
+    /// Official user location object.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub user_location: Option<Value>,
+}
+
+impl OpenAIWebSearchTool {
+    /// Sets whether live web access is allowed.
+    #[must_use]
+    pub const fn external_web_access(mut self, allowed: bool) -> Self {
+        self.external_web_access = Some(allowed);
+        self
+    }
+
+    /// Sets the official filter object.
+    #[must_use]
+    pub fn filters(mut self, filters: Value) -> Self {
+        self.filters = Some(filters);
+        self
+    }
+
+    /// Sets the official user location object.
+    #[must_use]
+    pub fn user_location(mut self, location: Value) -> Self {
+        self.user_location = Some(location);
+        self
+    }
+}
+
+/// `OpenAI` hosted file search configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAIFileSearchTool {
+    /// Vector stores to search.
+    pub vector_store_ids: Vec<String>,
+    /// Maximum number of search results.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub max_num_results: Option<u32>,
+    /// Whether to request `file_search_call.results` in the response include list.
+    pub include_results: bool,
+    /// Official filter object.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub filters: Option<Value>,
+}
+
+impl OpenAIFileSearchTool {
+    /// Creates file search over the provided vector stores.
+    #[must_use]
+    pub fn new(vector_store_ids: impl Into<Vec<String>>) -> Self {
+        Self {
+            vector_store_ids: vector_store_ids.into(),
+            max_num_results: None,
+            include_results: false,
+            filters: None,
+        }
+    }
+
+    /// Sets maximum result count.
+    #[must_use]
+    pub const fn max_num_results(mut self, value: u32) -> Self {
+        self.max_num_results = Some(value);
+        self
+    }
+
+    /// Requests file search result inclusion.
+    #[must_use]
+    pub const fn include_results(mut self, include: bool) -> Self {
+        self.include_results = include;
+        self
+    }
+
+    /// Sets the official filter object.
+    #[must_use]
+    pub fn filters(mut self, filters: Value) -> Self {
+        self.filters = Some(filters);
+        self
+    }
+}
+
+/// `OpenAI` code interpreter configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAICodeInterpreterTool {
+    /// Container selection.
+    pub container: OpenAICodeInterpreterContainer,
+}
+
+impl Default for OpenAICodeInterpreterTool {
+    fn default() -> Self {
+        Self {
+            container: OpenAICodeInterpreterContainer::Auto(OpenAIAutoContainer::default()),
+        }
+    }
+}
+
+impl OpenAICodeInterpreterTool {
+    /// Uses an automatically managed container.
+    #[must_use]
+    pub const fn auto() -> Self {
+        Self {
+            container: OpenAICodeInterpreterContainer::Auto(OpenAIAutoContainer::new()),
+        }
+    }
+
+    /// Uses an existing container ID.
+    #[must_use]
+    pub fn existing(container_id: impl Into<String>) -> Self {
+        Self {
+            container: OpenAICodeInterpreterContainer::Existing(container_id.into()),
+        }
+    }
+}
+
+/// `OpenAI` code interpreter container selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum OpenAICodeInterpreterContainer {
+    /// Automatically create or reuse a container.
+    Auto(OpenAIAutoContainer),
+    /// Use an existing container ID.
+    Existing(String),
+}
+
+/// `OpenAI` automatically managed code interpreter container.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAIAutoContainer {
+    /// Memory tier such as `1g`, `4g`, `16g`, or `64g`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub memory_limit: Option<String>,
+    /// File IDs to preload into the container.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub file_ids: Vec<String>,
+}
+
+impl OpenAIAutoContainer {
+    /// Creates an auto container with default API settings.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            memory_limit: None,
+            file_ids: Vec::new(),
+        }
+    }
+
+    /// Sets the memory tier.
+    #[must_use]
+    pub fn memory_limit(mut self, memory_limit: impl Into<String>) -> Self {
+        self.memory_limit = Some(memory_limit.into());
+        self
+    }
+
+    /// Preloads file IDs.
+    #[must_use]
+    pub fn file_ids(mut self, file_ids: impl Into<Vec<String>>) -> Self {
+        self.file_ids = file_ids.into();
+        self
+    }
+}
+
+/// `OpenAI` image generation tool configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAIImageGenerationTool {
+    /// Number of partial image events to stream.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub partial_images: Option<u8>,
+}
+
+impl OpenAIImageGenerationTool {
+    /// Sets partial image count.
+    #[must_use]
+    pub const fn partial_images(mut self, count: u8) -> Self {
+        self.partial_images = Some(count);
+        self
+    }
+}
+
+/// `OpenAI` remote MCP server configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAIMcpTool {
+    /// Label for the server.
+    pub server_label: String,
+    /// Server URL.
+    pub server_url: String,
+    /// Approval policy, such as `never` or `always`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub require_approval: Option<String>,
+    /// Optional allowlist of tool names.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub allowed_tools: Vec<String>,
+}
+
+impl OpenAIMcpTool {
+    /// Creates a remote MCP server tool.
+    #[must_use]
+    pub fn new(server_label: impl Into<String>, server_url: impl Into<String>) -> Self {
+        Self {
+            server_label: server_label.into(),
+            server_url: server_url.into(),
+            require_approval: None,
+            allowed_tools: Vec::new(),
+        }
+    }
+
+    /// Sets approval policy.
+    #[must_use]
+    pub fn require_approval(mut self, policy: impl Into<String>) -> Self {
+        self.require_approval = Some(policy.into());
+        self
+    }
+
+    /// Sets allowed tools.
+    #[must_use]
+    pub fn allowed_tools(mut self, tools: impl Into<Vec<String>>) -> Self {
+        self.allowed_tools = tools.into();
+        self
+    }
+}
+
+/// `OpenAI` computer use preview tool configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OpenAIComputerUseTool {
+    /// Display width in pixels.
+    pub display_width: u32,
+    /// Display height in pixels.
+    pub display_height: u32,
+    /// Environment such as `browser`.
+    pub environment: String,
+}
+
+impl OpenAIComputerUseTool {
+    /// Creates a computer use preview tool.
+    #[must_use]
+    pub fn new(display_width: u32, display_height: u32, environment: impl Into<String>) -> Self {
+        Self {
+            display_width,
+            display_height,
+            environment: environment.into(),
+        }
+    }
+}
+
+/// Gemini-native tools.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GeminiNativeTools {
+    /// Grounding with Google Search.
+    pub google_search: bool,
+    /// Built-in code execution.
+    pub code_execution: bool,
+    /// URL Context tool.
+    pub url_context: bool,
+}
+
+impl GeminiNativeTools {
+    /// Returns true when no Gemini-native tools are configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.google_search && !self.code_execution && !self.url_context
+    }
+
+    /// Enables Grounding with Google Search.
+    #[must_use]
+    pub const fn google_search(mut self, enabled: bool) -> Self {
+        self.google_search = enabled;
+        self
+    }
+
+    /// Enables Code Execution.
+    #[must_use]
+    pub const fn code_execution(mut self, enabled: bool) -> Self {
+        self.code_execution = enabled;
+        self
+    }
+
+    /// Enables URL Context.
+    #[must_use]
+    pub const fn url_context(mut self, enabled: bool) -> Self {
+        self.url_context = enabled;
+        self
+    }
+}
+
+/// Claude-native tools.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ClaudeNativeTools {
+    /// Server-side web search.
+    pub web_search: bool,
+    /// Server-side web fetch.
+    pub web_fetch: bool,
+    /// Server-side code execution.
+    pub code_execution: bool,
+    /// Client-side bash tool.
+    pub bash: bool,
+    /// Client-side text editor tool.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub text_editor: Option<ClaudeTextEditorTool>,
+}
+
+impl ClaudeNativeTools {
+    /// Returns true when no Claude-native tools are configured.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.web_search
+            && !self.web_fetch
+            && !self.code_execution
+            && !self.bash
+            && self.text_editor.is_none()
+    }
+
+    /// Enables server-side web search.
+    #[must_use]
+    pub const fn web_search(mut self, enabled: bool) -> Self {
+        self.web_search = enabled;
+        self
+    }
+
+    /// Enables server-side web fetch.
+    #[must_use]
+    pub const fn web_fetch(mut self, enabled: bool) -> Self {
+        self.web_fetch = enabled;
+        self
+    }
+
+    /// Enables server-side code execution.
+    #[must_use]
+    pub const fn code_execution(mut self, enabled: bool) -> Self {
+        self.code_execution = enabled;
+        self
+    }
+
+    /// Enables client-side bash.
+    #[must_use]
+    pub const fn bash(mut self, enabled: bool) -> Self {
+        self.bash = enabled;
+        self
+    }
+
+    /// Enables client-side text editor.
+    #[must_use]
+    pub const fn text_editor(mut self, tool: ClaudeTextEditorTool) -> Self {
+        self.text_editor = Some(tool);
+        self
+    }
+}
+
+/// Claude text editor tool configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ClaudeTextEditorTool {
+    /// Optional maximum characters returned by the `view` command.
+    pub max_characters: Option<u32>,
+}
+
+impl ClaudeTextEditorTool {
+    /// Sets maximum characters for view results.
+    #[must_use]
+    pub const fn max_characters(mut self, value: u32) -> Self {
+        self.max_characters = Some(value);
+        self
+    }
+}
+
 /// Tool choice policy for tool calling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -297,32 +916,38 @@ pub enum ToolChoice {
 }
 
 /// Effort levels available for reasoning-focused models.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The ladder is ordered from least to most reasoning, and spans the union of
+/// what the providers accept. **No provider accepts every level**, and the
+/// supported set varies by model within a provider, so each provider crate maps
+/// this to its own wire vocabulary and rejects a level its API does not have —
+/// rather than silently clamping to the nearest one, which would bill the
+/// caller for a depth they did not ask for.
+///
+/// Deliberately carries no `as_str`: the wire spelling is not shared. `Minimal`
+/// is `"minimal"` on `OpenAI` and Gemini and does not exist on Claude; `XHigh`
+/// and `Max` exist on Claude and `OpenAI` but not Gemini.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum ReasoningEffort {
-    /// Minimum reasoning effort.
-    Minimum,
-
-    /// Compute-intensive reasoning.
+    /// No reasoning at all: answer directly.
+    ///
+    /// On Claude this disables thinking, which the API rejects on models whose
+    /// thinking is always on.
+    None,
+    /// The least reasoning a model will do while still reasoning.
+    Minimal,
+    /// Shallow reasoning, for latency-sensitive work.
     Low,
     /// Balanced reasoning depth.
     Medium,
-    /// Maximum reasoning depth and accuracy.
+    /// Thorough reasoning. The default on current Claude models.
     High,
-}
-
-impl ReasoningEffort {
-    /// Returns the string representation expected by providers.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Minimum => "minimum",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-        }
-    }
+    /// Beyond `High`, where the extra depth pays for itself.
+    XHigh,
+    /// The most reasoning available, for quality-first workloads.
+    Max,
 }
 
 /// Provider-specific prompt cache controls.
@@ -375,12 +1000,12 @@ pub struct OpenAIPromptCache {
     pub retention: Option<OpenAIPromptCacheRetention>,
 }
 
-/// OpenAI prompt cache retention policies.
+/// `OpenAI` prompt cache retention policies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum OpenAIPromptCacheRetention {
-    /// Keep cache entries in-memory (default OpenAI retention mode).
+    /// Keep cache entries in-memory (default `OpenAI` retention mode).
     InMemory,
     /// Keep cache entries for 24 hours.
     #[cfg_attr(feature = "serde", serde(rename = "24h"))]
@@ -404,13 +1029,55 @@ impl OpenAIPromptCacheRetention {
 pub struct ClaudePromptCache {
     /// Requested cache TTL policy.
     pub ttl: ClaudePromptCacheTtl,
+    /// Cache application strategy.
+    pub strategy: ClaudePromptCacheStrategy,
 }
 
 impl ClaudePromptCache {
     /// Build a cache configuration with the chosen TTL.
     #[must_use]
     pub const fn new(ttl: ClaudePromptCacheTtl) -> Self {
-        Self { ttl }
+        Self {
+            ttl,
+            strategy: ClaudePromptCacheStrategy::Automatic,
+        }
+    }
+
+    /// Build an automatic top-level cache configuration.
+    #[must_use]
+    pub const fn automatic(ttl: ClaudePromptCacheTtl) -> Self {
+        Self::new(ttl)
+    }
+
+    /// Build an explicit block-level cache configuration.
+    #[must_use]
+    pub const fn explicit(
+        ttl: ClaudePromptCacheTtl,
+        breakpoints: ClaudeExplicitCacheBreakpoints,
+    ) -> Self {
+        Self {
+            ttl,
+            strategy: ClaudePromptCacheStrategy::Explicit(breakpoints),
+        }
+    }
+
+    /// Build a cache configuration that combines automatic and explicit breakpoints.
+    #[must_use]
+    pub const fn automatic_with_explicit(
+        ttl: ClaudePromptCacheTtl,
+        breakpoints: ClaudeExplicitCacheBreakpoints,
+    ) -> Self {
+        Self {
+            ttl,
+            strategy: ClaudePromptCacheStrategy::AutomaticAndExplicit(breakpoints),
+        }
+    }
+
+    /// Override the cache strategy.
+    #[must_use]
+    pub const fn with_strategy(mut self, strategy: ClaudePromptCacheStrategy) -> Self {
+        self.strategy = strategy;
+        self
     }
 }
 
@@ -433,6 +1100,175 @@ impl ClaudePromptCacheTtl {
             Self::FiveMinutes => "5m",
             Self::OneHour => "1h",
         }
+    }
+}
+
+/// Claude prompt cache strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ClaudePromptCacheStrategy {
+    /// Add top-level `cache_control` (automatic caching).
+    #[default]
+    Automatic,
+    /// Place `cache_control` on selected cacheable blocks.
+    Explicit(ClaudeExplicitCacheBreakpoints),
+    /// Use top-level automatic caching and explicit breakpoints together.
+    AutomaticAndExplicit(ClaudeExplicitCacheBreakpoints),
+}
+
+/// Explicit Claude cache breakpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ClaudeExplicitCacheBreakpoint {
+    /// Block target where cache control should be applied.
+    pub target: ClaudeCacheBreakpointTarget,
+    /// Optional TTL override for this breakpoint.
+    ///
+    /// When omitted, request-level `ClaudePromptCache::ttl` is used.
+    pub ttl: Option<ClaudePromptCacheTtl>,
+}
+
+impl ClaudeExplicitCacheBreakpoint {
+    /// Creates a breakpoint for the given target using request-level default TTL.
+    #[must_use]
+    pub const fn new(target: ClaudeCacheBreakpointTarget) -> Self {
+        Self { target, ttl: None }
+    }
+
+    /// Overrides TTL for this breakpoint.
+    #[must_use]
+    pub const fn with_ttl(mut self, ttl: ClaudePromptCacheTtl) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    /// Returns the effective TTL for this breakpoint.
+    #[must_use]
+    pub const fn effective_ttl(self, default_ttl: ClaudePromptCacheTtl) -> ClaudePromptCacheTtl {
+        match self.ttl {
+            Some(ttl) => ttl,
+            None => default_ttl,
+        }
+    }
+}
+
+/// Explicit Claude cache breakpoint placement target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ClaudeCacheBreakpointTarget {
+    /// The last tool definition.
+    LastTool,
+    /// A specific tool definition by index.
+    Tool(usize),
+    /// The last non-empty system text block.
+    LastSystem,
+    /// A specific system text block by index.
+    System(usize),
+    /// The last cacheable content block in messages.
+    LastMessage,
+    /// A specific message content block by message and block indices.
+    Message {
+        /// Message index in `messages`.
+        message_index: usize,
+        /// Content block index within the message.
+        block_index: usize,
+    },
+}
+
+/// Up to four explicit Claude cache breakpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ClaudeExplicitCacheBreakpoints {
+    /// First explicit breakpoint.
+    pub first: ClaudeExplicitCacheBreakpoint,
+    /// Optional second explicit breakpoint.
+    pub second: Option<ClaudeExplicitCacheBreakpoint>,
+    /// Optional third explicit breakpoint.
+    pub third: Option<ClaudeExplicitCacheBreakpoint>,
+    /// Optional fourth explicit breakpoint.
+    pub fourth: Option<ClaudeExplicitCacheBreakpoint>,
+}
+
+impl ClaudeExplicitCacheBreakpoints {
+    /// Creates an explicit breakpoint set with one mandatory breakpoint.
+    #[must_use]
+    pub const fn new(first: ClaudeExplicitCacheBreakpoint) -> Self {
+        Self {
+            first,
+            second: None,
+            third: None,
+            fourth: None,
+        }
+    }
+
+    /// Sets the second breakpoint.
+    #[must_use]
+    pub const fn with_second(mut self, second: ClaudeExplicitCacheBreakpoint) -> Self {
+        self.second = Some(second);
+        self
+    }
+
+    /// Sets the third breakpoint.
+    #[must_use]
+    pub const fn with_third(mut self, third: ClaudeExplicitCacheBreakpoint) -> Self {
+        self.third = Some(third);
+        self
+    }
+
+    /// Sets the fourth breakpoint.
+    #[must_use]
+    pub const fn with_fourth(mut self, fourth: ClaudeExplicitCacheBreakpoint) -> Self {
+        self.fourth = Some(fourth);
+        self
+    }
+
+    /// Returns all configured breakpoints in declared order.
+    pub fn iter(self) -> impl Iterator<Item = ClaudeExplicitCacheBreakpoint> {
+        [Some(self.first), self.second, self.third, self.fourth]
+            .into_iter()
+            .flatten()
+    }
+
+    /// Number of configured breakpoints.
+    #[must_use]
+    pub const fn count(&self) -> usize {
+        1 + self.second.is_some() as usize
+            + self.third.is_some() as usize
+            + self.fourth.is_some() as usize
+    }
+
+    /// Returns true when all four breakpoint slots are in use.
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        self.fourth.is_some()
+    }
+
+    /// Cache only the last cacheable message content block.
+    #[must_use]
+    pub const fn messages_only() -> Self {
+        Self::new(ClaudeExplicitCacheBreakpoint::new(
+            ClaudeCacheBreakpointTarget::LastMessage,
+        ))
+    }
+
+    /// Cache tool definitions, system blocks, and message blocks.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self::new(ClaudeExplicitCacheBreakpoint::new(
+            ClaudeCacheBreakpointTarget::LastTool,
+        ))
+        .with_second(ClaudeExplicitCacheBreakpoint::new(
+            ClaudeCacheBreakpointTarget::LastSystem,
+        ))
+        .with_third(ClaudeExplicitCacheBreakpoint::new(
+            ClaudeCacheBreakpointTarget::LastMessage,
+        ))
+    }
+}
+
+impl Default for ClaudeExplicitCacheBreakpoints {
+    fn default() -> Self {
+        Self::messages_only()
     }
 }
 
@@ -693,6 +1529,7 @@ impl Profile {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum Ability {
     /// The model can use external tools/functions.
     ToolUse,
@@ -700,6 +1537,8 @@ pub enum Ability {
     Vision,
     /// The model can process and understand audio.
     Audio,
+    /// The model can generate audio output.
+    AudioOutput,
     /// The model can process and understand video.
     Video,
     /// The model can perform web searches natively.
@@ -712,59 +1551,12 @@ pub enum Ability {
     Reasoning,
     /// The model can generate images.
     ImageGeneration,
-}
-
-/// Model performance/cost tier classification.
-///
-/// Used to categorize models by their general performance characteristics
-/// and typical cost levels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum ModelTier {
-    /// Flagship models - highest capability, highest cost (e.g., GPT-4, Claude Opus)
-    Flagship,
-    /// Balanced models - good capability/cost ratio (e.g., GPT-4o, Claude Sonnet)
-    Balanced,
-    /// Fast models - optimized for speed and cost (e.g., GPT-4o-mini, Claude Haiku)
-    Fast,
-}
-
-/// Static metadata about a known model.
-///
-/// This struct contains pre-defined information about popular models,
-/// used as fallback when provider APIs don't expose model metadata.
-#[derive(Debug, Clone)]
-pub struct ModelInfo {
-    /// Canonical model ID (e.g., "gpt-4o", "claude-3-5-sonnet")
-    pub id: &'static str,
-    /// Human-readable name (e.g., "GPT-4o", "Claude 3.5 Sonnet")
-    pub name: &'static str,
-    /// Provider name (e.g., "openai", "anthropic", "google")
-    pub provider: &'static str,
-    /// Context window size in tokens
-    pub context_window: u32,
-    /// Maximum output tokens (if known)
-    pub max_output_tokens: Option<u32>,
-    /// Model tier classifications (a model can belong to multiple tiers)
-    pub tiers: &'static [ModelTier],
-    /// Model capabilities
-    pub abilities: &'static [Ability],
-    /// Whether this model is outdated (superseded by a newer version)
-    pub outdated: bool,
-}
-
-impl ModelInfo {
-    /// Check if this model belongs to a specific tier.
-    #[must_use]
-    pub fn has_tier(&self, tier: ModelTier) -> bool {
-        self.tiers.contains(&tier)
-    }
-
-    /// Get the primary (first) tier for this model.
-    #[must_use]
-    pub const fn primary_tier(&self) -> Option<ModelTier> {
-        self.tiers.first().copied()
-    }
+    /// The model supports computer use / desktop interaction.
+    ComputerUse,
+    /// The model supports prompt caching.
+    PromptCaching,
+    /// The model supports assistant prefill (pre-filling assistant responses).
+    AssistantPrefill,
 }
 
 #[cfg(test)]
@@ -779,7 +1571,11 @@ mod tests {
         assert_eq!(profile.slug, "test-model");
         assert_eq!(profile.description, "A test model");
         assert_eq!(profile.context_length, 4096);
-        assert!(profile.abilities.is_empty());
+        assert!(
+            profile.abilities.is_empty(),
+            "expected no abilities, got {:?}",
+            profile.abilities
+        );
         assert!(profile.pricing.is_none());
     }
 
@@ -1084,5 +1880,66 @@ mod tests {
     fn claude_prompt_cache_ttl_string_values_match_api() {
         assert_eq!(ClaudePromptCacheTtl::FiveMinutes.as_str(), "5m");
         assert_eq!(ClaudePromptCacheTtl::OneHour.as_str(), "1h");
+    }
+
+    #[test]
+    fn claude_cache_default_strategy_is_automatic() {
+        let cache = ClaudePromptCache::new(ClaudePromptCacheTtl::FiveMinutes);
+        assert_eq!(cache.strategy, ClaudePromptCacheStrategy::Automatic);
+    }
+
+    #[test]
+    fn claude_explicit_breakpoints_default_to_messages_only() {
+        let breakpoints = ClaudeExplicitCacheBreakpoints::default();
+        assert_eq!(breakpoints.count(), 1);
+        assert_eq!(
+            breakpoints.first.target,
+            ClaudeCacheBreakpointTarget::LastMessage
+        );
+        assert!(breakpoints.second.is_none());
+    }
+
+    #[test]
+    fn claude_prompt_cache_explicit_builder_preserves_breakpoints() {
+        let breakpoints = ClaudeExplicitCacheBreakpoints::all();
+        let params = Parameters::default()
+            .claude_prompt_cache_explicit(ClaudePromptCacheTtl::OneHour, breakpoints);
+        let cache = params
+            .cache
+            .claude
+            .expect("claude cache should be set by explicit builder");
+        assert_eq!(cache.ttl, ClaudePromptCacheTtl::OneHour);
+        assert_eq!(
+            cache.strategy,
+            ClaudePromptCacheStrategy::Explicit(breakpoints)
+        );
+    }
+
+    #[test]
+    fn claude_explicit_breakpoint_supports_per_block_ttl_override() {
+        let breakpoint = ClaudeExplicitCacheBreakpoint::new(ClaudeCacheBreakpointTarget::Tool(0))
+            .with_ttl(ClaudePromptCacheTtl::OneHour);
+        assert_eq!(breakpoint.ttl, Some(ClaudePromptCacheTtl::OneHour));
+        assert_eq!(
+            breakpoint.effective_ttl(ClaudePromptCacheTtl::FiveMinutes),
+            ClaudePromptCacheTtl::OneHour
+        );
+    }
+
+    #[test]
+    fn claude_prompt_cache_automatic_with_explicit_builder_preserves_breakpoints() {
+        let breakpoints = ClaudeExplicitCacheBreakpoints::messages_only();
+        let params = Parameters::default().claude_prompt_cache_automatic_with_explicit(
+            ClaudePromptCacheTtl::FiveMinutes,
+            breakpoints,
+        );
+        let cache = params
+            .cache
+            .claude
+            .expect("claude cache should be set by combined builder");
+        assert_eq!(
+            cache.strategy,
+            ClaudePromptCacheStrategy::AutomaticAndExplicit(breakpoints)
+        );
     }
 }

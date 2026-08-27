@@ -14,11 +14,11 @@ use std::sync::Arc;
 
 use aither_core::{
     LanguageModel,
-    llm::{Tool, ToolOutput},
+    llm::{Tool, ToolResult},
 };
-use aither_sandbox::BashToolFactory;
+use aither_sandbox::TerminalToolFactory;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::AgentBuilder;
 use crate::fs_util::path_exists;
@@ -43,13 +43,20 @@ pub struct SubagentType<LLM> {
     builder: SubagentBuilder<LLM>,
 }
 
+/// Maps a path the subagent sees onto the host directory it really refers to.
+///
+/// A subagent works inside a sandbox, so the paths in its prompts are virtual;
+/// this records how to resolve them without letting one escape its root.
 #[derive(Clone, Debug)]
 pub struct SubagentFileMount {
+    /// Path prefix as the subagent sees it.
     pub virtual_prefix: PathBuf,
+    /// Directory on the host that prefix resolves to.
     pub host_root: PathBuf,
 }
 
 impl SubagentFileMount {
+    /// Maps `virtual_prefix` onto `host_root`.
     #[must_use]
     pub fn new(virtual_prefix: impl Into<PathBuf>, host_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -63,7 +70,7 @@ impl<LLM> std::fmt::Debug for SubagentType<LLM> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubagentType")
             .field("description", &self.description)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -102,7 +109,7 @@ impl<LLM: Clone> SubagentType<LLM> {
 /// Choose the subagent type that best matches the task requirements.
 ///
 /// You can also load custom subagents from `.md` files by specifying a path
-/// (e.g., `./custom-agent.md` or `.subagents/researcher.md`).
+/// (e.g., `./custom-agent.md` or `subagents/researcher.md`).
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
 pub struct SubagentArgs {
     /// Subagent type name (e.g., "explore", "plan") or path to a subagent file.
@@ -110,6 +117,13 @@ pub struct SubagentArgs {
     pub subagent: String,
     /// The detailed task prompt for the subagent.
     pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SubagentResult {
+    subagent: String,
+    status: &'static str,
+    result: String,
 }
 
 /// A tool that spawns specialized subagents to handle complex tasks.
@@ -146,8 +160,8 @@ pub struct SubagentTool<LLM> {
     base_dir: Option<PathBuf>,
     /// Ordered mount map used to resolve virtual sandbox paths into host paths.
     mounts: Vec<SubagentFileMount>,
-    /// Factory for creating child bash tools for subagents.
-    bash_tool_factory: Option<BashToolFactory>,
+    /// Factory for creating child terminal tools for subagents.
+    terminal_tool_factory: Option<TerminalToolFactory>,
 }
 
 impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
@@ -156,11 +170,11 @@ impl<LLM> std::fmt::Debug for SubagentTool<LLM> {
         f.debug_struct("SubagentTool")
             .field("type_names", &type_names)
             .field("base_dir", &self.base_dir)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
-impl<LLM: Clone> SubagentTool<LLM> {
+impl<LLM: Clone + Sync> SubagentTool<LLM> {
     /// Creates a new `TaskTool` with the given LLM.
     pub fn new(llm: LLM) -> Self {
         Self {
@@ -168,13 +182,13 @@ impl<LLM: Clone> SubagentTool<LLM> {
             types: HashMap::new(),
             base_dir: None,
             mounts: Vec::new(),
-            bash_tool_factory: None,
+            terminal_tool_factory: None,
         }
     }
 
     /// Sets the base directory for resolving relative paths.
     ///
-    /// Paths like `.subagents/...` and `.skills/...` will be resolved
+    /// Paths like `subagents/...` and `skills/...` will be resolved
     /// relative to this directory.
     #[must_use]
     pub fn with_base_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
@@ -194,10 +208,10 @@ impl<LLM: Clone> SubagentTool<LLM> {
         self
     }
 
-    /// Sets the bash tool factory used for subagents.
+    /// Sets the terminal tool factory used for subagents.
     #[must_use]
-    pub fn with_bash_tool_factory(mut self, factory: BashToolFactory) -> Self {
-        self.bash_tool_factory = Some(factory);
+    pub fn with_terminal_tool_factory(mut self, factory: TerminalToolFactory) -> Self {
+        self.terminal_tool_factory = Some(factory);
         self
     }
 
@@ -236,8 +250,8 @@ impl<LLM: Clone> SubagentTool<LLM> {
             .unwrap_or_else(|| PathBuf::from(Path::new(".")));
         vec![
             SubagentFileMount::new(PathBuf::from("."), base.clone()),
-            SubagentFileMount::new(PathBuf::from(".subagents"), base.join(".subagents")),
-            SubagentFileMount::new(PathBuf::from(".skills"), base.join(".skills")),
+            SubagentFileMount::new(PathBuf::from("subagents"), base.join("subagents")),
+            SubagentFileMount::new(PathBuf::from("skills"), base.join("skills")),
         ]
     }
 
@@ -319,7 +333,6 @@ impl<LLM: Clone> SubagentTool<LLM> {
     }
 
     async fn resolve_relative_path_through_mounts(
-        &self,
         requested_display: &Path,
         file_path: &Path,
         mounts: &[SubagentFileMount],
@@ -333,14 +346,12 @@ impl<LLM: Clone> SubagentTool<LLM> {
             let display_path = if display_prefix.as_os_str().is_empty() {
                 candidate
                     .strip_prefix(&mount.host_root)
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|_| requested_display.to_path_buf())
+                    .map_or_else(|_| requested_display.to_path_buf(), Path::to_path_buf)
             } else {
                 display_prefix.join(
                     candidate
                         .strip_prefix(&mount.host_root)
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|_| requested_display.to_path_buf()),
+                        .map_or_else(|_| requested_display.to_path_buf(), Path::to_path_buf),
                 )
             };
             attempted.push(display_path.display().to_string());
@@ -363,17 +374,25 @@ impl<LLM: Clone> SubagentTool<LLM> {
         ))
     }
 
-    async fn resolve_subagent_path(&self, file_path: &Path) -> anyhow::Result<PathBuf> {
-        let mounts = self.effective_mounts();
+    /// Resolves a path the subagent asked for against its mounts.
+    ///
+    /// Takes the mounts and base directory rather than `&self` so the returned
+    /// future does not borrow the tool, and so stays `Send`.
+    async fn resolve_subagent_path(
+        mounts: &[SubagentFileMount],
+        base_dir: Option<&Path>,
+        file_path: &Path,
+    ) -> anyhow::Result<PathBuf> {
         if file_path.is_absolute() {
-            if let Some(base_dir) = &self.base_dir
+            if let Some(base_dir) = base_dir
                 && let Ok(stripped) = file_path.strip_prefix(base_dir)
             {
                 let relative = Self::strip_leading_curdir(stripped);
                 if !relative.as_os_str().is_empty() {
-                    return self
-                        .resolve_relative_path_through_mounts(&relative, &relative, &mounts)
-                        .await;
+                    return Self::resolve_relative_path_through_mounts(
+                        &relative, &relative, mounts,
+                    )
+                    .await;
                 }
             }
 
@@ -386,12 +405,11 @@ impl<LLM: Clone> SubagentTool<LLM> {
             ));
         }
 
-        self.resolve_relative_path_through_mounts(file_path, file_path, &mounts)
-            .await
+        Self::resolve_relative_path_through_mounts(file_path, file_path, mounts).await
     }
 }
 
-impl<LLM: LanguageModel + Clone> SubagentTool<LLM> {
+impl<LLM: LanguageModel + Clone + Sync> SubagentTool<LLM> {
     /// Register a subagent from a definition (builder pattern).
     ///
     /// Creates a subagent type from a `SubagentDefinition` loaded from a file.
@@ -400,6 +418,7 @@ impl<LLM: LanguageModel + Clone> SubagentTool<LLM> {
     pub fn with_definition(self, def: SubagentDefinition) -> Self {
         let subagent = SubagentType::new(def.description.clone(), move |llm| {
             crate::AgentBuilder::new(llm)
+                .agent_kind(crate::AgentKind::Chatbot)
                 .system_prompt(&def.system_prompt)
                 .max_iterations(def.max_iterations)
         });
@@ -420,24 +439,33 @@ impl<LLM: LanguageModel + Clone> SubagentTool<LLM> {
 
 impl<LLM> Tool for SubagentTool<LLM>
 where
-    LLM: LanguageModel + Clone + 'static,
+    LLM: LanguageModel + Clone + Sync + 'static,
 {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("subagent")
     }
 
     type Arguments = SubagentArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
         // Determine if subagent is a file path or a registered type name
         // File paths contain '/' or end with '.md'
-        let is_file_path = args.subagent.contains('/') || args.subagent.ends_with(".md");
+        let is_file_path = args.subagent.contains('/')
+            || Path::new(&args.subagent)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("md"));
 
         let (subagent_id, agent_builder) = if is_file_path {
             // Load subagent from file
             // Resolve paths using explicit search roots.
             let file_path = PathBuf::from(&args.subagent);
-            let resolved_path = self.resolve_subagent_path(&file_path).await?;
+            let resolved_path = Self::resolve_subagent_path(
+                &self.effective_mounts(),
+                self.base_dir.as_deref(),
+                &file_path,
+            )
+            .await?;
 
             let def = SubagentDefinition::from_file_async(&resolved_path)
                 .await
@@ -446,15 +474,10 @@ where
                         "Failed to read subagent file '{}': {e}",
                         resolved_path.display()
                     )
-                })?
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Invalid subagent definition in '{}'",
-                        resolved_path.display()
-                    )
                 })?;
 
             let builder = crate::AgentBuilder::new(self.llm.clone())
+                .agent_kind(crate::AgentKind::Chatbot)
                 .system_prompt(&def.system_prompt)
                 .max_iterations(def.max_iterations);
 
@@ -476,30 +499,60 @@ where
 
         tracing::info!(subagent = %subagent_id, "Starting subagent");
 
-        // Add child bash tool if factory is configured
-        let agent_builder = if let Some(factory) = &self.bash_tool_factory {
-            let dyn_bash = factory
+        // Add child terminal tool if factory is configured
+        let (agent_builder, child_job_registry) = if let Some(factory) = &self.terminal_tool_factory
+        {
+            let dyn_terminal = factory
                 .create()
                 .await
-                .map_err(|e| anyhow::anyhow!("failed to create subagent bash tool: {e}"))?;
-            agent_builder.dyn_bash(dyn_bash)
+                .map_err(|e| anyhow::anyhow!("failed to create subagent terminal tool: {e}"))?;
+            let job_registry = dyn_terminal.job_registry();
+            (agent_builder.dyn_terminal(dyn_terminal), Some(job_registry))
         } else {
-            agent_builder
+            (agent_builder, None)
         };
 
         let mut agent = agent_builder.build();
 
         // Run the subagent with the prompt
-        let result = agent
-            .query(&args.prompt)
-            .await
-            .map_err(|e| anyhow::anyhow!("Subagent '{subagent_id}' error: {e}"))?;
+        let query_result = agent.query(&args.prompt).await;
+        if let Some(job_registry) = child_job_registry {
+            let killed = job_registry.kill_running().await;
+            if killed > 0 {
+                tracing::info!(
+                    subagent = %subagent_id,
+                    killed,
+                    "Stopped background terminal jobs left by completed subagent"
+                );
+            }
+        }
+        let result = match query_result {
+            Ok(result) => result,
+            Err(error) => {
+                let history = agent.history();
+                let recent = history
+                    .into_iter()
+                    .rev()
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>();
+                let recent_json = serde_json::to_string(&recent)
+                    .unwrap_or_else(|serialize_error| serialize_error.to_string());
+                return Err(anyhow::anyhow!(
+                    "Subagent '{subagent_id}' error: {error}\nRecent subagent history: {recent_json}"
+                ));
+            }
+        };
 
         tracing::info!(subagent = %subagent_id, "Subagent completed");
 
-        Ok(ToolOutput::text(format!(
-            "[Subagent '{subagent_id}' completed]\n\n{result}"
-        )))
+        ToolResult::json(&SubagentResult {
+            subagent: subagent_id,
+            status: "completed",
+            result,
+        })
     }
 }
 
@@ -520,6 +573,24 @@ mod tests {
         // Check required order
         let required = value.get("required").expect("should have required");
         assert!(required.is_array());
+    }
+
+    #[test]
+    fn subagent_result_serializes_as_structured_json() {
+        let value = serde_json::to_value(SubagentResult {
+            subagent: "research".to_string(),
+            status: "completed",
+            result: "done".to_string(),
+        })
+        .expect("subagent result should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "subagent": "research",
+                "status": "completed",
+                "result": "done",
+            })
+        );
     }
 
     fn unique_temp_dir(tag: &str) -> PathBuf {
@@ -548,10 +619,13 @@ mod tests {
             SubagentFileMount::new(".", root.join("workspace")),
             SubagentFileMount::new(".skills", skills_root.clone()),
         ]);
-        let resolved = tool
-            .resolve_subagent_path(Path::new(".skills/slide/SKILL.md"))
-            .await
-            .expect("resolve mounted skill path");
+        let resolved = SubagentTool::<()>::resolve_subagent_path(
+            &tool.effective_mounts(),
+            tool.base_dir.as_deref(),
+            Path::new(".skills/slide/SKILL.md"),
+        )
+        .await
+        .expect("resolve mounted skill path");
         assert_eq!(resolved, skill_file);
 
         let _ = std::fs::remove_dir_all(root);
@@ -561,12 +635,15 @@ mod tests {
     async fn rejects_parent_traversal_paths() {
         let root = unique_temp_dir("mount-traversal");
         let tool = SubagentTool::new(())
-            .with_file_mounts([SubagentFileMount::new(".skills", root.join("skills"))]);
+            .with_file_mounts([SubagentFileMount::new("skills", root.join("skills"))]);
 
-        let error = tool
-            .resolve_subagent_path(Path::new("../outside.md"))
-            .await
-            .expect_err("parent traversal should fail");
+        let error = SubagentTool::<()>::resolve_subagent_path(
+            &tool.effective_mounts(),
+            tool.base_dir.as_deref(),
+            Path::new("../outside.md"),
+        )
+        .await
+        .expect_err("parent traversal should fail");
         assert!(
             error
                 .to_string()
@@ -583,15 +660,18 @@ mod tests {
         let skills_root = root.join("skills");
         std::fs::create_dir_all(&skills_root).expect("create skills root");
         let tool = SubagentTool::new(())
-            .with_file_mounts([SubagentFileMount::new(".skills", skills_root.clone())]);
+            .with_file_mounts([SubagentFileMount::new("skills", skills_root.clone())]);
 
-        let error = tool
-            .resolve_subagent_path(Path::new(".skills/missing.md"))
-            .await
-            .expect_err("missing file should fail");
+        let error = SubagentTool::<()>::resolve_subagent_path(
+            &tool.effective_mounts(),
+            tool.base_dir.as_deref(),
+            Path::new(".skills/missing.md"),
+        )
+        .await
+        .expect_err("missing file should fail");
         let message = error.to_string();
         assert!(
-            message.contains(".skills/missing.md"),
+            message.contains("skills/missing.md"),
             "missing virtual path in error: {message}"
         );
         assert!(
@@ -607,7 +687,7 @@ mod tests {
         let root = unique_temp_dir("absolute-workspace-skills");
         let workspace_root = root.join("workspace");
         let skills_root = root.join("skills");
-        let session_skills_file = workspace_root.join(".skills/slide/subagents/art_direction.md");
+        let session_skills_file = workspace_root.join("skills/slide/subagents/art_direction.md");
         let mounted_skill_file = skills_root.join("slide/subagents/art_direction.md");
         std::fs::create_dir_all(session_skills_file.parent().expect("session skill parent"))
             .expect("create session skill parent");
@@ -619,13 +699,16 @@ mod tests {
             .with_base_dir(workspace_root.clone())
             .with_file_mounts([
                 SubagentFileMount::new(".", workspace_root.clone()),
-                SubagentFileMount::new(".skills", skills_root.clone()),
+                SubagentFileMount::new("skills", skills_root.clone()),
             ]);
 
-        let resolved = tool
-            .resolve_subagent_path(&session_skills_file)
-            .await
-            .expect("resolve absolute workspace .skills path");
+        let resolved = SubagentTool::<()>::resolve_subagent_path(
+            &tool.effective_mounts(),
+            tool.base_dir.as_deref(),
+            &session_skills_file,
+        )
+        .await
+        .expect("resolve absolute workspace .skills path");
         assert_eq!(resolved, mounted_skill_file);
 
         let _ = std::fs::remove_dir_all(root);

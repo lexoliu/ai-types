@@ -42,6 +42,10 @@ pub enum OrtError {
     /// Ndarray shape error.
     #[error("shape error: {0}")]
     Shape(String),
+
+    /// Background worker error.
+    #[error("worker error: {0}")]
+    Worker(String),
 }
 
 impl From<ort::Error> for OrtError {
@@ -50,12 +54,20 @@ impl From<ort::Error> for OrtError {
     }
 }
 
+/// `SessionBuilder` methods return an error that carries the partially-built
+/// builder so it can be recovered. We have nothing to recover, so drop it.
+impl From<ort::Error<ort::session::builder::SessionBuilder>> for OrtError {
+    fn from(e: ort::Error<ort::session::builder::SessionBuilder>) -> Self {
+        Self::Ort(e.into())
+    }
+}
+
 impl OrtError {
     /// Creates a tokenizer error from a path and error message.
-    pub fn tokenizer(path: impl Into<PathBuf>, message: impl ToString) -> Self {
+    pub fn tokenizer(path: impl Into<PathBuf>, message: impl Into<String>) -> Self {
         Self::Tokenizer {
             path: path.into(),
-            message: message.to_string(),
+            message: message.into(),
         }
     }
 }

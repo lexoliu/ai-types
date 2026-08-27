@@ -95,7 +95,7 @@ impl LanguageModelProvider for OpenAIProvider {
                         .context_length
                         .or(model.max_tokens)
                         .or(model.input_token_limit)
-                        .or_else(|| lookup_model_info(&model.id).map(|info| info.context_window));
+                        .or_else(|| lookup_model_info(&model.id).and_then(aither_models::ModelEntry::max_input_tokens));
                     let Some(context_length) = context_length else {
                         tracing::warn!(
                             model = %model.id,

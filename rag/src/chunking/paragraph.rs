@@ -104,12 +104,7 @@ impl Chunker for ParagraphChunker {
         let mut idx = 0usize;
 
         for paragraph in self.paragraphs(text) {
-            if current.is_empty() {
-                current.push_str(paragraph);
-                continue;
-            }
-
-            if current.len() + 2 + paragraph.len() > self.max_chunk_size {
+            if !current.is_empty() && current.len() + 2 + paragraph.len() > self.max_chunk_size {
                 let hash = content_hash(&current);
                 chunks.push(Chunk::with_metadata(
                     format!("{}#chunk_{}", doc.id, idx),
@@ -121,11 +116,10 @@ impl Chunker for ParagraphChunker {
                 ));
                 idx += 1;
                 current.clear();
-                current.push_str(paragraph);
-            } else {
+            } else if !current.is_empty() {
                 current.push_str("\n\n");
-                current.push_str(paragraph);
             }
+            current.push_str(paragraph);
         }
 
         if !current.is_empty() {
@@ -159,9 +153,9 @@ mod tests {
         let chunks = chunker.chunk(&doc).unwrap();
 
         assert_eq!(chunks.len(), 1);
-        assert!(chunks[0].text.contains("a"));
-        assert!(chunks[0].text.contains("b"));
-        assert!(chunks[0].text.contains("c"));
+        assert!(chunks[0].text.contains('a'));
+        assert!(chunks[0].text.contains('b'));
+        assert!(chunks[0].text.contains('c'));
     }
 
     #[test]

@@ -22,10 +22,15 @@ pub type Data = Vec<u8>;
 /// }
 /// ```
 pub trait AudioGenerator {
+    /// The error type returned by this generator.
+    type Error: core::error::Error + Send + Sync + 'static;
+
     /// Generates audio from text prompt.
     ///
-    /// Returns a [`Stream`] of [`Data`] chunks.
-    fn generate(&self, prompt: &str) -> impl Stream<Item = Data> + Send;
+    /// Returns a [`Stream`] of [`Data`] chunks. Synthesis can fail part-way
+    /// through, so each chunk is fallible rather than silently truncating the
+    /// audio on error.
+    fn generate(&self, prompt: &str) -> impl Stream<Item = Result<Data, Self::Error>> + Send;
 }
 
 /// Transcribes audio to text.
@@ -45,10 +50,15 @@ pub trait AudioGenerator {
 /// }
 /// ```
 pub trait AudioTranscriber {
+    /// The error type returned by this transcriber.
+    type Error: core::error::Error + Send + Sync + 'static;
+
     /// Transcribes audio data to text.
     ///
-    /// Returns a [`Stream`] of transcribed text chunks.
-    fn transcribe(&self, audio: &[u8]) -> impl Stream<Item = String> + Send;
+    /// Returns a [`Stream`] of transcribed text chunks. Transcription can fail
+    /// part-way through, so each chunk is fallible rather than silently
+    /// returning a partial transcript.
+    fn transcribe(&self, audio: &[u8]) -> impl Stream<Item = Result<String, Self::Error>> + Send;
 }
 
 #[cfg(test)]
@@ -57,10 +67,24 @@ mod tests {
     use alloc::{string::ToString, vec};
     use futures_lite::StreamExt;
 
+    /// Error type for the mocks below, which never fail.
+    #[derive(Debug)]
+    struct MockError;
+
+    impl core::fmt::Display for MockError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("mock error")
+        }
+    }
+
+    impl core::error::Error for MockError {}
+
     struct MockAudioGenerator;
 
     impl AudioGenerator for MockAudioGenerator {
-        fn generate(&self, prompt: &str) -> impl Stream<Item = Data> + Send {
+        type Error = MockError;
+
+        fn generate(&self, prompt: &str) -> impl Stream<Item = Result<Data, Self::Error>> + Send {
             // Generate mock audio data based on prompt length
             let chunks = if prompt.is_empty() {
                 vec![]
@@ -74,14 +98,19 @@ mod tests {
                 ]
             };
 
-            futures_lite::stream::iter(chunks)
+            futures_lite::stream::iter(chunks.into_iter().map(Ok))
         }
     }
 
     struct MockAudioTranscriber;
 
     impl AudioTranscriber for MockAudioTranscriber {
-        fn transcribe(&self, audio: &[u8]) -> impl Stream<Item = String> + Send {
+        type Error = MockError;
+
+        fn transcribe(
+            &self,
+            audio: &[u8],
+        ) -> impl Stream<Item = Result<String, Self::Error>> + Send {
             // Generate mock transcription based on audio length
             let text_chunks = if audio.is_empty() {
                 vec![]
@@ -99,7 +128,7 @@ mod tests {
                 ]
             };
 
-            futures_lite::stream::iter(text_chunks)
+            futures_lite::stream::iter(text_chunks.into_iter().map(Ok))
         }
     }
 
@@ -110,7 +139,7 @@ mod tests {
 
         let mut chunks = Vec::new();
         while let Some(chunk) = stream.next().await {
-            chunks.push(chunk);
+            chunks.push(chunk.expect("mock never fails"));
         }
 
         assert_eq!(chunks.len(), 1);
@@ -126,7 +155,7 @@ mod tests {
 
         let mut chunks = Vec::new();
         while let Some(chunk) = stream.next().await {
-            chunks.push(chunk);
+            chunks.push(chunk.expect("mock never fails"));
         }
 
         assert_eq!(chunks.len(), 3);
@@ -146,10 +175,10 @@ mod tests {
 
         let mut chunks = Vec::new();
         while let Some(chunk) = stream.next().await {
-            chunks.push(chunk);
+            chunks.push(chunk.expect("mock never fails"));
         }
 
-        assert!(chunks.is_empty());
+        assert!(chunks.is_empty(), "expected no chunks, got {chunks:?}");
     }
 
     #[tokio::test]
@@ -160,7 +189,7 @@ mod tests {
 
         let mut text_chunks = Vec::new();
         while let Some(chunk) = stream.next().await {
-            text_chunks.push(chunk);
+            text_chunks.push(chunk.expect("mock never fails"));
         }
 
         assert_eq!(text_chunks.len(), 1);
@@ -175,7 +204,7 @@ mod tests {
 
         let mut text_chunks = Vec::new();
         while let Some(chunk) = stream.next().await {
-            text_chunks.push(chunk);
+            text_chunks.push(chunk.expect("mock never fails"));
         }
 
         assert_eq!(text_chunks.len(), 2);
@@ -191,7 +220,7 @@ mod tests {
 
         let mut text_chunks = Vec::new();
         while let Some(chunk) = stream.next().await {
-            text_chunks.push(chunk);
+            text_chunks.push(chunk.expect("mock never fails"));
         }
 
         assert_eq!(text_chunks.len(), 5);
@@ -207,10 +236,13 @@ mod tests {
 
         let mut text_chunks = Vec::new();
         while let Some(chunk) = stream.next().await {
-            text_chunks.push(chunk);
+            text_chunks.push(chunk.expect("mock never fails"));
         }
 
-        assert!(text_chunks.is_empty());
+        assert!(
+            text_chunks.is_empty(),
+            "expected no text chunks, got {text_chunks:?}"
+        );
     }
 
     #[test]
@@ -240,13 +272,21 @@ mod tests {
 
         // Test clear
         data.clear();
-        assert!(data.is_empty());
+        assert!(
+            data.is_empty(),
+            "expected no audio data, got {} bytes",
+            data.len()
+        );
     }
 
     #[test]
     fn data_creation() {
         let empty_data: Data = Vec::new();
-        assert!(empty_data.is_empty());
+        assert!(
+            empty_data.is_empty(),
+            "expected no audio data, got {} bytes",
+            empty_data.len()
+        );
 
         let filled_data: Data = vec![42; 100];
         assert_eq!(filled_data.len(), 100);
@@ -264,7 +304,7 @@ mod tests {
 
         let mut all_audio_data = Vec::new();
         while let Some(chunk) = audio_stream.next().await {
-            all_audio_data.extend_from_slice(&chunk);
+            all_audio_data.extend_from_slice(&chunk.expect("mock never fails"));
         }
 
         // Transcribe the generated audio back to text
@@ -272,12 +312,15 @@ mod tests {
 
         let mut transcription_chunks = Vec::new();
         while let Some(chunk) = transcription_stream.next().await {
-            transcription_chunks.push(chunk);
+            transcription_chunks.push(chunk.expect("mock never fails"));
         }
 
         // Verify the workflow
-        assert!(!all_audio_data.is_empty());
-        assert!(!transcription_chunks.is_empty());
+        assert!(!all_audio_data.is_empty(), "expected audio data, got none");
+        assert!(
+            !transcription_chunks.is_empty(),
+            "expected transcription chunks, got none"
+        );
 
         let full_transcription: String = transcription_chunks.join("");
         assert_eq!(full_transcription, "This is a longer transcription");

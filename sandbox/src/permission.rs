@@ -1,8 +1,9 @@
-//! Permission handling for bash execution modes.
+//! Permission handling for terminal execution modes.
 //!
-//! Different bash modes have different permission requirements:
-//! - `Sandboxed`: No approval needed (read-only, no network)
-//! - `Network`: First-use approval only
+//! Different terminal modes have different permission requirements:
+//! - `Sandboxed`: No approval needed; outbound network is available by
+//!   default, filtered per-domain via [`PermissionHandler::check_domain`]
+//!   and audited by higher layers
 //! - `Unsafe`: Per-script approval required
 
 use std::future::Future;
@@ -10,30 +11,27 @@ use std::future::Future;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Permission mode for bash execution.
+/// Permission mode for terminal execution.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum BashMode {
-    /// Sandboxed execution with read-only filesystem and no network.
-    /// IPC commands (websearch, webfetch) still work.
-    /// No approval needed.
+pub enum TerminalMode {
+    /// Sandboxed execution without extra host privileges.
+    ///
+    /// Outbound network is available by default, filtered per-domain through
+    /// the configured network policy and always audited.
     #[default]
     Sandboxed,
-
-    /// Sandboxed execution with network access enabled.
-    /// Requires first-use approval.
-    Network,
 
     /// Unsafe execution without sandbox.
     /// Full system access. Requires per-script approval.
     Unsafe,
 }
 
-impl BashMode {
+impl TerminalMode {
     /// Returns whether this mode requires user approval.
     #[must_use]
     pub const fn requires_approval(self) -> bool {
-        matches!(self, Self::Network | Self::Unsafe)
+        matches!(self, Self::Unsafe)
     }
 
     /// Returns whether approval is needed per-script (vs first-use only).
@@ -46,8 +44,7 @@ impl BashMode {
     #[must_use]
     pub const fn description(self) -> &'static str {
         match self {
-            Self::Sandboxed => "sandboxed (read-only, no network)",
-            Self::Network => "network-enabled sandbox",
+            Self::Sandboxed => "sandboxed",
             Self::Unsafe => "unsafe (no sandbox, full access)",
         }
     }
@@ -55,22 +52,34 @@ impl BashMode {
 
 /// Trait for handling permission requests.
 ///
-/// Implementors decide whether to allow bash executions based on mode and script.
+/// Implementors decide whether to allow terminal executions based on mode and script.
 pub trait PermissionHandler: Send + Sync {
     /// Checks if the given mode and script are allowed.
     ///
     /// For `Sandboxed` mode, this should always return `Ok(true)`.
-    /// For `Network` mode, this might return `Ok(true)` after first approval.
     /// For `Unsafe` mode, this should prompt for each script.
     fn check(
         &self,
-        mode: BashMode,
+        mode: TerminalMode,
         script: &str,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send;
 
+    /// Returns whether `check` will suspend waiting for an external approval.
+    ///
+    /// This is used by higher-level runtimes to surface pause/resume lifecycle
+    /// events only when a permission request will actually block.
+    fn will_wait_for_approval(
+        &self,
+        mode: TerminalMode,
+        script: &str,
+    ) -> impl Future<Output = bool> + Send {
+        let _ = (mode, script);
+        async { false }
+    }
+
     /// Checks if a network domain is allowed.
     ///
-    /// Called for each network connection attempt in `Network` mode.
+    /// Called for each network connection attempt in `Sandboxed` mode.
     /// The implementation may prompt the user, check against a whitelist, etc.
     ///
     /// Default implementation denies all domains (fail-safe).
@@ -102,85 +111,52 @@ pub enum PermissionError {
 pub struct DenyUnsafe;
 
 impl PermissionHandler for DenyUnsafe {
-    async fn check(&self, mode: BashMode, _script: &str) -> Result<bool, PermissionError> {
-        match mode {
-            BashMode::Sandboxed => Ok(true),
-            BashMode::Network | BashMode::Unsafe => Err(PermissionError::Denied(format!(
-                "{} mode requires approval but no interactive handler is configured",
+    fn check(
+        &self,
+        mode: TerminalMode,
+        _script: &str,
+    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
+        std::future::ready(match mode {
+            TerminalMode::Sandboxed => Ok(true),
+            TerminalMode::Unsafe => Err(PermissionError::Denied(format!(
+                "sandbox blocked {} execution; approval is required to escalate this command, but no interactive approval handler is configured",
                 mode.description()
             ))),
-        }
+        })
+    }
+
+    fn will_wait_for_approval(
+        &self,
+        _mode: TerminalMode,
+        _script: &str,
+    ) -> impl Future<Output = bool> + Send {
+        std::future::ready(false)
     }
 }
 
-/// A permission handler that allows everything (for testing).
+/// A no-op permission handler that allows every execution mode and domain.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct AllowAll;
+pub struct NoopPermissionHandler;
 
-impl PermissionHandler for AllowAll {
-    async fn check(&self, _mode: BashMode, _script: &str) -> Result<bool, PermissionError> {
-        Ok(true)
+impl PermissionHandler for NoopPermissionHandler {
+    fn check(
+        &self,
+        _mode: TerminalMode,
+        _script: &str,
+    ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
+        std::future::ready(Ok(true))
     }
 
-    async fn check_domain(&self, _domain: &str, _port: u16) -> bool {
-        true
-    }
-}
-
-/// A permission handler that tracks network approval state.
-#[derive(Debug, Default)]
-pub struct StatefulPermissionHandler<Inner> {
-    inner: Inner,
-    network_approved: std::sync::atomic::AtomicBool,
-}
-
-impl<Inner> StatefulPermissionHandler<Inner> {
-    /// Creates a new stateful handler wrapping the given inner handler.
-    pub const fn new(inner: Inner) -> Self {
-        Self {
-            inner,
-            network_approved: std::sync::atomic::AtomicBool::new(false),
-        }
+    fn will_wait_for_approval(
+        &self,
+        _mode: TerminalMode,
+        _script: &str,
+    ) -> impl Future<Output = bool> + Send {
+        std::future::ready(false)
     }
 
-    /// Returns whether network mode has been approved.
-    pub fn is_network_approved(&self) -> bool {
-        self.network_approved
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Marks network mode as approved.
-    pub fn approve_network(&self) {
-        self.network_approved
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-}
-
-impl<Inner: PermissionHandler> PermissionHandler for StatefulPermissionHandler<Inner> {
-    async fn check(&self, mode: BashMode, script: &str) -> Result<bool, PermissionError> {
-        match mode {
-            BashMode::Sandboxed => Ok(true),
-            BashMode::Network => {
-                // Check if already approved
-                if self.is_network_approved() {
-                    return Ok(true);
-                }
-                // Ask inner handler
-                let approved = self.inner.check(mode, script).await?;
-                if approved {
-                    self.approve_network();
-                }
-                Ok(approved)
-            }
-            BashMode::Unsafe => {
-                // Always ask for unsafe
-                self.inner.check(mode, script).await
-            }
-        }
-    }
-
-    async fn check_domain(&self, domain: &str, port: u16) -> bool {
-        self.inner.check_domain(domain, port).await
+    fn check_domain(&self, _domain: &str, _port: u16) -> impl Future<Output = bool> + Send {
+        std::future::ready(true)
     }
 }
 
@@ -193,37 +169,28 @@ mod tests {
         let handler = DenyUnsafe;
 
         // Sandboxed should be allowed
-        assert!(handler.check(BashMode::Sandboxed, "ls").await.unwrap());
-
-        // Network should be denied
-        assert!(handler.check(BashMode::Network, "curl").await.is_err());
+        assert!(handler.check(TerminalMode::Sandboxed, "ls").await.unwrap());
 
         // Unsafe should be denied
-        assert!(handler.check(BashMode::Unsafe, "rm -rf /").await.is_err());
+        assert!(
+            handler
+                .check(TerminalMode::Unsafe, "rm -rf /")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
-    async fn test_allow_all() {
-        let handler = AllowAll;
+    async fn test_noop_permission_handler() {
+        let handler = NoopPermissionHandler;
 
-        assert!(handler.check(BashMode::Sandboxed, "ls").await.unwrap());
-        assert!(handler.check(BashMode::Network, "curl").await.unwrap());
-        assert!(handler.check(BashMode::Unsafe, "rm -rf /").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_stateful_handler() {
-        let handler = StatefulPermissionHandler::new(AllowAll);
-
-        // Network not yet approved
-        assert!(!handler.is_network_approved());
-
-        // First network check approves
-        assert!(handler.check(BashMode::Network, "curl").await.unwrap());
-        assert!(handler.is_network_approved());
-
-        // Subsequent checks use cached approval
-        assert!(handler.check(BashMode::Network, "wget").await.unwrap());
+        assert!(handler.check(TerminalMode::Sandboxed, "ls").await.unwrap());
+        assert!(
+            handler
+                .check(TerminalMode::Unsafe, "rm -rf /")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -236,19 +203,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_allow_all_check_domain() {
-        let handler = AllowAll;
+    async fn test_noop_permission_handler_check_domain() {
+        let handler = NoopPermissionHandler;
 
-        // AllowAll allows all domains
+        // NoopPermissionHandler allows all domains
         assert!(handler.check_domain("example.com", 443).await);
         assert!(handler.check_domain("malicious.com", 80).await);
-    }
-
-    #[tokio::test]
-    async fn test_stateful_handler_check_domain() {
-        let handler = StatefulPermissionHandler::new(AllowAll);
-
-        // Delegates to inner handler
-        assert!(handler.check_domain("example.com", 443).await);
     }
 }

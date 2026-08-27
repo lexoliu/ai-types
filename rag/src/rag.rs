@@ -44,6 +44,9 @@ where
     M: EmbeddingModel + Send + Sync + 'static,
 {
     /// Creates a new RAG instance with default configuration.
+    ///
+    /// # Panics
+    /// Panics if the default redb persistence store cannot be created.
     pub fn new(embedder: M) -> Self {
         let config = RagConfig::default();
         let persistence =
@@ -71,25 +74,39 @@ where
     P: Persistence,
 {
     /// Loads the index from persistence.
-    pub fn load(&self) -> Result<usize> {
-        let entries = self.persistence.load()?;
+    ///
+    /// # Errors
+    /// Returns an error when persistence loading fails or entries cannot be loaded into the index.
+    pub async fn load(&self) -> Result<usize> {
+        let entries = self.persistence.load().await?;
         let count = entries.len();
         self.store.index().load(entries)?;
         Ok(count)
     }
 
     /// Saves the index to persistence.
-    pub fn save(&self) -> Result<()> {
+    ///
+    /// # Errors
+    /// Returns an error when persistence saving fails.
+    pub async fn save(&self) -> Result<()> {
         let entries = self.store.index().entries();
-        self.persistence.save(&entries)
+        self.persistence.save(&entries).await
     }
 
     /// Indexes all files in a directory.
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be walked, a file cannot be
+    /// read, or embedding fails.
     pub async fn index_directory<Pth: AsRef<Path>>(&self, dir: Pth) -> Result<usize> {
         self.index_directory_with_progress(dir, |_| {}).await
     }
 
     /// Indexes all files in a directory with progress callback.
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be walked, a file cannot be
+    /// read, or embedding fails.
     pub async fn index_directory_with_progress<Pth, F>(
         &self,
         dir: Pth,
@@ -156,7 +173,7 @@ where
 
         if self.config.auto_save {
             on_progress(IndexProgress::new(indexed, total, None, IndexStage::Saving));
-            self.save()?;
+            self.save().await?;
         }
 
         on_progress(IndexProgress::new(indexed, total, None, IndexStage::Done));
@@ -165,6 +182,9 @@ where
     }
 
     /// Inserts a single document.
+    /// # Errors
+    ///
+    /// Returns an error if the document cannot be embedded or stored.
     pub async fn insert(&self, document: Document) -> Result<usize> {
         self.store.insert(document).await
     }
@@ -175,11 +195,19 @@ where
     }
 
     /// Searches for similar content.
+    /// # Errors
+    ///
+    /// Returns an error if the query cannot be embedded, or its dimension does
+    /// not match the index.
     pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
         self.store.search(query).await
     }
 
     /// Searches with a custom result count.
+    /// # Errors
+    ///
+    /// Returns an error if the query cannot be embedded, or its dimension does
+    /// not match the index.
     pub async fn search_with_k(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         self.store.search_with_k(query, top_k).await
     }
@@ -336,6 +364,9 @@ where
     }
 
     /// Builds the [`Rag`] instance using Redb persistence.
+    ///
+    /// # Errors
+    /// Returns an error when the configured redb persistence store cannot be created.
     pub fn build(self) -> Result<Rag<M, C, L, RedbPersistence>> {
         let config = self.config_builder.build();
         let persistence = RedbPersistence::new(&config.index_path)?;
@@ -350,6 +381,9 @@ where
     }
 
     /// Builds the [`Rag`] instance using a provided persistence backend.
+    /// # Errors
+    ///
+    /// Returns an error if the persistence backend rejects initialization.
     pub fn build_with_persistence<P: Persistence>(self, persistence: P) -> Result<Rag<M, C, L, P>> {
         let config = self.config_builder.build();
         let store =
@@ -390,13 +424,17 @@ mod tests {
             self.dimension
         }
 
-        async fn embed(&self, text: &str) -> aither_core::Result<Vec<f32>> {
+        fn embed(
+            &self,
+            text: &str,
+        ) -> impl std::future::Future<Output = aither_core::Result<Vec<f32>>> + Send {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut vec = vec![0.0; self.dimension];
             for (idx, value) in vec.iter_mut().enumerate() {
-                *value = ((text.len() + idx) % 10) as f32 / 10.0;
+                let digit = u8::try_from((text.len() + idx) % 10).expect("modulo result fits u8");
+                *value = f32::from(digit) / 10.0;
             }
-            Ok(vec)
+            std::future::ready(Ok(vec))
         }
     }
 
@@ -447,7 +485,7 @@ mod tests {
             rag.insert(Document::new("doc1", "Hello world"))
                 .await
                 .unwrap();
-            rag.save().unwrap();
+            rag.save().await.unwrap();
         }
 
         {
@@ -457,7 +495,7 @@ mod tests {
                 .build()
                 .unwrap();
 
-            let count = rag.load().unwrap();
+            let count = rag.load().await.unwrap();
             assert_eq!(count, 1);
             assert_eq!(rag.len(), 1);
         }
@@ -479,6 +517,6 @@ mod tests {
 
         assert!(!rag.config().deduplication);
         assert_eq!(rag.config().default_top_k, 10);
-        assert_eq!(rag.config().similarity_threshold, 0.5);
+        assert!((rag.config().similarity_threshold - 0.5).abs() < f32::EPSILON);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "aither-attachments"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -16,11 +16,12 @@ async-fs = "2"
 futures-lite = "2.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
+const-hex = "1.19"
 
 [dev-dependencies]
-tempfile = "3.24.0"
-tokio-test = "0.4"
+tempfile = "3.27.0"
+tokio = { version = "1.0", features = ["macros", "rt"] }
 
 [lints]
 workspace = true

@@ -3,10 +3,13 @@
 mod ask;
 mod terminal;
 
-pub use ask::AskCommand;
-pub use terminal::{InputTerminalArgs, InputTerminalTool, KillTerminalArgs, KillTerminalTool};
+pub use ask::{AskCommand, AskModelTier};
+pub use terminal::{
+    InputTerminalArgs, InputTerminalTool, KillTerminalArgs, KillTerminalTool,
+    ReadTerminalDeltaArgs, ReadTerminalDeltaTool,
+};
 
-use leash::IpcRouter;
+use heel::IpcRouter;
 
 /// Creates an IPC router with built-in commands (excluding ask, which needs LLM).
 #[must_use]

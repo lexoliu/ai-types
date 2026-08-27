@@ -7,7 +7,7 @@ use crate::files::upload_file;
 #[cfg(not(target_arch = "wasm32"))]
 use aither_attachments::{FileCache, default_cache_dir};
 #[cfg(not(target_arch = "wasm32"))]
-use aither_core::llm::Message;
+use aither_core::llm::{Attachment, Message};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 #[cfg(not(target_arch = "wasm32"))]
@@ -42,7 +42,7 @@ pub async fn resolve_messages(
         for attachment in attachments {
             let resolved_url = resolve_attachment(cfg, &mut cache, &attachment).await?;
             cache_dirty |= resolved_url.cache_updated;
-            next_attachments.push(resolved_url.url);
+            next_attachments.push(attachment.with_url(resolved_url.url));
         }
 
         resolved.push(Message::User {
@@ -68,30 +68,20 @@ struct ResolvedUrl {
 async fn resolve_attachment(
     cfg: &GeminiConfig,
     cache: &mut FileCache,
-    attachment: &Url,
+    attachment: &Attachment,
 ) -> Result<ResolvedUrl, GeminiError> {
-    match attachment.scheme() {
+    let url = attachment.url();
+    match url.scheme() {
         "file" => {
-            let path = attachment.to_file_path().map_err(|()| {
+            let path = url.to_file_path().map_err(|()| {
                 GeminiError::Api("Attachment file URL could not be converted to path".to_string())
             })?;
             resolve_file_attachment(cfg, cache, &path).await
         }
-        "http" | "https" => {
-            if is_gemini_file_uri(attachment) {
-                Ok(ResolvedUrl {
-                    url: attachment.clone(),
-                    cache_updated: false,
-                })
-            } else {
-                Err(GeminiError::Api(
-                    "HTTP attachments must be uploaded via Gemini Files API".to_string(),
-                ))
-            }
-        }
-        "data" => Err(GeminiError::Api(
-            "data: attachments must be uploaded via Gemini Files API".to_string(),
-        )),
+        "http" | "https" | "data" => Ok(ResolvedUrl {
+            url: url.clone(),
+            cache_updated: false,
+        }),
         other => Err(GeminiError::Api(format!(
             "Unsupported attachment URL scheme: {other}"
         ))),
@@ -140,10 +130,4 @@ async fn resolve_file_attachment(
         url,
         cache_updated: true,
     })
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn is_gemini_file_uri(url: &Url) -> bool {
-    url.host_str()
-        .is_some_and(|h| h == "generativelanguage.googleapis.com")
 }

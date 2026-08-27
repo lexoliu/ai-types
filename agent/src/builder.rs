@@ -3,17 +3,21 @@
 //! The builder pattern allows fluent configuration of agents with
 //! tools, hooks, and various settings.
 
+#[cfg(feature = "skills")]
 use std::sync::Arc;
 
 use aither_core::{LanguageModel, llm::Tool};
-use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, OutputStore};
+use aither_sandbox::{BackgroundTaskReceiver, JobRegistry, PermissionEventReceiver};
+#[cfg(feature = "skills")]
+use aither_skills::SkillRegistry;
 
 use crate::{
-    agent::{Agent, ModelTier},
+    agent::Agent,
     compression::ContextStrategy,
-    config::{AgentConfig, AgentKind, ContextBlock},
+    config::{AgentConfig, AgentKind},
     context::Context,
     hook::{HCons, Hook},
+    model_group::ModelTier,
     todo::{TodoList, TodoTool},
     tools::AgentTools,
     transcript::Transcript,
@@ -52,12 +56,15 @@ pub struct AgentBuilder<Advanced, Balanced = Advanced, Fast = Balanced, H = ()> 
     tools: AgentTools,
     hooks: H,
     config: AgentConfig,
+    context: Context,
     todo_list: Option<TodoList>,
-    output_store: Option<Arc<OutputStore>>,
     background_receiver: Option<BackgroundTaskReceiver>,
+    permission_receiver: Option<PermissionEventReceiver>,
     job_registry: Option<JobRegistry>,
     transcript: Option<Transcript>,
     sandbox_dir: Option<std::path::PathBuf>,
+    #[cfg(feature = "skills")]
+    skill_registry: Option<Arc<SkillRegistry>>,
 }
 
 impl<Advanced, Balanced, Fast, H> std::fmt::Debug for AgentBuilder<Advanced, Balanced, Fast, H> {
@@ -66,7 +73,7 @@ impl<Advanced, Balanced, Fast, H> std::fmt::Debug for AgentBuilder<Advanced, Bal
             .field("tier", &self.tier)
             .field("config", &self.config)
             .field("todo_enabled", &self.todo_list.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -83,12 +90,15 @@ impl<LLM: LanguageModel + Clone> AgentBuilder<LLM, LLM, LLM, ()> {
             tools: AgentTools::new(),
             hooks: (),
             config: AgentConfig::default(),
+            context: Context::default(),
             todo_list: None,
-            output_store: None,
             background_receiver: None,
+            permission_receiver: None,
             job_registry: None,
             transcript: None,
             sandbox_dir: None,
+            #[cfg(feature = "skills")]
+            skill_registry: None,
         }
     }
 }
@@ -116,12 +126,15 @@ where
             tools: self.tools,
             hooks: self.hooks,
             config: self.config,
+            context: self.context,
             todo_list: self.todo_list,
-            output_store: self.output_store,
             background_receiver: self.background_receiver,
+            permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
+            #[cfg(feature = "skills")]
+            skill_registry: self.skill_registry,
         }
     }
 
@@ -141,12 +154,15 @@ where
             tools: self.tools,
             hooks: self.hooks,
             config: self.config,
+            context: self.context,
             todo_list: self.todo_list,
-            output_store: self.output_store,
             background_receiver: self.background_receiver,
+            permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
+            #[cfg(feature = "skills")]
+            skill_registry: self.skill_registry,
         }
     }
 
@@ -175,17 +191,29 @@ where
     /// Registers an eager (always-loaded) tool.
     ///
     /// Eager tools are included in every LLM request.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
     pub fn tool<T: Tool + 'static>(mut self, tool: T) -> Self {
-        self.tools.register(tool);
+        self.tools
+            .register(tool)
+            .expect("tool registration must succeed: duplicate name or missing description");
         self
     }
 
-    /// Registers a dynamic bash tool (type-erased).
+    /// Registers a dynamic terminal tool (type-erased).
     ///
-    /// This is used for child bash tools in subagents where the concrete type
-    /// is not known at compile time.
-    pub fn dyn_bash(mut self, dyn_tool: aither_sandbox::DynBashTool) -> Self {
-        self.tools.register_dyn_bash(dyn_tool);
+    /// This is used for child terminal capability bundles in subagents where the
+    /// concrete terminal type is not known at compile time.
+    pub fn dyn_terminal(mut self, dyn_tool: aither_sandbox::DynTerminalTool) -> Self {
+        self.background_receiver = Some(dyn_tool.background_receiver());
+        self.permission_receiver = Some(dyn_tool.permission_receiver());
+        self.job_registry = Some(dyn_tool.job_registry());
+        self.sandbox_dir = Some(dyn_tool.working_dir().clone());
+        self.tools.register_dyn_terminal(dyn_tool);
         self
     }
 
@@ -212,12 +240,15 @@ where
             tools: self.tools,
             hooks: HCons::new(hook, self.hooks),
             config: self.config,
+            context: self.context,
             todo_list: self.todo_list,
-            output_store: self.output_store,
             background_receiver: self.background_receiver,
+            permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
+            #[cfg(feature = "skills")]
+            skill_registry: self.skill_registry,
         }
     }
 
@@ -274,9 +305,34 @@ where
         self
     }
 
-    /// Adds a structured context block.
-    pub fn context_block(mut self, block: ContextBlock) -> Self {
-        self.config.context_blocks.push(block);
+    /// Sets the skill registry used for runtime skill matching and activation.
+    #[cfg(feature = "skills")]
+    pub fn skill_registry(mut self, registry: Arc<SkillRegistry>) -> Self {
+        self.skill_registry = Some(registry);
+        self
+    }
+
+    /// Inserts or replaces a typed persistent system block.
+    pub fn system<T: serde::Serialize>(mut self, value: T) -> Self {
+        self.context.insert_system(&value);
+        self
+    }
+
+    /// Inserts or replaces a persistent system block with an explicit tag.
+    pub fn system_named(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
+        self.context.insert_system_named(tag, content);
+        self
+    }
+
+    /// Inserts or replaces a persistent system block with raw text.
+    ///
+    /// Unlike [`system`](Self::system) and [`system_named`](Self::system_named),
+    /// the `content` is stored verbatim without any XML wrapping. This is the
+    /// preferred entry point for prose system blocks (workspace descriptions,
+    /// runtime metadata, environment hints) where XML structure adds tokens
+    /// without providing semantic value.
+    pub fn system_text(mut self, tag: impl Into<String>, content: impl Into<String>) -> Self {
+        self.context.insert_system_text(tag, content);
         self
     }
 
@@ -330,9 +386,9 @@ where
         self
     }
 
-    /// Registers a bash tool for script execution in a sandbox.
+    /// Registers the terminal tool for command execution in a sandbox.
     ///
-    /// The bash tool enables script execution with configurable permission modes
+    /// The terminal tool enables command execution with configurable permission modes
     /// (sandboxed, network, unsafe). It creates its own working directory with
     /// four random words and manages output storage internally.
     ///
@@ -342,32 +398,43 @@ where
     /// # Example
     ///
     /// ```rust,ignore
-    /// use aither_sandbox::{BashTool, ToolRegistryBuilder, permission::DenyUnsafe};
+    /// use aither_sandbox::{TerminalTool, ToolRegistryBuilder, permission::DenyUnsafe};
     /// use std::sync::Arc;
     ///
-    /// // Create bash tool (creates random working dir like amber-forest-thunder-pearl/)
-    /// let bash_tool = BashTool::new_in(parent, DenyUnsafe, executor).await?;
-    /// let registry = Arc::new(ToolRegistryBuilder::new().build(bash_tool.outputs_dir()));
-    /// let bash_tool = bash_tool.with_registry(registry);
+    /// // Create terminal tool (creates random working dir like amber-forest-thunder-pearl/)
+    /// let terminal_tool = TerminalTool::new_in(parent, DenyUnsafe, executor).await?;
+    /// let registry = Arc::new(ToolRegistryBuilder::new().build(terminal_tool.outputs_dir()));
+    /// let terminal_tool = terminal_tool.with_registry(registry);
     ///
     /// let agent = Agent::builder(llm)
-    ///     .bash(bash_tool)
+    ///     .terminal(terminal_tool)
     ///     .build();
     /// ```
-    pub fn bash<P, E, State>(mut self, bash_tool: aither_sandbox::BashTool<P, E, State>) -> Self
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
+    pub fn terminal<P, E, State>(
+        mut self,
+        terminal_tool: aither_sandbox::TerminalTool<P, E, State>,
+    ) -> Self
     where
         P: aither_sandbox::PermissionHandler + 'static,
         E: executor_core::Executor + Clone + 'static,
         State: Clone + 'static,
-        aither_sandbox::BashTool<P, E, State>: Tool + 'static,
+        aither_sandbox::TerminalTool<P, E, State>: Tool + 'static,
     {
-        let output_store = bash_tool.output_store().clone();
-        let background_receiver = bash_tool.background_receiver();
-        let job_registry = bash_tool.job_registry();
-        self.sandbox_dir = Some(bash_tool.working_dir().clone());
-        self.tools.register(bash_tool);
-        self.output_store = Some(output_store);
+        let background_receiver = terminal_tool.background_receiver();
+        let permission_receiver = terminal_tool.permission_receiver();
+        let job_registry = terminal_tool.job_registry();
+        self.sandbox_dir = Some(terminal_tool.working_dir().clone());
+        self.tools
+            .register(terminal_tool)
+            .expect("tool registration must succeed: duplicate name or missing description");
         self.background_receiver = Some(background_receiver);
+        self.permission_receiver = Some(permission_receiver);
         self.job_registry = Some(job_registry);
         self
     }
@@ -391,10 +458,18 @@ where
     ///     .todo()
     ///     .build();
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
     pub fn todo(mut self) -> Self {
         let list = TodoList::new();
         let tool = TodoTool::with_list(list.clone());
-        self.tools.register(tool);
+        self.tools
+            .register(tool)
+            .expect("tool registration must succeed: duplicate name or missing description");
         self.todo_list = Some(list);
         self
     }
@@ -403,9 +478,17 @@ where
     ///
     /// Use this when you want to share a todo list between multiple agents
     /// or access the list externally.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the tool cannot be registered: another tool already uses
+    /// its name, or it carries no description for the model to read. Both
+    /// are mistakes in the calling program.
     pub fn todo_with_list(mut self, list: TodoList) -> Self {
         let tool = TodoTool::with_list(list.clone());
-        self.tools.register(tool);
+        self.tools
+            .register(tool)
+            .expect("tool registration must succeed: duplicate name or missing description");
         self.todo_list = Some(list);
         self
     }
@@ -420,16 +503,26 @@ where
             tools: self.tools,
             hooks: self.hooks,
             config: self.config,
-            context: Context::default(),
+            context: self.context,
             profile: None,
             fast_profile: None,
             initialized: false,
             todo_list: self.todo_list,
-            output_store: self.output_store,
             background_receiver: self.background_receiver,
+            permission_receiver: self.permission_receiver,
             job_registry: self.job_registry,
             transcript: self.transcript,
             sandbox_dir: self.sandbox_dir,
+            last_working_docs: None,
+            last_request_started_at: None,
+            transient_system_messages: Vec::new(),
+            cache_stats: crate::CacheStats::new(),
+            #[cfg(feature = "skills")]
+            skill_registry: self.skill_registry,
+            #[cfg(feature = "skills")]
+            active_skills: Vec::new(),
+            #[cfg(feature = "skills")]
+            active_allowed_tools: None,
         }
     }
 }
@@ -439,6 +532,8 @@ mod tests {
     use super::*;
     use std::borrow::Cow;
 
+    #[cfg(feature = "skills")]
+    use aither_skills::{Skill, SkillRegistry};
     use schemars::JsonSchema;
     use serde::Deserialize;
 
@@ -470,20 +565,23 @@ mod tests {
             futures_lite::stream::empty()
         }
 
-        async fn profile(&self) -> aither_core::llm::model::Profile {
-            aither_core::llm::model::Profile::new(
+        fn profile(
+            &self,
+        ) -> impl std::future::Future<Output = aither_core::llm::model::Profile> + Send {
+            std::future::ready(aither_core::llm::model::Profile::new(
                 "mock",
                 "test",
                 "mock-model",
                 "A mock model for testing",
                 100_000,
-            )
+            ))
         }
     }
 
     // Mock tool
     struct MockTool;
 
+    /// Does nothing, for tests that only care that a tool was registered.
     #[derive(Debug, JsonSchema, Deserialize)]
     struct MockArgs;
 
@@ -493,12 +591,13 @@ mod tests {
         }
 
         type Arguments = MockArgs;
+        type Res = aither_core::llm::ToolResult;
 
-        async fn call(
+        fn call(
             &self,
             _args: Self::Arguments,
-        ) -> aither_core::Result<aither_core::llm::ToolOutput> {
-            Ok(aither_core::llm::ToolOutput::text("ok"))
+        ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+            std::future::ready(Ok(aither_core::llm::ToolResult::text("ok")))
         }
     }
 
@@ -511,6 +610,14 @@ mod tests {
     fn test_builder_basic() {
         let agent = AgentBuilder::new(MockLlm).build();
         assert!(agent.tools.definitions().is_empty());
+    }
+
+    #[test]
+    fn public_model_tier_configures_agent_builder() {
+        let agent = AgentBuilder::new(MockLlm)
+            .tier(crate::ModelTier::Balanced)
+            .build();
+        assert_eq!(agent.tier, crate::ModelTier::Balanced);
     }
 
     #[test]
@@ -558,5 +665,45 @@ mod tests {
             agent.config.max_iterations,
             AgentConfig::default().max_iterations
         );
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn test_builder_preserves_skill_registry() {
+        let mut registry = SkillRegistry::new();
+        registry.register(Skill {
+            name: "code-review".to_string(),
+            description: "Review code carefully".to_string(),
+            instructions: "Use a review checklist.".to_string(),
+            allowed_tools: Some(vec!["mock_tool".to_string()]),
+            resources: std::collections::HashMap::new(),
+        });
+
+        let agent = AgentBuilder::new(MockLlm)
+            .skill_registry(Arc::new(registry))
+            .build();
+        assert!(agent.skill_registry.is_some());
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn test_runtime_skill_activation_is_disabled() {
+        let mut registry = SkillRegistry::new();
+        registry.register(Skill {
+            name: "code-review".to_string(),
+            description: "Review code carefully".to_string(),
+            instructions: "Use a review checklist.".to_string(),
+            allowed_tools: Some(vec!["mock_tool".to_string()]),
+            resources: std::collections::HashMap::new(),
+        });
+
+        let mut agent = AgentBuilder::new(MockLlm)
+            .skill_registry(Arc::new(registry))
+            .build();
+        let events = agent.activate_skills_for_prompt("please review this patch");
+
+        assert!(events.is_empty());
+        assert!(agent.active_skills.is_empty());
+        assert!(agent.active_allowed_tools.is_none());
     }
 }

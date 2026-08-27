@@ -54,23 +54,24 @@ impl PoolingStrategy {
                     .collect()
             }
             Self::Mean => {
-                // Count valid tokens
-                let valid_count: f32 = attention_mask.iter().map(|&m| m as f32).sum();
-                if valid_count == 0.0 {
-                    return vec![0.0; hidden_dim];
-                }
-
-                // Sum hidden states weighted by attention mask
+                // Sum the unmasked positions, counting them as we go: deriving
+                // the divisor from the same pass is what keeps it in step with
+                // what was actually summed.
                 let mut result = vec![0.0; hidden_dim];
+                let mut valid_count = 0.0_f32;
                 for (seq_idx, &mask) in attention_mask.iter().enumerate() {
-                    if mask != 0 {
-                        for (d, value) in result.iter_mut().enumerate() {
-                            *value += hidden_states[[0, seq_idx, d]];
-                        }
+                    if mask == 0 {
+                        continue;
+                    }
+                    valid_count += 1.0;
+                    for (d, value) in result.iter_mut().enumerate() {
+                        *value += hidden_states[[0, seq_idx, d]];
                     }
                 }
 
-                // Divide by count
+                if valid_count == 0.0 {
+                    return vec![0.0; hidden_dim];
+                }
                 for value in &mut result {
                     *value /= valid_count;
                 }

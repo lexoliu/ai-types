@@ -1,18 +1,19 @@
 use aither_core::{
-    Error, LanguageModel,
+    LanguageModel,
     llm::{
-        Event, LLMRequest, Message, Role, Usage,
-        model::{Ability, Parameters, Profile, ReasoningEffort, ToolChoice},
+        Attachment, Event, GenerateError, LLMRequest, Message, ReasoningState, Role, Usage,
+        model::{Ability, Parameters, Profile, ToolChoice},
         tool::ToolDefinition,
     },
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_core::Stream;
 use futures_lite::StreamExt;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use tracing::debug;
 
+use crate::PROVIDER_NAME;
 use crate::{
     client::stream_generate,
     config::Gemini,
@@ -20,7 +21,7 @@ use crate::{
     types::{
         FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration, GeminiContent, GeminiTool,
         GenerateContentRequest, GenerationConfig, GoogleSearch, Part, PromptFeedback, SafetyRating,
-        ThinkingConfig, ToolConfig, UsageMetadata,
+        ThinkingConfig, ThinkingLevel, ToolConfig, UsageMetadata,
     },
 };
 use schemars::schema_for;
@@ -39,7 +40,7 @@ impl LanguageModel for Gemini {
     fn generate<T: JsonSchema + DeserializeOwned + 'static>(
         &self,
         mut request: LLMRequest,
-    ) -> impl core::future::Future<Output = aither_core::Result<T>> + Send {
+    ) -> impl core::future::Future<Output = Result<T, GenerateError<Self::Error>>> + Send {
         let schema = schema_for!(T);
         let mut params = request.parameters().clone();
         params.structured_outputs = true;
@@ -48,9 +49,13 @@ impl LanguageModel for Gemini {
 
         let stream = self.respond(request);
         async move {
-            let text = aither_core::llm::collect_text(stream).await?;
-            serde_json::from_str::<T>(&text)
-                .map_err(|err| Error::new(err).context("failed to parse structured output"))
+            let text = aither_core::llm::collect_text(stream)
+                .await
+                .map_err(GenerateError::Provider)?;
+            serde_json::from_str::<T>(&text).map_err(|source| GenerateError::Parse {
+                source,
+                response: text.chars().take(500).collect(),
+            })
         }
     }
 
@@ -66,11 +71,10 @@ impl LanguageModel for Gemini {
                     tracing::debug!("API did not return context_length: {e}");
                     // Fallback to models database
                     aither_models::lookup(&model_name)
-                        .map(|info| info.context_window)
+                        .and_then(aither_models::ModelEntry::max_input_tokens)
                         .unwrap_or_else(|| {
                             panic!(
-                                "Gemini model '{}' missing context metadata from provider and aither-models",
-                                model_name
+                                "Gemini model '{model_name}' missing context metadata from provider and aither-models"
                             )
                         })
                 }
@@ -101,85 +105,160 @@ fn respond_stream(
     Box::pin(respond_stream_inner(cfg, request))
 }
 
+/// Assembles the Gemini request for a provider-agnostic one.
+///
+/// Async because file attachments are uploaded before the request is sent.
+///
+/// # Errors
+///
+/// Returns [`GeminiError`] if the request carries another provider's cache
+/// settings, names an exact tool that was not supplied, or an attachment cannot
+/// be resolved.
+async fn build_generate_request(
+    cfg: &crate::config::GeminiConfig,
+    request: LLMRequest,
+) -> Result<GenerateContentRequest, GeminiError> {
+    let (messages, parameters, tool_defs) = request.into_parts();
+
+    if parameters.cache.openai.is_some() || parameters.cache.claude.is_some() {
+        return Err(GeminiError::Api(
+            "Gemini provider only accepts cache.gemini settings".to_string(),
+        ));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let messages = crate::attachments::resolve_messages(cfg, messages).await?;
+    // wasm32 has no filesystem, so there is nothing to upload and no use for
+    // the config here.
+    #[cfg(target_arch = "wasm32")]
+    let _ = cfg;
+
+    let (system_instruction, contents) = messages_to_gemini(&messages).await?;
+
+    let tool_defs: Vec<ToolDefinition> = match &parameters.tool_choice {
+        ToolChoice::None => Vec::new(),
+        ToolChoice::Exact(name) => tool_defs
+            .into_iter()
+            .filter(|tool| tool.name() == name)
+            .collect(),
+        ToolChoice::Auto | ToolChoice::Required => tool_defs,
+    };
+    let has_function_tools = !tool_defs.is_empty();
+
+    if let ToolChoice::Exact(name) = &parameters.tool_choice
+        && !has_function_tools
+    {
+        return Err(GeminiError::Api(format!(
+            "Exact tool choice '{name}' is not present in tool definitions"
+        )));
+    }
+
+    let mut tools: Vec<GeminiTool> = Vec::new();
+    if has_function_tools {
+        tools.push(GeminiTool::FunctionTool {
+            function_declarations: convert_tool_definitions(tool_defs),
+        });
+    }
+
+    // Google's own tools cannot be combined with a narrowed tool choice: the
+    // model would be free to answer with a tool the caller did not ask about.
+    let builtins_allowed = !matches!(
+        parameters.tool_choice,
+        ToolChoice::None | ToolChoice::Exact(_)
+    );
+    let native = &parameters.native_tools.gemini;
+    if builtins_allowed && (parameters.websearch || native.google_search) {
+        tools.push(GeminiTool::GoogleSearchTool {
+            google_search: GoogleSearch {},
+        });
+    }
+    if builtins_allowed && (parameters.code_execution || native.code_execution) {
+        tools.push(GeminiTool::CodeExecutionTool {
+            code_execution: crate::types::CodeExecution {},
+        });
+    }
+    if builtins_allowed && native.url_context {
+        tools.push(GeminiTool::UrlContextTool {
+            url_context: crate::types::UrlContext {},
+        });
+    }
+
+    Ok(GenerateContentRequest {
+        system_instruction,
+        contents,
+        generation_config: build_generation_config(&parameters, None)?,
+        tools,
+        tool_config: build_tool_config(&parameters, has_function_tools),
+        safety_settings: Vec::new(),
+        cached_content: parameters
+            .cache
+            .gemini
+            .as_ref()
+            .map(|cache| cache.cached_content.clone()),
+    })
+}
+
+/// Turns one candidate's content into the events it represents, in wire order:
+/// reasoning, then text, then built-in tool output, then function calls.
+fn events_from_content(content: &GeminiContent) -> Vec<Event> {
+    let mut events = Vec::new();
+
+    events.extend(content.reasoning_chunks().into_iter().map(Event::Reasoning));
+    events.extend(
+        content
+            .text_chunks()
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .map(Event::Text),
+    );
+
+    for part in &content.parts {
+        if let Some(code) = &part.executable_code {
+            events.push(Event::BuiltInToolResult {
+                tool: "code_execution".to_string(),
+                result: format!("```{}\n{}\n```", code.language.to_lowercase(), code.code),
+            });
+        }
+        if let Some(result) = &part.code_execution_result {
+            events.push(Event::BuiltInToolResult {
+                tool: "code_execution".to_string(),
+                result: format!("```output\n{}\n```", result.output),
+            });
+        }
+    }
+
+    // Tool calls are reported, never executed: the consumer decides.
+    events.extend(
+        content
+            .function_call_parts()
+            .into_iter()
+            .map(|(call, signature)| {
+                // Gemini signs each function call rather than the turn, so the
+                // signature rides on the call it belongs to.
+                Event::ToolCall(aither_core::llm::ToolCall {
+                    id: tool_call_id(),
+                    name: call.name,
+                    arguments: call.args,
+                    reasoning_state: signature
+                        .map(|value| ReasoningState::new(PROVIDER_NAME, value)),
+                })
+            }),
+    );
+
+    events
+}
+
 fn respond_stream_inner(
     cfg: crate::config::GeminiConfig,
     request: LLMRequest,
 ) -> impl Stream<Item = Result<Event, GeminiError>> + Send {
     async_stream::stream! {
-        let (messages, parameters, tool_defs) = request.into_parts();
-        if parameters.cache.openai.is_some() || parameters.cache.claude.is_some() {
-            yield Err(GeminiError::Api(
-                "Gemini provider only accepts cache.gemini settings".to_string(),
-            ));
-            return;
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        let messages = match crate::attachments::resolve_messages(&cfg, messages).await {
-            Ok(resolved) => resolved,
-            Err(err) => {
-                yield Err(err);
+        let gemini_request = match build_generate_request(&cfg, request).await {
+            Ok(request) => request,
+            Err(e) => {
+                yield Err(e);
                 return;
             }
-        };
-        #[cfg(target_arch = "wasm32")]
-        let messages = messages;
-        let (system_instruction, contents) = messages_to_gemini(&messages);
-        let mut gemini_tools_payload: Vec<GeminiTool> = Vec::new();
-        let tool_defs = match &parameters.tool_choice {
-            ToolChoice::None => Vec::new(),
-            ToolChoice::Exact(name) => tool_defs
-                .into_iter()
-                .filter(|tool| tool.name() == name)
-                .collect(),
-            ToolChoice::Auto | ToolChoice::Required => tool_defs,
-        };
-        let has_function_tools = !tool_defs.is_empty();
-        if let ToolChoice::Exact(name) = &parameters.tool_choice
-            && !has_function_tools
-        {
-            yield Err(GeminiError::Api(format!(
-                "Exact tool choice '{name}' is not present in tool definitions"
-            )));
-            return;
-        }
-
-        // Add function declarations from aither-core Tools
-        if has_function_tools {
-            gemini_tools_payload.push(GeminiTool::FunctionTool {
-                function_declarations: convert_tool_definitions(tool_defs),
-            });
-        }
-
-        // Add native Google Search tool if enabled in parameters
-        if parameters.websearch && !matches!(parameters.tool_choice, ToolChoice::None | ToolChoice::Exact(_)) {
-            gemini_tools_payload.push(GeminiTool::GoogleSearchTool {
-                google_search: GoogleSearch {},
-            });
-        }
-
-        // Add native Code Execution tool if enabled in parameters
-        if parameters.code_execution && !matches!(parameters.tool_choice, ToolChoice::None | ToolChoice::Exact(_)) {
-            gemini_tools_payload.push(GeminiTool::CodeExecutionTool {
-                code_execution: crate::types::CodeExecution {},
-            });
-        }
-
-        let tool_config = build_tool_config(&parameters, has_function_tools);
-        let generation_config = build_generation_config(&parameters, None);
-
-        let gemini_request = GenerateContentRequest {
-            system_instruction,
-            contents,
-            generation_config,
-            tools: gemini_tools_payload,
-            tool_config,
-            safety_settings: Vec::new(),
-            cached_content: parameters
-                .cache
-                .gemini
-                .as_ref()
-                .map(|cache| cache.cached_content.clone()),
         };
 
         debug!("Gemini request: {:?}", gemini_request);
@@ -212,10 +291,10 @@ fn respond_stream_inner(
             }
 
             let Some(candidate) = response.primary_candidate() else {
-                // Skip chunks without candidates (might be metadata)
+                // Chunks without candidates carry metadata, not content — but a
+                // blocked prompt is reported this way and must not pass silently.
                 if let Some(feedback) = &response.prompt_feedback {
-                    let message = format_prompt_feedback(feedback);
-                    yield Err(GeminiError::Api(message));
+                    yield Err(GeminiError::Api(format_prompt_feedback(feedback)));
                 }
                 continue;
             };
@@ -228,48 +307,8 @@ fn respond_stream_inner(
                 continue;
             };
 
-            // Emit reasoning events
-            for reasoning in content.reasoning_chunks() {
-                yield Ok(Event::Reasoning(reasoning));
-            }
-
-            // Emit text events
-            for text in content.text_chunks() {
-                if !text.is_empty() {
-                    yield Ok(Event::Text(text));
-                }
-            }
-
-            // Emit built-in tool results (code execution)
-            for part in &content.parts {
-                if let Some(code) = &part.executable_code {
-                    let code_block = format!(
-                        "```{}\n{}\n```",
-                        code.language.to_lowercase(),
-                        code.code
-                    );
-                    yield Ok(Event::BuiltInToolResult {
-                        tool: "code_execution".to_string(),
-                        result: code_block,
-                    });
-                }
-                if let Some(result) = &part.code_execution_result {
-                    let output_block = format!("```output\n{}\n```", result.output);
-                    yield Ok(Event::BuiltInToolResult {
-                        tool: "code_execution".to_string(),
-                        result: output_block,
-                    });
-                }
-            }
-
-            // Emit tool call events (NOT executed - consumer handles execution)
-            for (call, signature) in content.function_call_parts() {
-                let call_id = tool_call_id(signature.as_deref());
-                yield Ok(Event::ToolCall(aither_core::llm::ToolCall {
-                    id: call_id,
-                    name: call.name.clone(),
-                    arguments: call.args.clone(),
-                }));
+            for event in events_from_content(content) {
+                yield Ok(event);
             }
 
             if let Some(reason) = candidate.finish_reason.clone() {
@@ -295,22 +334,12 @@ fn uuid_v4() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos());
     format!("{timestamp:032x}")
 }
 
-const TOOL_SIGNATURE_SEPARATOR: &str = "|ts|";
-
-fn tool_call_id(signature: Option<&str>) -> String {
-    let base = format!("gemini_{}", uuid_v4());
-    match signature {
-        Some(value) => {
-            let encoded = URL_SAFE_NO_PAD.encode(value.as_bytes());
-            format!("{base}{TOOL_SIGNATURE_SEPARATOR}{encoded}")
-        }
-        None => base,
-    }
+fn tool_call_id() -> String {
+    format!("gemini_{}", uuid_v4())
 }
 
 fn parse_tool_response(content: &str) -> Option<(String, serde_json::Value, Option<String>)> {
@@ -323,10 +352,10 @@ fn parse_tool_response(content: &str) -> Option<(String, serde_json::Value, Opti
     let mut header_split = header.splitn(2, ':');
     let id = header_split.next()?.trim();
     let name = header_split.next()?.trim().to_string();
-    let output = content[end + 1..]
-        .strip_prefix(' ')
-        .unwrap_or(&content[end + 1..]);
-    let (_, signature) = parse_tool_signature(id);
+    let rest = &content[end + 1..];
+    let output = rest.strip_prefix(' ').unwrap_or(rest);
+    let _ = id;
+    let signature = None;
     let response_value = match serde_json::from_str::<serde_json::Value>(output) {
         Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
         Ok(other) => {
@@ -346,18 +375,7 @@ fn parse_tool_response(content: &str) -> Option<(String, serde_json::Value, Opti
     Some((name, response_value, signature))
 }
 
-fn parse_tool_signature(id: &str) -> (String, Option<String>) {
-    if let Some((base, encoded)) = id.split_once(TOOL_SIGNATURE_SEPARATOR) {
-        if let Ok(bytes) = URL_SAFE_NO_PAD.decode(encoded) {
-            if let Ok(signature) = String::from_utf8(bytes) {
-                return (base.to_string(), Some(signature));
-            }
-        }
-    }
-    (id.to_string(), None)
-}
-
-fn usage_from_metadata(meta: &UsageMetadata) -> Usage {
+const fn usage_from_metadata(meta: &UsageMetadata) -> Usage {
     Usage {
         prompt_tokens: meta.prompt_token_count,
         completion_tokens: meta.candidates_token_count,
@@ -370,19 +388,36 @@ fn usage_from_metadata(meta: &UsageMetadata) -> Usage {
     }
 }
 
-fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<GeminiContent>) {
-    use std::collections::HashMap;
+/// Indexes every tool call by id, yielding its function name and, where the
+/// model signed it, its thought signature.
+///
+/// A tool *result* has to look both up: Gemini scopes the signature to the call
+/// rather than the result, so the result cannot carry it.
+fn index_tool_calls(messages: &[Message]) -> (HashMap<&str, &str>, HashMap<&str, &str>) {
+    let mut names = HashMap::new();
+    let mut signatures = HashMap::new();
+    for message in messages {
+        for tc in message.tool_calls() {
+            names.insert(tc.id.as_str(), tc.name.as_str());
+            if let Some(signature) = tc
+                .reasoning_state
+                .as_ref()
+                .and_then(|state| state.payload_for(PROVIDER_NAME))
+            {
+                signatures.insert(tc.id.as_str(), signature);
+            }
+        }
+    }
+    (names, signatures)
+}
 
+async fn messages_to_gemini(
+    messages: &[Message],
+) -> Result<(Option<GeminiContent>, Vec<GeminiContent>), GeminiError> {
     let mut system_parts = Vec::new();
     let mut contents = Vec::new();
 
-    // Build a map from tool_call_id to function name for resolving Tool messages
-    let mut tool_call_names: HashMap<&str, &str> = HashMap::new();
-    for message in messages {
-        for tc in message.tool_calls() {
-            tool_call_names.insert(&tc.id, &tc.name);
-        }
-    }
+    let (tool_call_names, tool_call_signatures) = index_tool_calls(messages);
 
     for message in messages {
         match message.role() {
@@ -397,9 +432,7 @@ fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<Gemin
 
                     // Add attachment parts first
                     for attachment in attachments {
-                        if let Some(part) = url_to_part(attachment) {
-                            parts.push(part);
-                        }
+                        parts.push(url_to_part(attachment).await?);
                     }
 
                     // Add text content
@@ -413,7 +446,10 @@ fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<Gemin
             Role::Tool => {
                 // Get the function name from the tool_call_id
                 let tool_call_id = message.tool_call_id().unwrap_or("");
-                let (base_id, signature) = parse_tool_signature(tool_call_id);
+                let base_id = tool_call_id.to_string();
+                let signature = tool_call_signatures
+                    .get(tool_call_id)
+                    .map(|value| (*value).to_string());
 
                 if let Some(&function_name) = tool_call_names.get(tool_call_id) {
                     // Parse the content as JSON, or wrap it as a string result
@@ -468,7 +504,11 @@ fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<Gemin
 
                     // Add function call parts with thought signatures extracted from IDs
                     for tc in tool_calls {
-                        let (_, signature) = parse_tool_signature(&tc.id);
+                        let signature = tc
+                            .reasoning_state
+                            .as_ref()
+                            .and_then(|state| state.payload_for(PROVIDER_NAME))
+                            .map(String::from);
                         parts.push(Part::function_call_with_signature(
                             tc.name.clone(),
                             tc.arguments.clone(),
@@ -488,7 +528,7 @@ fn messages_to_gemini(messages: &[Message]) -> (Option<GeminiContent>, Vec<Gemin
         Some(GeminiContent::system(system_parts))
     };
 
-    (system_instruction, contents)
+    Ok((system_instruction, contents))
 }
 
 fn format_prompt_feedback(feedback: &PromptFeedback) -> String {
@@ -518,11 +558,15 @@ fn format_safety_rating(rating: &SafetyRating) -> String {
     format!("{} ({status}, probability: {probability})", rating.category)
 }
 
+/// # Errors
+///
+/// Returns [`GeminiError`] when the requested reasoning effort has no Gemini
+/// equivalent.
 fn build_generation_config(
     parameters: &Parameters,
     modalities: Option<Vec<String>>,
-) -> Option<GenerationConfig> {
-    let thinking_config = build_thinking_config(parameters);
+) -> Result<Option<GenerationConfig>, GeminiError> {
+    let thinking_config = build_thinking_config(parameters)?;
     let mut config = GenerationConfig {
         temperature: parameters.temperature,
         top_p: parameters.top_p,
@@ -534,6 +578,14 @@ fn build_generation_config(
         stop_sequences: parameters.stop.clone(),
         response_modalities: modalities,
         thinking_config,
+        seed: parameters.seed.map(
+            #[allow(clippy::cast_possible_wrap)]
+            |value| value as i32,
+        ),
+        presence_penalty: parameters.presence_penalty,
+        frequency_penalty: parameters.frequency_penalty,
+        response_logprobs: parameters.logprobs,
+        logprobs: parameters.top_logprobs.map(i32::from),
         ..Default::default()
     };
     if let Some(schema) = &parameters.response_format {
@@ -543,9 +595,9 @@ fn build_generation_config(
         config.response_mime_type = Some("application/json".into());
     }
     if config.is_meaningful() {
-        Some(config)
+        Ok(Some(config))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -567,29 +619,26 @@ fn build_tool_config(parameters: &Parameters, has_tools: bool) -> Option<ToolCon
     })
 }
 
-fn build_thinking_config(parameters: &Parameters) -> Option<ThinkingConfig> {
-    if !parameters.include_reasoning {
-        return None;
+/// Builds `thinkingConfig` from the portable reasoning parameters.
+///
+/// Depth (`reasoning_effort`) and visibility (`include_reasoning`) are separate
+/// controls: asking for a deeper think does not require the thoughts to be
+/// returned, and vice versa. Either one alone is enough to emit the config.
+/// # Errors
+///
+/// Returns [`GeminiError`] when the requested effort has no Gemini equivalent.
+fn build_thinking_config(parameters: &Parameters) -> Result<Option<ThinkingConfig>, GeminiError> {
+    let thinking_level = parameters
+        .reasoning_effort
+        .map(ThinkingLevel::try_from)
+        .transpose()?;
+    if !parameters.include_reasoning && thinking_level.is_none() {
+        return Ok(None);
     }
-    Some(ThinkingConfig {
-        include_thoughts: Some(parameters.include_reasoning),
-        token_budget: parameters.reasoning_effort.map(|effort| match effort {
-            ReasoningEffort::Minimum => 0,
-            ReasoningEffort::Low => 1024,
-            ReasoningEffort::Medium => 4096,
-            ReasoningEffort::High => 10240,
-        }),
-        thinking_level: parameters.reasoning_effort.map(|effort| {
-            // Gemini does not have a direct mapping for Minimum, so we map it to Low.
-            match effort {
-                ReasoningEffort::Minimum => "low",
-                ReasoningEffort::Low => "low",
-                ReasoningEffort::Medium => "medium",
-                ReasoningEffort::High => "high",
-            }
-            .to_string()
-        }),
-    })
+    Ok(Some(ThinkingConfig {
+        include_thoughts: parameters.include_reasoning.then_some(true),
+        thinking_level,
+    }))
 }
 
 fn convert_tool_definitions(defs: Vec<ToolDefinition>) -> Vec<FunctionDeclaration> {
@@ -602,115 +651,245 @@ fn convert_tool_definitions(defs: Vec<ToolDefinition>) -> Vec<FunctionDeclaratio
         .collect()
 }
 
-/// Convert a URL attachment to a Gemini Part.
-///
-/// Handles:
-/// - `data:...;base64,...` - already base64 encoded
-/// - `file:///path/to/file` - reads file and converts to base64
-/// - Gemini file URI (<https://generativelanguage.googleapis.com>/...) - uses file reference
-/// - Other HTTP/HTTPS URLs - not currently supported (would need download)
-fn url_to_part(url: &url::Url) -> Option<Part> {
+/// Convert a typed attachment to a Gemini content part.
+async fn url_to_part(attachment: &Attachment) -> Result<Part, GeminiError> {
+    let url = attachment.url();
+    let media_type = attachment.media_type().as_ref();
     match url.scheme() {
-        "data" => parse_data_url(url.as_str()),
-        "file" => read_file_to_part(url),
-        "http" | "https" => {
-            // Check if this is a Gemini Files API URI
-            if is_gemini_file_uri(url) {
-                gemini_file_uri_to_part(url)
-            } else {
-                // Other HTTP/HTTPS URLs would need to be downloaded first
-                tracing::warn!("Unsupported attachment URL: {}", url);
-                None
-            }
-        }
-        _ => {
-            tracing::warn!("Unsupported attachment URL scheme: {}", url.scheme());
-            None
-        }
+        "data" => parse_data_url(url.as_str(), media_type),
+        "file" => read_file_to_part(url, media_type).await,
+        "http" | "https" => Ok(Part::from_file(media_type, url.as_str())),
+        scheme => Err(GeminiError::Api(format!(
+            "Gemini does not support attachment URL scheme '{scheme}'"
+        ))),
     }
 }
 
-/// Check if a URL is a Gemini Files API URI.
-fn is_gemini_file_uri(url: &url::Url) -> bool {
-    url.host_str()
-        .is_some_and(|h| h == "generativelanguage.googleapis.com")
-}
-
-/// Convert a Gemini Files API URI to a Part using file reference.
-fn gemini_file_uri_to_part(url: &url::Url) -> Option<Part> {
-    // The file URI contains the path which includes the file type info
-    // We need to infer the MIME type from the original file or use a generic one
-    // For now, use application/octet-stream as the API will handle it
-    let mime_type = infer_mime_from_gemini_uri(url).unwrap_or("application/octet-stream");
-    Some(Part::from_file(mime_type, url.as_str()))
-}
-
-/// Try to infer MIME type from a Gemini file URI.
-/// The URI doesn't typically contain MIME info, so we return None.
-const fn infer_mime_from_gemini_uri(_url: &url::Url) -> Option<&'static str> {
-    // Gemini file URIs don't contain MIME type info in the URL
-    // The server knows the type from when it was uploaded
-    None
-}
-
-/// Parse a data URL into a Part with inline data.
-fn parse_data_url(url: &str) -> Option<Part> {
+fn parse_data_url(url: &str, media_type: &str) -> Result<Part, GeminiError> {
     use base64::Engine;
 
-    // Format: data:mime/type;base64,<data>
-    let after_data = url.strip_prefix("data:")?;
-    let (header, data) = after_data.split_once(',')?;
-    let mime_type = header.strip_suffix(";base64")?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .ok()?;
-
-    Some(Part::inline_media(mime_type, bytes))
+    let after_data = url
+        .strip_prefix("data:")
+        .ok_or_else(|| GeminiError::Api("Malformed attachment data URL".to_string()))?;
+    let (header, data) = after_data
+        .split_once(',')
+        .ok_or_else(|| GeminiError::Api("Attachment data URL is missing payload".to_string()))?;
+    let encoded_media_type = header.strip_suffix(";base64").ok_or_else(|| {
+        GeminiError::Api("Attachment data URL must use base64 encoding".to_string())
+    })?;
+    if encoded_media_type != media_type {
+        return Err(GeminiError::Api(format!(
+            "Attachment MIME type '{media_type}' does not match data URL MIME type '{encoded_media_type}'"
+        )));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+    Ok(Part::inline_media(media_type, bytes))
 }
 
-/// Read a file:// URL and convert to a Part with inline data.
 #[cfg(not(target_arch = "wasm32"))]
-fn read_file_to_part(url: &url::Url) -> Option<Part> {
-    let path = url.to_file_path().ok()?;
-    let data = std::fs::read(&path).ok()?;
-    let mime_type = mime_from_path(&path)?;
-
-    Some(Part::inline_media(mime_type, data))
+async fn read_file_to_part(url: &url::Url, media_type: &str) -> Result<Part, GeminiError> {
+    let path = url.to_file_path().map_err(|()| {
+        GeminiError::Api("Attachment file URL could not be converted to a path".to_string())
+    })?;
+    let data = async_fs::read(&path).await.map_err(|error| {
+        GeminiError::Api(format!(
+            "Failed to read attachment '{}': {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Part::inline_media(media_type, data))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn read_file_to_part(_url: &url::Url) -> Option<Part> {
-    None
+async fn read_file_to_part(_url: &url::Url, _media_type: &str) -> Result<Part, GeminiError> {
+    Err(GeminiError::Api(
+        "file:// attachments are not supported on wasm32".to_string(),
+    ))
 }
 
-/// Get MIME type from file path extension.
-fn mime_from_path(path: &std::path::Path) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())?
-        .to_lowercase()
-        .as_str()
-    {
-        // Images
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "heic" => Some("image/heic"),
-        "heif" => Some("image/heif"),
-        // Video
-        "mp4" => Some("video/mp4"),
-        "webm" => Some("video/webm"),
-        "mov" => Some("video/quicktime"),
-        "avi" => Some("video/x-msvideo"),
-        // Audio
-        "mp3" => Some("audio/mpeg"),
-        "wav" => Some("audio/wav"),
-        "ogg" => Some("audio/ogg"),
-        "m4a" => Some("audio/mp4"),
-        "flac" => Some("audio/flac"),
-        // Documents
-        "pdf" => Some("application/pdf"),
-        _ => None,
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aither_core::llm::model::ReasoningEffort;
+
+    #[tokio::test]
+    async fn data_attachments_preserve_declared_media_types() {
+        for media_type in ["image/png", "audio/wav", "video/mp4", "application/pdf"] {
+            let attachment = Attachment::new(
+                format!("data:{media_type};base64,AA==")
+                    .parse()
+                    .expect("data URL"),
+                media_type.parse().expect("MIME type"),
+            );
+            let part = url_to_part(&attachment).await.expect("encode attachment");
+            let value = serde_json::to_value(part).expect("serialize part");
+            assert_eq!(value["inlineData"]["mimeType"], media_type);
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_attachment_uses_file_data_with_media_type() {
+        let attachment = Attachment::new(
+            "https://ai.google.dev/static/gemini-api/docs/files/sample.pdf"
+                .parse()
+                .expect("remote URL"),
+            "application/pdf".parse().expect("PDF MIME"),
+        );
+        let part = url_to_part(&attachment).await.expect("encode attachment");
+        let value = serde_json::to_value(part).expect("serialize part");
+        assert_eq!(value["fileData"]["mimeType"], "application/pdf");
+        assert_eq!(
+            value["fileData"]["fileUri"],
+            "https://ai.google.dev/static/gemini-api/docs/files/sample.pdf"
+        );
+    }
+
+    #[test]
+    fn data_url_mime_mismatch_fails() {
+        let error = parse_data_url("data:image/png;base64,AA==", "audio/wav")
+            .expect_err("MIME mismatch must fail");
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    fn thinking_json(params: &Parameters) -> serde_json::Value {
+        let config = build_thinking_config(params)
+            .expect("effort supported by Gemini")
+            .expect("thinking config");
+        serde_json::to_value(config).expect("serialize thinking config")
+    }
+
+    /// Gemini names the field `thinkingLevel`; there is no `tokenBudget`, so a
+    /// misnamed field is accepted by serde and then ignored on the wire.
+    #[test]
+    fn thinking_config_uses_gemini_field_names() {
+        let value = thinking_json(&Parameters::default().reasoning_effort(ReasoningEffort::Medium));
+        assert_eq!(value["thinkingLevel"], "medium");
+        assert_eq!(value.get("tokenBudget"), None);
+        assert_eq!(value.get("thinkingBudget"), None);
+    }
+
+    /// `thinkingLevel` and the legacy `thinkingBudget` are mutually exclusive:
+    /// sending both is a 400, so only the level is ever modelled.
+    #[test]
+    fn thinking_config_never_pairs_a_budget_with_a_level() {
+        for effort in [
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ] {
+            let value = thinking_json(&Parameters::default().reasoning_effort(effort));
+            let object = value.as_object().expect("thinking config object");
+            assert!(
+                object.keys().all(|key| key != "thinkingBudget"),
+                "effort {effort:?} paired a budget with a level"
+            );
+            assert!(object.contains_key("thinkingLevel"));
+        }
+    }
+
+    #[test]
+    fn minimal_effort_maps_to_the_minimal_level() {
+        let value =
+            thinking_json(&Parameters::default().reasoning_effort(ReasoningEffort::Minimal));
+        assert_eq!(value["thinkingLevel"], "minimal");
+    }
+
+    /// Gemini's ladder stops at High. Clamping `XHigh` or `Max` down to High would
+    /// hand back less reasoning than the caller asked for, silently.
+    #[test]
+    fn efforts_above_gemini_ceiling_are_rejected() {
+        for effort in [ReasoningEffort::XHigh, ReasoningEffort::Max] {
+            let error = build_thinking_config(&Parameters::default().reasoning_effort(effort))
+                .expect_err("effort above the Gemini ceiling must fail");
+            assert!(
+                error.to_string().contains("tops out at High"),
+                "unexpected error for {effort:?}: {error}"
+            );
+        }
+    }
+
+    /// The signature used to be base64'd into the tool-call id behind a `|ts|`
+    /// separator, because core had nowhere to put it. It now rides on the call,
+    /// and the id is a plain identifier again.
+    #[tokio::test]
+    async fn thought_signature_round_trips_without_mangling_the_id() {
+        let call = aither_core::llm::ToolCall::new("gemini_abc", "lookup", serde_json::json!({}))
+            .with_reasoning_state(ReasoningState::new(PROVIDER_NAME, "sig-xyz"));
+        let message = Message::assistant_with_tool_calls("", vec![call]);
+
+        let (_, contents) = messages_to_gemini(&[message]).await.expect("convert");
+        let value = serde_json::to_value(&contents).expect("serialize contents");
+        let part = &value[0]["parts"][0];
+
+        assert_eq!(part["thoughtSignature"], "sig-xyz");
+        assert_eq!(part["functionCall"]["name"], "lookup");
+    }
+
+    #[tokio::test]
+    async fn generated_tool_call_ids_carry_no_smuggled_signature() {
+        assert!(!tool_call_id().contains("|ts|"));
+    }
+
+    /// Signatures are Gemini's; another provider's state must not be replayed.
+    #[tokio::test]
+    async fn foreign_reasoning_state_is_not_sent_as_a_signature() {
+        let call = aither_core::llm::ToolCall::new("gemini_abc", "lookup", serde_json::json!({}))
+            .with_reasoning_state(ReasoningState::new("anthropic", "sig-from-claude"));
+        let message = Message::assistant_with_tool_calls("", vec![call]);
+
+        let (_, contents) = messages_to_gemini(&[message]).await.expect("convert");
+        let value = serde_json::to_value(&contents).expect("serialize contents");
+        assert_eq!(value[0]["parts"][0].get("thoughtSignature"), None);
+    }
+
+    /// Gemini has no "no thinking" level; the caller should omit effort instead.
+    #[test]
+    fn none_effort_is_rejected() {
+        let error =
+            build_thinking_config(&Parameters::default().reasoning_effort(ReasoningEffort::None))
+                .expect_err("None effort must fail");
+        assert!(error.to_string().contains("no 'none' thinking level"));
+    }
+
+    /// Depth and visibility are independent: asking for effort alone must still
+    /// produce a config, and asking for thoughts alone must still produce one.
+    #[test]
+    fn effort_and_visibility_are_independent() {
+        let effort_only =
+            thinking_json(&Parameters::default().reasoning_effort(ReasoningEffort::High));
+        assert_eq!(effort_only["thinkingLevel"], "high");
+        assert_eq!(effort_only.get("includeThoughts"), None);
+
+        let thoughts_only = thinking_json(&Parameters::default().include_reasoning(true));
+        assert_eq!(thoughts_only["includeThoughts"], true);
+        assert_eq!(thoughts_only.get("thinkingLevel"), None);
+
+        assert!(
+            build_thinking_config(&Parameters::default())
+                .expect("no effort requested")
+                .is_none()
+        );
+    }
+
+    /// These reached the wire only if `build_generation_config` populates them;
+    /// they were declared on the struct but never filled.
+    #[test]
+    fn generation_config_forwards_every_sampling_parameter() {
+        let params = Parameters::default()
+            .seed(42)
+            .presence_penalty(0.5)
+            .frequency_penalty(0.25)
+            .logprobs(true)
+            .top_logprobs(3);
+        let config = build_generation_config(&params, None)
+            .expect("effort supported by Gemini")
+            .expect("generation config");
+        let value = serde_json::to_value(config).expect("serialize generation config");
+        assert_eq!(value["seed"], 42);
+        assert_eq!(value["presencePenalty"], 0.5);
+        assert_eq!(value["frequencyPenalty"], 0.25);
+        assert_eq!(value["responseLogprobs"], true);
+        assert_eq!(value["logprobs"], 3);
     }
 }

@@ -7,8 +7,6 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[cfg(not(target_arch = "wasm32"))]
-use async_fs;
 use serde::{Deserialize, Serialize};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
@@ -70,7 +68,7 @@ pub struct OpenAIFile {
     /// Size of the file in bytes.
     pub bytes: u64,
     /// Unix timestamp when the file was created.
-    pub created_at: i64,
+    pub created_at: u64,
     /// Name of the file.
     pub filename: String,
     /// Purpose of the file.
@@ -87,7 +85,7 @@ impl OpenAIFile {
     /// Get the creation time as `SystemTime`.
     #[must_use]
     pub fn created(&self) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(self.created_at as u64)
+        UNIX_EPOCH + Duration::from_secs(self.created_at)
     }
 
     /// Check if the file is ready for use.
@@ -164,10 +162,15 @@ impl FilesConfig {
 ///
 /// # Arguments
 /// * `cfg` - Files configuration
-/// * `file_name` - File name reported to OpenAI
+/// * `file_name` - File name reported to `OpenAI`
 /// * `mime_type` - MIME type for multipart metadata
 /// * `data` - File content bytes
 /// * `purpose` - Purpose of the file
+///
+/// # Errors
+///
+/// Returns an error if the upload request fails or the provider rejects
+/// the file.
 pub async fn upload_bytes(
     cfg: &FilesConfig,
     file_name: &str,
@@ -217,7 +220,7 @@ pub async fn upload_bytes(
         .map_err(OpenAIError::from_http)?
         .header(
             header::AUTHORIZATION.as_str(),
-            &format!("Bearer {}", cfg.api_key),
+            format!("Bearer {}", cfg.api_key),
         )
         .map_err(OpenAIError::from_http)?;
 
@@ -235,7 +238,16 @@ pub async fn upload_bytes(
 /// Upload a local file path to `OpenAI`.
 ///
 /// This is a native-only convenience API. For wasm, use [`upload_bytes`].
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or the upload request fails.
 #[cfg(not(target_arch = "wasm32"))]
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read, the upload fails, or the
+/// provider rejects the file.
 pub async fn upload_file(
     cfg: &FilesConfig,
     path: &Path,
@@ -255,6 +267,10 @@ pub async fn upload_file(
 /// # Arguments
 /// * `cfg` - Files configuration
 /// * `file_id` - ID of the file to delete
+///
+/// # Errors
+///
+/// Returns an error if the request fails, or the provider rejects it.
 pub async fn delete_file(
     cfg: &FilesConfig,
     file_id: &str,
@@ -267,7 +283,7 @@ pub async fn delete_file(
         .map_err(OpenAIError::from_http)?
         .header(
             header::AUTHORIZATION.as_str(),
-            &format!("Bearer {}", cfg.api_key),
+            format!("Bearer {}", cfg.api_key),
         )
         .map_err(OpenAIError::from_http)?;
 
@@ -285,6 +301,10 @@ pub async fn delete_file(
 /// # Arguments
 /// * `cfg` - Files configuration
 /// * `file_id` - ID of the file
+///
+/// # Errors
+///
+/// Returns an error if the request fails, or the provider rejects it.
 pub async fn get_file(cfg: &FilesConfig, file_id: &str) -> Result<OpenAIFile, OpenAIError> {
     let endpoint = format!("{}/{}", cfg.files_endpoint(), file_id);
 
@@ -294,7 +314,7 @@ pub async fn get_file(cfg: &FilesConfig, file_id: &str) -> Result<OpenAIFile, Op
         .map_err(OpenAIError::from_http)?
         .header(
             header::AUTHORIZATION.as_str(),
-            &format!("Bearer {}", cfg.api_key),
+            format!("Bearer {}", cfg.api_key),
         )
         .map_err(OpenAIError::from_http)?;
 
@@ -312,6 +332,10 @@ pub async fn get_file(cfg: &FilesConfig, file_id: &str) -> Result<OpenAIFile, Op
 /// # Arguments
 /// * `cfg` - Files configuration
 /// * `purpose` - Optional filter by purpose
+///
+/// # Errors
+///
+/// Returns an error if the request fails, or the provider rejects it.
 pub async fn list_files(
     cfg: &FilesConfig,
     purpose: Option<FilePurpose>,
@@ -328,7 +352,7 @@ pub async fn list_files(
         .map_err(OpenAIError::from_http)?
         .header(
             header::AUTHORIZATION.as_str(),
-            &format!("Bearer {}", cfg.api_key),
+            format!("Bearer {}", cfg.api_key),
         )
         .map_err(OpenAIError::from_http)?;
 

@@ -1,3 +1,4 @@
+use crate::PROVIDER_NAME;
 use crate::{
     DEEPSEEK_BASE_URL, DEFAULT_AUDIO_FORMAT, DEFAULT_AUDIO_MODEL, DEFAULT_AUDIO_VOICE,
     DEFAULT_BASE_URL, DEFAULT_EMBEDDING_DIM, DEFAULT_EMBEDDING_MODEL, DEFAULT_IMAGE_MODEL,
@@ -16,7 +17,7 @@ use crate::{
 use aither_core::{
     LanguageModel,
     llm::{
-        Event, LLMRequest, ToolCall, Usage,
+        Event, LLMRequest, ReasoningState, ToolCall, Usage,
         model::{Ability, Profile as ModelProfile, ToolChoice},
         oneshot,
     },
@@ -61,6 +62,12 @@ impl RetryConfig {
     }
 
     /// Calculate delay for a given attempt number (0-indexed).
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
     fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let delay_ms =
             self.initial_delay.as_millis() as f64 * self.backoff_multiplier.powi(attempt as i32);
@@ -69,26 +76,23 @@ impl RetryConfig {
     }
 }
 
+fn is_retryable_json_error(error: &serde_json::Error) -> bool {
+    matches!(error.classify(), serde_json::error::Category::Eof)
+}
+
 /// Check if an error is retryable.
-const fn is_retryable_error(err: &OpenAIError) -> bool {
+fn is_retryable_error(err: &OpenAIError) -> bool {
     match err {
-        // Network/transport errors are retryable
-        OpenAIError::Http(_) => true,
-        // Body errors (connection issues) may be retryable
-        OpenAIError::Body(_) => true,
-        // SSE stream errors may be retryable
-        OpenAIError::Stream(_) => true,
-        // Rate limit and server errors are retryable
-        OpenAIError::RateLimit { .. } => true,
-        OpenAIError::ServerError { .. } => true,
-        // Timeout is retryable
-        OpenAIError::Timeout => true,
-        // API errors are generally not retryable (bad request, auth, etc.)
-        OpenAIError::Api(_) => false,
-        // Parse errors are not retryable
-        OpenAIError::Json(_) => false,
-        // Decode errors are not retryable
-        OpenAIError::Decode(_) => false,
+        OpenAIError::Http(_)
+        | OpenAIError::Body(_)
+        | OpenAIError::Stream(_)
+        | OpenAIError::RateLimit { .. }
+        | OpenAIError::ServerError { .. }
+        | OpenAIError::Timeout => true,
+        // API and decode errors are generally not retryable.
+        OpenAIError::Api(_) | OpenAIError::Decode(_) => false,
+        // EOF while parsing JSON is typically a truncated/empty upstream body.
+        OpenAIError::Json(error) => is_retryable_json_error(error),
     }
 }
 
@@ -142,11 +146,22 @@ async fn request_with_timeout<T>(
     }
     #[cfg(target_arch = "wasm32")]
     {
+        // The browser timer is not `Send`, and `LanguageModel` requires the
+        // futures built on top of this one to be. Run the timer on the JS event
+        // loop where it belongs and wait on a channel, which is `Send`.
         let millis = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+        let (expired_tx, expired_rx) = async_channel::bounded::<()>(1);
+        wasm_bindgen_futures::spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(millis).await;
+            let _ = expired_tx.send(()).await;
+        });
+
         futures_lite::future::or(
             async move { fut.await.map_err(map_zenwave_error) },
             async move {
-                gloo_timers::future::TimeoutFuture::new(millis).await;
+                // A closed channel means the timer task was dropped, which can
+                // only happen once the whole request is being torn down.
+                let _ = expired_rx.recv().await;
                 Err(OpenAIError::Timeout)
             },
         )
@@ -341,6 +356,7 @@ impl OpenAI {
 impl LanguageModel for OpenAI {
     type Error = OpenAIError;
 
+    #[allow(clippy::too_many_lines)]
     fn respond(
         &self,
         request: LLMRequest,
@@ -351,6 +367,17 @@ impl LanguageModel for OpenAI {
         let mut snapshot = ParameterSnapshot::from(&parameters);
         snapshot.legacy_max_tokens = cfg.legacy_max_tokens;
         let has_attachments = messages.iter().any(|msg| !msg.attachments().is_empty());
+        let has_audio = messages.iter().any(|message| {
+            message
+                .attachments()
+                .iter()
+                .any(|attachment| attachment.media_type().as_ref().starts_with("audio/"))
+        });
+        let effective_api_kind = if cfg.api_kind == ApiKind::Responses && has_audio {
+            ApiKind::ChatCompletions
+        } else {
+            cfg.api_kind
+        };
 
         async_stream::stream! {
             if parameters.cache.claude.is_some() || parameters.cache.gemini.is_some() {
@@ -360,14 +387,39 @@ impl LanguageModel for OpenAI {
                 return;
             }
 
-            if cfg.api_kind == ApiKind::ChatCompletions && has_attachments {
+            if effective_api_kind == ApiKind::ChatCompletions
+                && messages.iter().flat_map(aither_core::llm::Message::attachments).any(|attachment| {
+                    let media_type = attachment.media_type().as_ref();
+                    !media_type.starts_with("image/") && !media_type.starts_with("audio/")
+                })
+            {
                 yield Err(OpenAIError::Api(
-                    "Chat Completions does not support file attachments; use Responses API".to_string(),
+                    "Chat Completions accepts only image and audio attachments".to_string(),
                 ));
                 return;
             }
 
-            let messages = if has_attachments {
+            if effective_api_kind == ApiKind::Responses
+                && messages.iter().flat_map(aither_core::llm::Message::attachments).any(|attachment| {
+                    attachment.media_type().as_ref().starts_with("video/")
+                })
+            {
+                yield Err(OpenAIError::Api(
+                    "OpenAI Responses API does not support video attachments".to_string(),
+                ));
+                return;
+            }
+
+            if effective_api_kind == ApiKind::ChatCompletions
+                && (!snapshot.openai_tools.is_empty() || snapshot.websearch || snapshot.code_execution)
+            {
+                yield Err(OpenAIError::Api(
+                    "OpenAI native hosted tools require the Responses API".to_string(),
+                ));
+                return;
+            }
+
+            let messages = if has_attachments && effective_api_kind == ApiKind::Responses {
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     match crate::attachments::resolve_messages(&cfg, messages).await {
@@ -389,9 +441,15 @@ impl LanguageModel for OpenAI {
                 messages
             };
 
-            match cfg.api_kind {
+            match effective_api_kind {
                 ApiKind::ChatCompletions => {
-                    let payload_messages = to_chat_messages(&messages);
+                    let payload_messages = match to_chat_messages(&messages).await {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            yield Err(error);
+                            return;
+                        }
+                    };
                     let openai_tools = if tool_defs.is_empty() {
                         None
                     } else {
@@ -448,14 +506,19 @@ impl LanguageModel for OpenAI {
                 Ok(len) => len,
                 Err(e) => {
                     tracing::debug!("API did not return context_length: {e}");
-                    // Fallback to models database
                     aither_models::lookup(&cfg.chat_model)
-                        .map(|info| info.context_window)
+                        .and_then(aither_models::ModelEntry::max_input_tokens)
                         .unwrap_or_else(|| {
-                            panic!(
-                                "OpenAI model '{}' missing context metadata from provider and aither-models",
-                                cfg.chat_model
-                            )
+                            // Custom/self-hosted models are legitimately absent
+                            // from both the provider API and the registry, so
+                            // assume a conservative context window rather than
+                            // failing the whole conversation.
+                            tracing::warn!(
+                                model = %cfg.chat_model,
+                                assumed_context_length = UNKNOWN_MODEL_CONTEXT_LENGTH,
+                                "model missing context metadata from provider and aither-models"
+                            );
+                            UNKNOWN_MODEL_CONTEXT_LENGTH
                         })
                 }
             };
@@ -479,6 +542,12 @@ impl LanguageModel for OpenAI {
 }
 
 /// Fetch context window size from the models API.
+/// Context window assumed for models with no metadata from either the
+/// provider API or the aither-models registry (custom/self-hosted models).
+/// Conservative enough to be safe for compaction budgeting on any modern
+/// OpenAI-compatible backend.
+const UNKNOWN_MODEL_CONTEXT_LENGTH: u32 = 32_768;
+
 async fn fetch_model_context_length(cfg: &Config) -> Result<u32, OpenAIError> {
     use crate::response::ModelsListResponse;
 
@@ -572,17 +641,14 @@ async fn chat_completions_request(
             .map_err(OpenAIError::Http)?;
     }
 
-    match request_with_timeout(
+    request_with_timeout(
         cfg.request_timeout,
         builder.json_body(request).map_err(OpenAIError::Http)?.sse(),
     )
     .await
-    {
-        Ok(stream) => Ok(stream),
-        Err(error) => return Err(error),
-    }
 }
 
+#[allow(clippy::too_many_lines)]
 fn chat_completions_stream_inner(
     cfg: Arc<Config>,
     payload_messages: Vec<ChatMessagePayload>,
@@ -629,15 +695,14 @@ fn chat_completions_stream_inner(
                     tracing::debug!(sse_event = %data, "Received SSE event");
 
                     // Check for API error response
-                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(error) = error_obj.get("error") {
+                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data)
+                        && let Some(error) = error_obj.get("error") {
                             let msg = error.get("message")
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("Unknown API error");
                             yield Err(OpenAIError::Api(msg.to_string()));
                             return;
                         }
-                    }
 
                     match serde_json::from_str::<ChatCompletionChunk>(data) {
                         Ok(chunk) => {
@@ -647,27 +712,23 @@ fn chat_completions_stream_inner(
                             // Emit text events
                             for choice in &chunk.choices {
                                 // Check for malformed function call
-                                if let Some(ref reason) = choice.finish_reason {
-                                    if reason.contains("malformed_function_call") {
+                                if let Some(ref reason) = choice.finish_reason
+                                    && reason.contains("malformed_function_call") {
                                         yield Err(OpenAIError::Api("malformed function call".to_string()));
                                         return;
                                     }
-                                }
 
-                                if let Some(content) = &choice.delta.content {
-                                    if !content.is_empty() {
+                                if let Some(content) = &choice.delta.content
+                                    && !content.is_empty() {
                                         yield Ok(Event::Text(content.clone()));
                                     }
-                                }
                                 // Emit reasoning if enabled
-                                if include_reasoning {
-                                    if let Some(reasoning) = &choice.delta.reasoning_content {
-                                        if !reasoning.is_empty() {
+                                if include_reasoning
+                                    && let Some(reasoning) = &choice.delta.reasoning_content
+                                        && !reasoning.is_empty() {
                                             yield Ok(Event::Reasoning(reasoning.clone()));
                                         }
-                                    }
-                                }
-                                // Accumulate tool calls
+                                // Accumulate tool calls and emit deltas
                                 if let Some(calls) = &choice.delta.tool_calls {
                                     for call in calls {
                                         let index = call.index.unwrap_or(0);
@@ -682,6 +743,14 @@ fn chat_completions_stream_inner(
                                             if let Some(args) = &function.arguments {
                                                 acc.arguments.push_str(args);
                                             }
+                                        }
+                                        // Emit delta for UI progress
+                                        if let (Some(id), Some(name)) = (&acc.id, &acc.name) {
+                                            yield Ok(Event::ToolCallDelta {
+                                                id: id.clone(),
+                                                name: name.clone(),
+                                                arguments_fragment: acc.arguments.clone(),
+                                            });
                                         }
                                     }
                                 }
@@ -706,15 +775,17 @@ fn chat_completions_stream_inner(
         for (_, acc) in sorted_calls {
             if let (Some(id), Some(name)) = (acc.id, acc.name) {
                 let arguments = if acc.arguments.is_empty() {
-                    serde_json::Value::Object(Default::default())
+                    serde_json::Value::Object(serde_json::Map::default())
                 } else {
-                    serde_json::from_str(&acc.arguments)
-                        .unwrap_or(serde_json::Value::Object(Default::default()))
+                    serde_json::from_str(&acc.arguments).unwrap_or_else(|_| {
+                        serde_json::Value::Object(serde_json::Map::default())
+                    })
                 };
                 yield Ok(Event::ToolCall(ToolCall {
                     id,
                     name,
                     arguments,
+                    reasoning_state: None,
                 }));
             }
         }
@@ -736,17 +807,34 @@ fn responses_stream(
 /// Accumulated function call state for Responses API streaming.
 #[derive(Debug, Default)]
 struct FunctionCallAccumulator {
+    item_id: Option<String>,
     call_id: Option<String>,
     name: Option<String>,
     arguments: String,
     emitted: bool,
 }
 
+fn normalize_response_call_id(call_id: Option<String>, fallback: &str) -> String {
+    match call_id {
+        Some(call_id) if !call_id.trim().is_empty() => call_id,
+        _ => fallback.to_string(),
+    }
+}
+
+fn non_empty_response_id(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+fn fallback_response_item_id(output_index: usize) -> String {
+    format!("response_output_{output_index}")
+}
+
 fn parse_tool_call_arguments(arguments: &str) -> serde_json::Value {
     if arguments.is_empty() {
-        serde_json::Value::Object(Default::default())
+        serde_json::Value::Object(serde_json::Map::default())
     } else {
-        serde_json::from_str(arguments).unwrap_or(serde_json::Value::Object(Default::default()))
+        serde_json::from_str(arguments)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::default()))
     }
 }
 
@@ -789,48 +877,117 @@ fn usage_from_responses(raw: &ResponsesUsage) -> Usage {
 }
 
 fn mark_and_emit_done_function_call(
-    function_calls: &mut HashMap<String, FunctionCallAccumulator>,
-    id: String,
+    function_calls: &mut HashMap<usize, FunctionCallAccumulator>,
+    output_index: usize,
+    item_id: Option<String>,
+    response_id: String,
     call_id: Option<String>,
     name: String,
-    arguments: String,
+    arguments: &str,
 ) -> ToolCall {
-    let resolved_call_id = call_id.unwrap_or_else(|| id.clone());
+    let fallback_id = non_empty_response_id(item_id.clone())
+        .or_else(|| non_empty_response_id(Some(response_id.clone())))
+        .unwrap_or_else(|| fallback_response_item_id(output_index));
+    let resolved_call_id = normalize_response_call_id(call_id, &fallback_id);
 
-    let acc = function_calls.entry(id).or_default();
+    let acc = function_calls.entry(output_index).or_default();
+    acc.item_id =
+        non_empty_response_id(item_id).or_else(|| non_empty_response_id(Some(response_id)));
     acc.call_id = Some(resolved_call_id.clone());
     acc.name = Some(name.clone());
-    acc.arguments = arguments.clone();
+    acc.arguments.clear();
+    acc.arguments.push_str(arguments);
     acc.emitted = true;
 
     ToolCall {
         id: resolved_call_id,
         name,
-        arguments: parse_tool_call_arguments(&arguments),
+        arguments: parse_tool_call_arguments(arguments),
+        reasoning_state: None,
     }
 }
 
 fn drain_pending_function_calls(
-    function_calls: HashMap<String, FunctionCallAccumulator>,
+    function_calls: HashMap<usize, FunctionCallAccumulator>,
 ) -> Vec<ToolCall> {
     function_calls
-        .into_values()
-        .filter(|acc| !acc.emitted)
-        .filter_map(|acc| {
-            let (Some(call_id), Some(name)) = (acc.call_id, acc.name) else {
-                return None;
-            };
+        .into_iter()
+        .filter(|(_, acc)| !acc.emitted)
+        .filter_map(|(output_index, acc)| {
+            let name = acc.name?;
+            let fallback_id = acc
+                .item_id
+                .clone()
+                .unwrap_or_else(|| fallback_response_item_id(output_index));
+            let call_id = normalize_response_call_id(acc.call_id, &fallback_id);
             Some(ToolCall {
                 id: call_id,
                 name,
                 arguments: parse_tool_call_arguments(&acc.arguments),
+                reasoning_state: None,
             })
         })
         .collect()
 }
 
+#[allow(clippy::items_after_statements)]
+fn validate_serialized_responses_request(request: &ResponsesRequest) -> Result<(), OpenAIError> {
+    let request_value = serde_json::to_value(request).map_err(OpenAIError::Json)?;
+    let Some(items) = request_value
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+
+    fn find_blank_call_id(value: &serde_json::Value, path: &str) -> Option<(String, String)> {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    let child_path = format!("{path}.{key}");
+                    if key == "call_id"
+                        && let Some(call_id) = child.as_str()
+                        && call_id.trim().is_empty()
+                    {
+                        return Some((child_path, call_id.to_string()));
+                    }
+                    if let Some(found) = find_blank_call_id(child, &child_path) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Array(items) => {
+                for (index, child) in items.iter().enumerate() {
+                    let child_path = format!("{path}[{index}]");
+                    if let Some(found) = find_blank_call_id(child, &child_path) {
+                        return Some(found);
+                    }
+                }
+                None
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => None,
+        }
+    }
+
+    for (index, item) in items.iter().enumerate() {
+        if let Some((path, call_id)) = find_blank_call_id(item, &format!("input[{index}]")) {
+            let snippet = serde_json::to_string(item).map_err(OpenAIError::Json)?;
+            return Err(OpenAIError::Api(format!(
+                "responses request serialized blank call_id at {path}: {call_id:?}; item={snippet}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Make a responses API SSE request (single attempt).
 async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStreamResult {
+    validate_serialized_responses_request(request)?;
+    let serialized_request = serde_json::to_string(request).map_err(OpenAIError::Json)?;
     let endpoint = cfg.request_url("/responses");
     let mut backend = client();
 
@@ -855,10 +1012,18 @@ async fn responses_request(cfg: &Config, request: &ResponsesRequest) -> SseStrea
     .await
     {
         Ok(stream) => Ok(stream),
-        Err(error) => return Err(error),
+        Err(error) => {
+            if error.to_string().contains("call_id") {
+                return Err(OpenAIError::Api(format!(
+                    "{error}\nSerialized responses request: {serialized_request}"
+                )));
+            }
+            Err(error)
+        }
     }
 }
 
+#[allow(clippy::too_many_lines, clippy::collapsible_match)]
 fn responses_stream_inner(
     cfg: Arc<Config>,
     input: Vec<ResponsesInputItem>,
@@ -871,11 +1036,26 @@ fn responses_stream_inner(
         let mut response_tools = convert_responses_tools(tool_defs);
         let allow_builtins = matches!(snapshot.tool_choice, ToolChoice::Auto | ToolChoice::Required);
         if allow_builtins {
-            if snapshot.websearch {
-                response_tools.push(ResponsesTool::WebSearch);
+            let native_tools = snapshot.openai_tools.clone();
+            if snapshot.websearch || native_tools.web_search.is_some() {
+                let tool = native_tools.web_search.unwrap_or_default();
+                response_tools.push(ResponsesTool::from(tool));
             }
-            if snapshot.code_execution {
-                response_tools.push(ResponsesTool::CodeInterpreter);
+            for tool in native_tools.file_search {
+                response_tools.push(ResponsesTool::from(tool));
+            }
+            if snapshot.code_execution || native_tools.code_interpreter.is_some() {
+                let tool = native_tools.code_interpreter.unwrap_or_default();
+                response_tools.push(ResponsesTool::from(tool));
+            }
+            if let Some(tool) = native_tools.image_generation {
+                response_tools.push(ResponsesTool::from(tool));
+            }
+            for tool in native_tools.mcp {
+                response_tools.push(ResponsesTool::from(tool));
+            }
+            if let Some(tool) = native_tools.computer_use {
+                response_tools.push(ResponsesTool::from(tool));
             }
         }
         let response_tools = if response_tools.is_empty() {
@@ -894,6 +1074,7 @@ fn responses_stream_inner(
             tool_choice,
             true, // stream: true
         );
+        let serialized_request = serde_json::to_string(&request).unwrap_or_default();
 
         tracing::debug!(request = %serde_json::to_string_pretty(&request).unwrap_or_default(), "Sending responses request");
 
@@ -907,8 +1088,9 @@ fn responses_stream_inner(
         };
         futures_lite::pin!(sse_stream);
 
-        // Accumulate function calls by item_id
-        let mut function_calls: HashMap<String, FunctionCallAccumulator> = HashMap::new();
+        // Accumulate function calls by output_index because provider item identifiers can be
+        // absent or empty on some streamed events.
+        let mut function_calls: HashMap<usize, FunctionCallAccumulator> = HashMap::new();
         let mut usage: Option<Usage> = None;
         let mut usage_emitted = false;
 
@@ -925,15 +1107,20 @@ fn responses_stream_inner(
                     tracing::trace!(sse_event = %data, "Received Responses API SSE event");
 
                     // Check for API error response
-                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(error) = error_obj.get("error") {
+                    if let Ok(error_obj) = serde_json::from_str::<serde_json::Value>(data)
+                        && let Some(error) = error_obj.get("error") {
                             let msg = error.get("message")
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("Unknown API error");
-                            yield Err(OpenAIError::Api(msg.to_string()));
+                            if msg.contains("call_id") {
+                                yield Err(OpenAIError::Api(format!(
+                                    "{msg}\nSerialized responses request: {serialized_request}"
+                                )));
+                            } else {
+                                yield Err(OpenAIError::Api(msg.to_string()));
+                            }
                             return;
                         }
-                    }
 
                     match serde_json::from_str::<ResponsesStreamEvent>(data) {
                         Ok(stream_event) => {
@@ -954,33 +1141,73 @@ fn responses_stream_inner(
                                         yield Ok(Event::Reasoning(delta));
                                     }
                                 }
-                                ResponsesStreamEvent::OutputItemAdded { item, .. } => {
+                                ResponsesStreamEvent::OutputItemAdded { item, item_id, output_index } => {
                                     // When a function_call item is added, capture id and name
                                     if let ResponsesOutputItem::FunctionCall { id, call_id, name, .. } = item {
-                                        let acc = function_calls.entry(id.clone()).or_default();
-                                        acc.call_id = call_id.or(Some(id));
-                                        acc.name = Some(name);
+                                        let fallback_id = non_empty_response_id(item_id.clone())
+                                            .or_else(|| non_empty_response_id(Some(id.clone())))
+                                            .unwrap_or_else(|| fallback_response_item_id(output_index));
+                                        let acc = function_calls.entry(output_index).or_default();
+                                        acc.item_id = non_empty_response_id(item_id)
+                                            .or_else(|| non_empty_response_id(Some(id)));
+                                        acc.call_id = Some(normalize_response_call_id(call_id, &fallback_id));
+                                        acc.name = Some(name.clone());
+                                        // Emit initial delta with tool name
+                                        if let Some(ref call_id) = acc.call_id {
+                                            yield Ok(Event::ToolCallDelta {
+                                                id: call_id.clone(),
+                                                name,
+                                                arguments_fragment: String::new(),
+                                            });
+                                        }
                                     }
                                 }
-                                ResponsesStreamEvent::FunctionCallArgumentsDelta { delta, item_id, .. } => {
-                                    let acc = function_calls.entry(item_id).or_default();
+                                ResponsesStreamEvent::FunctionCallArgumentsDelta { delta, output_index, .. } => {
+                                    let acc = function_calls.entry(output_index).or_default();
                                     acc.arguments.push_str(&delta);
+                                    // Emit delta for UI progress
+                                    if let (Some(call_id), Some(name)) = (&acc.call_id, &acc.name) {
+                                        yield Ok(Event::ToolCallDelta {
+                                            id: call_id.clone(),
+                                            name: name.clone(),
+                                            arguments_fragment: acc.arguments.clone(),
+                                        });
+                                    }
                                 }
-                                ResponsesStreamEvent::FunctionCallArgumentsDone { arguments, item_id, .. } => {
-                                    let acc = function_calls.entry(item_id).or_default();
+                                ResponsesStreamEvent::FunctionCallArgumentsDone { arguments, output_index, .. } => {
+                                    let acc = function_calls.entry(output_index).or_default();
                                     acc.arguments = arguments;
                                 }
-                                ResponsesStreamEvent::OutputItemDone { item, .. } => {
+                                ResponsesStreamEvent::OutputItemDone { item, item_id, output_index } => {
                                     // Emit function call when item is done
                                     if let ResponsesOutputItem::FunctionCall { id, call_id, name, arguments } = item {
                                         let tool_call = mark_and_emit_done_function_call(
                                             &mut function_calls,
+                                            output_index,
+                                            item_id,
                                             id,
                                             call_id,
                                             name,
-                                            arguments,
+                                            &arguments,
                                         );
                                         yield Ok(Event::ToolCall(tool_call));
+                                    } else if let ResponsesOutputItem::Reasoning {
+                                        id, encrypted_content, ..
+                                    } = item
+                                    {
+                                        // Only encrypted reasoning is replayable;
+                                        // a summary alone cannot be verified.
+                                        if let Some(encrypted) = encrypted_content {
+                                            let payload = serde_json::json!({
+                                                "type": "reasoning",
+                                                "id": id,
+                                                "encrypted_content": encrypted,
+                                            });
+                                            yield Ok(Event::ReasoningState(ReasoningState::new(
+                                                PROVIDER_NAME,
+                                                payload.to_string(),
+                                            )));
+                                        }
                                     }
                                 }
                                 ResponsesStreamEvent::ResponseCompleted { response } => {
@@ -995,12 +1222,24 @@ fn responses_stream_inner(
                                     let msg = error
                                         .and_then(|e| e.message)
                                         .unwrap_or_else(|| "Response failed".to_string());
-                                    yield Err(OpenAIError::Api(msg));
+                                    if msg.contains("call_id") {
+                                        yield Err(OpenAIError::Api(format!(
+                                            "{msg}\nSerialized responses request: {serialized_request}"
+                                        )));
+                                    } else {
+                                        yield Err(OpenAIError::Api(msg));
+                                    }
                                     return;
                                 }
                                 ResponsesStreamEvent::Error { message, .. } => {
                                     let msg = message.unwrap_or_else(|| "Unknown error".to_string());
-                                    yield Err(OpenAIError::Api(msg));
+                                    if msg.contains("call_id") {
+                                        yield Err(OpenAIError::Api(format!(
+                                            "{msg}\nSerialized responses request: {serialized_request}"
+                                        )));
+                                    } else {
+                                        yield Err(OpenAIError::Api(msg));
+                                    }
                                     return;
                                 }
                                 // Ignore other events
@@ -1036,7 +1275,6 @@ mod tests {
         ChatCompletionTokensDetails, ChatCompletionUsage, ChatPromptTokensDetails,
         ResponsesInputTokenDetails, ResponsesOutputTokenDetails, ResponsesUsage,
     };
-    use futures_lite::future::block_on;
     use std::time::Duration;
 
     #[test]
@@ -1044,10 +1282,12 @@ mod tests {
         let mut function_calls = HashMap::new();
         let emitted = mark_and_emit_done_function_call(
             &mut function_calls,
+            1,
+            Some("item_1".to_string()),
             "item_1".to_string(),
             Some("call_1".to_string()),
             "search".to_string(),
-            r#"{"q":"rust"}"#.to_string(),
+            r#"{"q":"rust"}"#,
         );
         assert_eq!(emitted.id, "call_1");
         assert_eq!(emitted.name, "search");
@@ -1058,8 +1298,9 @@ mod tests {
     fn pending_function_call_is_emitted_once_via_fallback() {
         let mut function_calls = HashMap::new();
         function_calls.insert(
-            "item_2".to_string(),
+            2,
             FunctionCallAccumulator {
+                item_id: Some("item_2".to_string()),
                 call_id: Some("call_2".to_string()),
                 name: Some("lookup".to_string()),
                 arguments: r#"{"id":42}"#.to_string(),
@@ -1073,15 +1314,121 @@ mod tests {
     }
 
     #[test]
-    fn configured_timeout_is_enforced_for_sse_requests() {
-        block_on(async {
-            let timeout = request_with_timeout(
-                Duration::from_millis(20),
-                futures_lite::future::pending::<Result<(), zenwave::Error>>(),
-            )
-            .await;
-            assert!(matches!(timeout, Err(OpenAIError::Timeout)));
-        });
+    fn empty_done_call_id_falls_back_to_item_id() {
+        let mut function_calls = HashMap::new();
+        let emitted = mark_and_emit_done_function_call(
+            &mut function_calls,
+            3,
+            Some("item_3".to_string()),
+            "item_3".to_string(),
+            Some(String::new()),
+            "search".to_string(),
+            r#"{"q":"terminal first"}"#,
+        );
+        assert_eq!(emitted.id, "item_3");
+    }
+
+    #[test]
+    fn empty_pending_call_id_falls_back_to_item_id() {
+        let mut function_calls = HashMap::new();
+        function_calls.insert(
+            4,
+            FunctionCallAccumulator {
+                item_id: Some("item_4".to_string()),
+                call_id: Some("   ".to_string()),
+                name: Some("lookup".to_string()),
+                arguments: r#"{"id":7}"#.to_string(),
+                emitted: false,
+            },
+        );
+        let pending = drain_pending_function_calls(function_calls);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "item_4");
+        assert_eq!(pending[0].name, "lookup");
+    }
+
+    #[test]
+    fn empty_stream_identifiers_fall_back_to_output_index() {
+        let mut function_calls = HashMap::new();
+        function_calls.insert(
+            12,
+            FunctionCallAccumulator {
+                item_id: None,
+                call_id: None,
+                name: None,
+                arguments: r#"{"q":"may"}"#.to_string(),
+                emitted: false,
+            },
+        );
+        let emitted = mark_and_emit_done_function_call(
+            &mut function_calls,
+            12,
+            None,
+            String::new(),
+            Some(String::new()),
+            "search".to_string(),
+            r#"{"q":"may"}"#,
+        );
+        assert_eq!(emitted.id, "response_output_12");
+    }
+
+    #[test]
+    fn serialized_responses_request_rejects_empty_call_id() {
+        let snapshot = ParameterSnapshot::from(&aither_core::llm::model::Parameters::default());
+        let request = ResponsesRequest::new(
+            "gpt-5.4".to_string(),
+            vec![ResponsesInputItem::FunctionCall {
+                kind: "function_call",
+                call_id: String::new(),
+                name: "search".to_string(),
+                arguments: "{}".to_string(),
+            }],
+            &snapshot,
+            None,
+            responses_tool_choice(&snapshot, false),
+            false,
+        );
+
+        let error = validate_serialized_responses_request(&request)
+            .expect_err("empty serialized call_id must fail");
+        assert!(
+            error.to_string().contains("input[0]"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn serialized_responses_request_rejects_whitespace_call_id() {
+        let snapshot = ParameterSnapshot::from(&aither_core::llm::model::Parameters::default());
+        let request = ResponsesRequest::new(
+            "gpt-5.4".to_string(),
+            vec![ResponsesInputItem::FunctionCallOutput {
+                kind: "function_call_output",
+                call_id: "   ".to_string(),
+                output: "{}".to_string(),
+            }],
+            &snapshot,
+            None,
+            responses_tool_choice(&snapshot, false),
+            false,
+        );
+
+        let error = validate_serialized_responses_request(&request)
+            .expect_err("whitespace serialized call_id must fail");
+        assert!(
+            error.to_string().contains("blank call_id"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_timeout_is_enforced_for_sse_requests() {
+        let timeout = request_with_timeout(
+            Duration::from_millis(20),
+            futures_lite::future::pending::<Result<(), zenwave::Error>>(),
+        )
+        .await;
+        assert!(matches!(timeout, Err(OpenAIError::Timeout)));
     }
 
     #[test]

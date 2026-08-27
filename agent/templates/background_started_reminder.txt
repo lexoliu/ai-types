@@ -1,0 +1,7 @@
+<system-reminder>
+A terminal command is running in background (task_id={{ task_id }}).
+Current output snapshot (first max_lines):
+{{ output_preview }}
+Full redirected output file: {{ output_file }}
+Use terminal_read for incremental reads, read the stored file via terminal commands when needed, use terminal_input for stdin, and terminal_kill to stop it.
+</system-reminder>

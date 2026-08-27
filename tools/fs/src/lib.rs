@@ -5,11 +5,12 @@ use std::{
     future::Future,
     io,
     path::{Component, Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::Arc,
 };
 
-use aither_core::llm::{Tool, ToolOutput, tool::json};
+use aither_core::llm::{Tool, ToolResult, tool::json};
 use anyhow::{Result, anyhow};
+use arc_swap::ArcSwap;
 use async_fs::{
     OpenOptions, create_dir_all, read_dir, read_to_string, remove_dir, remove_file, write,
 };
@@ -175,8 +176,9 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
     }
 
     type Arguments = FsOperation;
+    type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
+    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<Self::Res> {
         match arguments {
             FsOperation::Read { path } => {
                 let content = self
@@ -184,7 +186,7 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                     .read_file(Path::new(&path))
                     .await
                     .map_err(anyhow::Error::new)?;
-                Ok(ToolOutput::text(content))
+                Ok(ToolResult::text(content))
             }
             FsOperation::Write { path, content } => {
                 self.ensure_writable()?;
@@ -192,7 +194,7 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                     .write_file(Path::new(&path), content)
                     .await
                     .map_err(anyhow::Error::new)?;
-                Ok(ToolOutput::Done)
+                Ok(ToolResult::Done)
             }
             FsOperation::Append { path, content } => {
                 self.ensure_writable()?;
@@ -200,7 +202,7 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                     .append_file(Path::new(&path), content)
                     .await
                     .map_err(anyhow::Error::new)?;
-                Ok(ToolOutput::Done)
+                Ok(ToolResult::Done)
             }
             FsOperation::Delete { path } => {
                 self.ensure_writable()?;
@@ -208,7 +210,7 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                     .remove_file(Path::new(&path))
                     .await
                     .map_err(anyhow::Error::new)?;
-                Ok(ToolOutput::Done)
+                Ok(ToolResult::Done)
             }
             FsOperation::List { path } => {
                 let listing = self
@@ -216,11 +218,11 @@ impl<FS: FileSystem> Tool for FileSystemTool<FS> {
                     .list_dir(path.as_deref().map_or(Path::new(""), Path::new))
                     .await
                     .map_err(anyhow::Error::new)?;
-                Ok(ToolOutput::text(json(&listing)))
+                Ok(ToolResult::text(json(&listing)?))
             }
             FsOperation::Glob { pattern } => {
                 let matches = self.filesystem.glob(&pattern)?;
-                Ok(ToolOutput::text(json(&matches)))
+                Ok(ToolResult::text(json(&matches)?))
             }
         }
     }
@@ -376,10 +378,10 @@ impl FileSystem for LocalFileSystem {
 
 #[derive(Debug, Clone)]
 pub struct InMemoryFileSystem {
-    state: Arc<RwLock<MemoryState>>,
+    state: Arc<ArcSwap<MemoryState>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct MemoryState {
     entries: BTreeMap<PathBuf, MemoryEntry>,
 }
@@ -395,8 +397,18 @@ impl InMemoryFileSystem {
         let mut entries = BTreeMap::new();
         entries.insert(PathBuf::from("/"), MemoryEntry::Directory);
         Self {
-            state: Arc::new(RwLock::new(MemoryState { entries })),
+            state: Arc::new(ArcSwap::from_pointee(MemoryState { entries })),
         }
+    }
+
+    fn mutate_entries(
+        &self,
+        update: impl FnOnce(&mut BTreeMap<PathBuf, MemoryEntry>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut entries = self.state.load().entries.clone();
+        update(&mut entries)?;
+        self.state.store(Arc::new(MemoryState { entries }));
+        Ok(())
     }
 
     fn normalize(path: &Path) -> io::Result<PathBuf> {
@@ -458,8 +470,8 @@ impl Default for InMemoryFileSystem {
 impl FileSystem for InMemoryFileSystem {
     async fn read_file<'a>(&'a self, path: &'a Path) -> io::Result<String> {
         let path = Self::normalize(path)?;
-        let guard = self.state.read().unwrap();
-        match guard.entries.get(&path) {
+        let state = self.state.load();
+        match state.entries.get(&path) {
             Some(MemoryEntry::File(contents)) => Ok(contents.clone()),
             Some(MemoryEntry::Directory) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -471,69 +483,71 @@ impl FileSystem for InMemoryFileSystem {
 
     async fn write_file<'a>(&'a self, path: &'a Path, contents: String) -> io::Result<()> {
         let path = Self::normalize(path)?;
-        let mut guard = self.state.write().unwrap();
-        if let Some(parent) = path.parent() {
-            Self::ensure_dir_present(&mut guard.entries, parent)?;
-        }
-        guard.entries.insert(path, MemoryEntry::File(contents));
-        Ok(())
+        self.mutate_entries(|entries| {
+            if let Some(parent) = path.parent() {
+                Self::ensure_dir_present(entries, parent)?;
+            }
+            entries.insert(path, MemoryEntry::File(contents));
+            Ok(())
+        })
     }
 
     async fn append_file<'a>(&'a self, path: &'a Path, contents: String) -> io::Result<()> {
         let path = Self::normalize(path)?;
-        let mut guard = self.state.write().unwrap();
-        if let Some(entry) = guard.entries.get_mut(&path) {
-            match entry {
-                MemoryEntry::File(existing) => existing.push_str(&contents),
-                MemoryEntry::Directory => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Cannot append to a directory",
-                    ));
+        self.mutate_entries(|entries| {
+            if let Some(entry) = entries.get_mut(&path) {
+                match entry {
+                    MemoryEntry::File(existing) => existing.push_str(&contents),
+                    MemoryEntry::Directory => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "Cannot append to a directory",
+                        ));
+                    }
                 }
+            } else {
+                if let Some(parent) = path.parent() {
+                    Self::ensure_dir_present(entries, parent)?;
+                }
+                entries.insert(path, MemoryEntry::File(contents));
             }
-        } else {
-            if let Some(parent) = path.parent() {
-                Self::ensure_dir_present(&mut guard.entries, parent)?;
-            }
-            guard.entries.insert(path, MemoryEntry::File(contents));
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     async fn remove_file<'a>(&'a self, path: &'a Path) -> io::Result<()> {
         let path = Self::normalize(path)?;
-        let mut guard = self.state.write().unwrap();
-        match guard.entries.remove(&path) {
+        self.mutate_entries(|entries| match entries.remove(&path) {
             Some(MemoryEntry::File(_)) => Ok(()),
             Some(MemoryEntry::Directory) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Use remove_dir for directories",
             )),
             None => Err(io::Error::new(io::ErrorKind::NotFound, "File not found")),
-        }
+        })
     }
 
     async fn list_dir<'a>(&'a self, dir: &'a Path) -> io::Result<Vec<DirEntry>> {
         let dir = Self::normalize(dir)?;
-        let guard = self.state.read().unwrap();
-        if !matches!(guard.entries.get(&dir), Some(MemoryEntry::Directory)) {
+        let state = self.state.load();
+        if !matches!(state.entries.get(&dir), Some(MemoryEntry::Directory)) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "Directory does not exist",
             ));
         }
-        Ok(Self::list_children(&guard.entries, &dir))
+        Ok(Self::list_children(&state.entries, &dir))
     }
 
     async fn create_dir<'a>(&'a self, dir: &'a Path) -> io::Result<()> {
         let dir = Self::normalize(dir)?;
-        let mut guard = self.state.write().unwrap();
-        if let Some(parent) = dir.parent() {
-            Self::ensure_dir_present(&mut guard.entries, parent)?;
-        }
-        guard.entries.insert(dir, MemoryEntry::Directory);
-        Ok(())
+        self.mutate_entries(|entries| {
+            if let Some(parent) = dir.parent() {
+                Self::ensure_dir_present(entries, parent)?;
+            }
+            entries.insert(dir, MemoryEntry::Directory);
+            Ok(())
+        })
     }
 
     async fn remove_dir<'a>(&'a self, dir: &'a Path) -> io::Result<()> {
@@ -544,35 +558,44 @@ impl FileSystem for InMemoryFileSystem {
                 "Cannot remove root directory",
             ));
         }
-        let mut guard = self.state.write().unwrap();
-        let mut to_remove = Vec::new();
-        for path in guard.entries.keys() {
-            if path.starts_with(&dir) {
-                to_remove.push(path.clone());
+        self.mutate_entries(|entries| {
+            let mut to_remove = Vec::new();
+            for path in entries.keys() {
+                if path.starts_with(&dir) {
+                    to_remove.push(path.clone());
+                }
             }
-        }
-        if to_remove.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Directory does not exist",
-            ));
-        }
-        for path in to_remove {
-            guard.entries.remove(&path);
-        }
-        Ok(())
+            if to_remove.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Directory does not exist",
+                ));
+            }
+            for path in to_remove {
+                entries.remove(&path);
+            }
+            Ok(())
+        })
     }
 }
 
 #[derive(Clone)]
 pub struct MountFileSystem<FS> {
-    mounts: Arc<RwLock<Vec<MountPoint<FS>>>>,
+    mounts: Arc<ArcSwap<Vec<MountPoint<FS>>>>,
 }
 
-#[derive(Clone)]
 struct MountPoint<FS> {
     prefix: PathBuf,
     fs: Arc<FS>,
+}
+
+impl<FS> Clone for MountPoint<FS> {
+    fn clone(&self) -> Self {
+        Self {
+            prefix: self.prefix.clone(),
+            fs: Arc::clone(&self.fs),
+        }
+    }
 }
 
 impl<FS> MountFileSystem<FS>
@@ -581,25 +604,25 @@ where
 {
     pub fn new() -> Self {
         Self {
-            mounts: Arc::new(RwLock::new(Vec::new())),
+            mounts: Arc::new(ArcSwap::from_pointee(Vec::new())),
         }
     }
 
     pub fn mount(self, prefix: impl Into<PathBuf>, fs: FS) -> Self {
-        let mut guard = self.mounts.write().unwrap();
-        guard.push(MountPoint {
+        let mut mounts = self.mounts.load().as_ref().clone();
+        mounts.push(MountPoint {
             prefix: normalize_mount(prefix.into()),
             fs: Arc::new(fs),
         });
-        drop(guard);
+        self.mounts.store(Arc::new(mounts));
         self
     }
 
     fn route(&self, path: &Path) -> io::Result<(Arc<FS>, PathBuf)> {
         let normalized = normalize_mount(path.to_path_buf());
-        let guard = self.mounts.read().unwrap();
+        let mounts = self.mounts.load();
         let mut best: Option<&MountPoint<_>> = None;
-        for mount in guard.iter() {
+        for mount in mounts.iter() {
             if normalized.starts_with(&mount.prefix) {
                 match best {
                     Some(current)
@@ -633,8 +656,8 @@ where
     FS: FileSystem,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let guard = self.mounts.read().unwrap();
-        let prefixes: Vec<PathBuf> = guard.iter().map(|mount| mount.prefix.clone()).collect();
+        let mounts = self.mounts.load();
+        let prefixes: Vec<PathBuf> = mounts.iter().map(|mount| mount.prefix.clone()).collect();
         f.debug_struct("MountFileSystem")
             .field("mounts", &prefixes)
             .finish()

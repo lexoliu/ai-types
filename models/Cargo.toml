@@ -1,8 +1,8 @@
 [package]
 name = "aither-models"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
-rust-version = "1.87"
+rust-version.workspace = true
 description = "Model registry with capabilities, context windows, and metadata for popular LLMs"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/phaedrus-ai/aither"
@@ -12,7 +12,18 @@ categories = ["data-structures"]
 
 [dependencies]
 aither-core.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-fs = { version = "2", optional = true }
+zenwave = { workspace = true, optional = true }
 
 [build-dependencies]
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
+serde_json = "1.0"
+
+[features]
+default = []
+remote = ["zenwave", "dep:async-fs"]
+
+[lints]
+workspace = true

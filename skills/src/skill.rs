@@ -12,8 +12,6 @@ pub struct Skill {
     pub name: String,
     /// Human-readable description.
     pub description: String,
-    /// Trigger phrases that activate this skill.
-    pub triggers: Vec<String>,
     /// The markdown instructions (everything after frontmatter).
     pub instructions: String,
     /// Optional list of allowed tools (None = all tools allowed).
@@ -24,14 +22,12 @@ pub struct Skill {
 
 /// YAML frontmatter parsed from SKILL.md files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillFrontmatter {
     /// Unique name of the skill.
     pub name: String,
     /// Human-readable description.
     pub description: String,
-    /// Trigger phrases that activate this skill.
-    #[serde(default)]
-    pub triggers: Vec<String>,
     /// Optional list of allowed tools.
     #[serde(default)]
     pub tools: Option<Vec<String>>,
@@ -45,8 +41,6 @@ impl Skill {
     /// ---
     /// name: skill-name
     /// description: What this skill does
-    /// triggers:
-    ///   - "trigger phrase"
     /// tools:
     ///   - Read
     ///   - Grep
@@ -79,12 +73,11 @@ impl Skill {
         let yaml_content = &after_first[..end_idx];
         let instructions = after_first[end_idx + 4..].trim().to_string();
 
-        let frontmatter: SkillFrontmatter = serde_yaml::from_str(yaml_content)?;
+        let frontmatter: SkillFrontmatter = serde_norway::from_str(yaml_content)?;
 
         Ok(Self {
             name: frontmatter.name,
             description: frontmatter.description,
-            triggers: frontmatter.triggers,
             instructions,
             allowed_tools: frontmatter.tools,
             resources: HashMap::new(),
@@ -98,31 +91,13 @@ mod tests {
 
     #[test]
     fn test_parse_skill() {
-        let content = r#"---
-name: code-review
-description: Reviews code for security and best practices
-triggers:
-  - "review"
-  - "security audit"
-tools:
-  - Read
-  - Grep
----
-
-# Code Review Skill
-
-When reviewing code, follow these steps:
-1. First scan for security vulnerabilities
-2. Check for common anti-patterns
-"#;
-
+        let content = include_str!("../tests/fixtures/code_review_skill.md");
         let skill = Skill::parse(content).unwrap();
         assert_eq!(skill.name, "code-review");
         assert_eq!(
             skill.description,
             "Reviews code for security and best practices"
         );
-        assert_eq!(skill.triggers, vec!["review", "security audit"]);
         assert_eq!(
             skill.allowed_tools,
             Some(vec!["Read".to_string(), "Grep".to_string()])
@@ -133,17 +108,9 @@ When reviewing code, follow these steps:
 
     #[test]
     fn test_parse_skill_no_tools() {
-        let content = r"---
-name: simple
-description: A simple skill
----
-
-Instructions here.
-";
-
+        let content = include_str!("../tests/fixtures/simple_skill.md");
         let skill = Skill::parse(content).unwrap();
         assert_eq!(skill.name, "simple");
-        assert!(skill.triggers.is_empty());
         assert!(skill.allowed_tools.is_none());
     }
 

@@ -1,4 +1,4 @@
-//! Output compression pipeline for bash tool results.
+//! Output compression pipeline for terminal tool results.
 //!
 //! Applies semantics-preserving transformations to reduce output size:
 //! 1. JSON arrays/objects -> TSV with dot-notation flattened headers (if smaller)
@@ -143,7 +143,7 @@ fn try_json_to_tsv(text: &str) -> Option<String> {
     }
 }
 
-/// Flatten a JSON value into a list of (dotted_key, string_value) pairs.
+/// Flatten a JSON value into a list of (`dotted_key`, `string_value`) pairs.
 fn flatten_value(val: &Value, prefix: &str) -> Vec<(String, String)> {
     let mut result = Vec::new();
     match val {
@@ -181,7 +181,7 @@ fn flatten_value(val: &Value, prefix: &str) -> Vec<(String, String)> {
 
 /// Escape a TSV field: replace tabs and newlines with spaces.
 fn escape_tsv_field(s: &str) -> String {
-    s.replace('\t', " ").replace('\n', " ").replace('\r', " ")
+    s.replace(['\t', '\n', '\r'], " ")
 }
 
 // ---------------------------------------------------------------------------
@@ -193,9 +193,10 @@ struct FoldedCode {
 }
 
 /// Mapping from magika `ContentType` label to tree-sitter language module.
+#[cfg(feature = "code-folding")]
 fn magika_label_to_ts_language(label: &str) -> Option<tree_sitter::Language> {
     match label {
-        "bash" | "shell" => Some(rs_tree_sitter_languages::bash::language()),
+        "terminal" | "shell" => Some(rs_tree_sitter_languages::bash::language()),
         "c" => Some(rs_tree_sitter_languages::c::language()),
         "cpp" => Some(rs_tree_sitter_languages::cpp::language()),
         "css" => Some(rs_tree_sitter_languages::css::language()),
@@ -223,6 +224,7 @@ fn magika_label_to_ts_language(label: &str) -> Option<tree_sitter::Language> {
 
 /// Set of tree-sitter node types considered "foldable blocks".
 /// These are compound statements whose body can be collapsed.
+#[cfg(feature = "code-folding")]
 fn is_foldable_node(kind: &str) -> bool {
     matches!(
         kind,
@@ -253,9 +255,20 @@ fn is_foldable_node(kind: &str) -> bool {
 }
 
 /// Minimum number of lines a foldable block must span to be worth folding.
+#[cfg(feature = "code-folding")]
 const MIN_FOLD_LINES: usize = 4;
 
 /// Try to detect source code via magika and fold it with tree-sitter.
+///
+/// Without the `code-folding` feature there is no content detector, so output
+/// is passed through uncompressed rather than folded incorrectly.
+#[cfg(not(feature = "code-folding"))]
+const fn try_fold_source_code(_text: &str) -> Option<FoldedCode> {
+    None
+}
+
+/// Try to detect source code via magika and fold it with tree-sitter.
+#[cfg(feature = "code-folding")]
 fn try_fold_source_code(text: &str) -> Option<FoldedCode> {
     // Use magika to identify content type
     let mut session = magika::Session::new().ok()?;
@@ -311,7 +324,7 @@ fn try_fold_source_code(text: &str) -> Option<FoldedCode> {
 
         // Calculate how many inner lines we're folding
         let inner_end = fold_end + 1; // exclusive
-        let folded_count = if inner_end > i { inner_end - i } else { 0 };
+        let folded_count = inner_end.saturating_sub(i);
 
         if folded_count > 0 {
             // Emit fold marker
@@ -343,6 +356,7 @@ fn try_fold_source_code(text: &str) -> Option<FoldedCode> {
 }
 
 /// Recursively collect foldable ranges from the tree-sitter AST.
+#[cfg(feature = "code-folding")]
 fn collect_foldable_ranges(node: tree_sitter::Node, ranges: &mut Vec<(usize, usize)>) {
     if is_foldable_node(node.kind()) {
         let start_line = node.start_position().row;
@@ -359,30 +373,38 @@ fn collect_foldable_ranges(node: tree_sitter::Node, ranges: &mut Vec<(usize, usi
 }
 
 /// Merge overlapping or adjacent ranges.
+#[cfg(feature = "code-folding")]
 fn merge_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for &(start, end) in ranges {
-        if let Some(last) = merged.last_mut() {
-            if start <= last.1 + 1 {
-                last.1 = last.1.max(end);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && start <= last.1 + 1
+        {
+            last.1 = last.1.max(end);
+            continue;
         }
         merged.push((start, end));
     }
     merged
 }
 
+#[cfg(feature = "code-folding")]
 fn append_numbered_line(out: &mut String, line_num: usize, line: &str, width: usize) {
     use std::fmt::Write;
     let _ = writeln!(out, "{line_num:>width$}  {line}");
 }
 
-fn digit_count(n: usize) -> usize {
-    if n == 0 {
-        return 1;
+#[cfg(feature = "code-folding")]
+const fn digit_count(n: usize) -> usize {
+    // Counting digits by repeated division avoids a float round-trip, and so
+    // cannot be thrown off by rounding near a power of ten.
+    let mut count = 1;
+    let mut remaining = n;
+    while remaining >= 10 {
+        remaining /= 10;
+        count += 1;
     }
-    ((n as f64).log10().floor() as usize) + 1
+    count
 }
 
 // ---------------------------------------------------------------------------

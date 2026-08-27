@@ -1,0 +1,3 @@
+Current todo list (do not mention this explicitly to the user):
+
+{{ items_json }}

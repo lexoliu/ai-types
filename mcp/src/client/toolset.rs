@@ -5,9 +5,11 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use aither_core::llm::tool::ToolDefinition;
-use async_channel::{Receiver, Sender};
+use aither_sandbox::{CommandPayload, ToolRegistryBuilder};
+use async_lock::Mutex;
 use serde::Deserialize;
 
 use crate::protocol::{CallToolResult, McpError, McpToolDefinition};
@@ -94,17 +96,8 @@ pub enum McpConnection {
 /// Service wrapper that serializes MCP tool calls through a command channel.
 #[derive(Clone, Debug)]
 pub struct McpToolService {
-    tx: Sender<McpCommand>,
+    conn: Arc<Mutex<McpConnection>>,
     tools: Vec<McpToolDefinition>,
-}
-
-#[derive(Debug)]
-enum McpCommand {
-    Call {
-        name: String,
-        arguments: serde_json::Value,
-        reply: Sender<Result<CallToolResult, McpError>>,
-    },
 }
 
 impl std::fmt::Debug for McpConnection {
@@ -278,7 +271,7 @@ impl McpConnection {
     ///
     /// Returns an error if stdio cannot be initialized.
     pub async fn stdio() -> Result<Self, McpError> {
-        let transport = StdioTransport::new().map_err(|e| McpError::Transport(e.to_string()))?;
+        let transport = StdioTransport::new();
         let mut client = McpClient::connect(transport).await?;
         let tools = client.list_tools().await?;
         let server_name = client.server_info().map(|i| i.name.clone());
@@ -311,17 +304,13 @@ impl McpConnection {
     }
 
     /// Returns aither-compatible tool definitions.
+    ///
+    /// A tool whose schema the server sent in a form JSON Schema does not allow
+    /// is dropped with a warning: it is unusable, and one bad entry should not
+    /// cost the caller every other tool on the server.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.mcp_definitions()
-            .iter()
-            .map(|def| {
-                let name: Cow<'static, str> = Cow::Owned(def.name.clone());
-                let description: Cow<'static, str> =
-                    Cow::Owned(def.description.clone().unwrap_or_default());
-                ToolDefinition::from_parts(name, description, def.input_schema.clone())
-            })
-            .collect()
+        convert_definitions(self.mcp_definitions())
     }
 
     /// Check if this connection has a tool with the given name.
@@ -361,14 +350,81 @@ impl McpConnection {
     }
 }
 
+fn call_result_to_terminal_payload(
+    result: CallToolResult,
+) -> Result<Option<CommandPayload>, String> {
+    let CallToolResult { content, is_error } = result;
+    let all_text = content
+        .iter()
+        .all(|item| matches!(item, crate::Content::Text(_)));
+
+    if all_text {
+        let text = content
+            .into_iter()
+            .filter_map(|item| match item {
+                crate::Content::Text(text_content) => Some(text_content.text),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if is_error {
+            Err(text)
+        } else {
+            Ok(Some(CommandPayload::Text { content: text }))
+        }
+    } else {
+        let value = serde_json::to_value(CallToolResult { content, is_error })
+            .map_err(|error| format!("failed to encode MCP tool result: {error}"))?;
+        if is_error {
+            Err(value.to_string())
+        } else {
+            Ok(Some(CommandPayload::Json { value }))
+        }
+    }
+}
+
+/// Registers all tools from an MCP connection as schema-driven terminal commands.
+///
+/// Each command derives its help text, positional arguments, and validation
+/// behavior from the MCP tool's JSON schema via
+/// [`aither_sandbox::ToolRegistryBuilder::configure_definition_handler`].
+pub fn register_terminal_commands(
+    registry: &mut ToolRegistryBuilder,
+    conn: McpConnection,
+) -> Vec<ToolDefinition> {
+    let definitions = conn.definitions();
+    let conn = std::sync::Arc::new(async_lock::Mutex::new(conn));
+
+    for definition in &definitions {
+        let tool_name = definition.name().to_string();
+        let conn = conn.clone();
+        registry.configure_definition_handler(definition, move |arguments| {
+            let conn = conn.clone();
+            let tool_name = tool_name.clone();
+            Box::pin(async move {
+                let result = {
+                    let mut conn = conn.lock().await;
+                    conn.call(tool_name.as_str(), arguments)
+                        .await
+                        .map_err(|error| error.to_string())?
+                };
+                call_result_to_terminal_payload(result)
+            })
+        });
+    }
+
+    definitions
+}
+
 impl McpToolService {
-    /// Creates a new MCP tool service and starts its background worker.
+    /// Creates a new MCP tool service.
     #[must_use]
-    pub fn new(mut conn: McpConnection) -> Self {
+    pub fn new(conn: McpConnection) -> Self {
         let tools = conn.mcp_definitions().to_vec();
-        let (tx, rx) = async_channel::unbounded();
-        std::thread::spawn(move || run_service(rx, &mut conn));
-        Self { tx, tools }
+        Self {
+            conn: Arc::new(Mutex::new(conn)),
+            tools,
+        }
     }
 
     /// Returns the MCP tool definitions.
@@ -378,17 +434,11 @@ impl McpToolService {
     }
 
     /// Returns aither-compatible tool definitions.
+    ///
+    /// See [`McpConnection::definitions`] for how an unusable schema is handled.
     #[must_use]
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools
-            .iter()
-            .map(|def| {
-                let name: Cow<'static, str> = Cow::Owned(def.name.clone());
-                let description: Cow<'static, str> =
-                    Cow::Owned(def.description.clone().unwrap_or_default());
-                ToolDefinition::from_parts(name, description, def.input_schema.clone())
-            })
-            .collect()
+        convert_definitions(&self.tools)
     }
 
     /// Check if this service has a tool with the given name.
@@ -407,35 +457,29 @@ impl McpToolService {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult, McpError> {
-        let (reply_tx, reply_rx) = async_channel::bounded(1);
-        self.tx
-            .send(McpCommand::Call {
-                name: name.to_string(),
-                arguments,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| McpError::ConnectionClosed)?;
-        reply_rx
-            .recv()
-            .await
-            .map_err(|_| McpError::ConnectionClosed)?
+        let mut conn = self.conn.lock().await;
+        conn.call(name, arguments).await
     }
 }
 
-fn run_service(rx: Receiver<McpCommand>, conn: &mut McpConnection) {
-    async_io::block_on(async {
-        while let Ok(cmd) = rx.recv().await {
-            match cmd {
-                McpCommand::Call {
-                    name,
-                    arguments,
-                    reply,
-                } => {
-                    let result = conn.call(&name, arguments).await;
-                    let _ = reply.send(result).await;
+/// Converts the server's tool list into aither definitions.
+///
+/// The schemas come off the wire from a third-party server, so one that is not
+/// a JSON schema at all is a rejection to log, not a reason to fail: that tool
+/// is skipped and the rest are returned.
+fn convert_definitions(defs: &[McpToolDefinition]) -> Vec<ToolDefinition> {
+    defs.iter()
+        .filter_map(|def| {
+            let name: Cow<'static, str> = Cow::Owned(def.name.clone());
+            let description: Cow<'static, str> =
+                Cow::Owned(def.description.clone().unwrap_or_default());
+            match ToolDefinition::from_parts(name, description, def.input_schema.clone()) {
+                Ok(definition) => Some(definition),
+                Err(err) => {
+                    tracing::warn!(error = %err, "skipping MCP tool with an unusable schema");
+                    None
                 }
             }
-        }
-    });
+        })
+        .collect()
 }

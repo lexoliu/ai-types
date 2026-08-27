@@ -1,3 +1,8 @@
+// These types mirror the provider's error payload. Some fields are declared
+// so a response deserializes faithfully even where this crate only reads a
+// few of them.
+#![allow(dead_code)]
+
 use std::fmt;
 
 use base64::DecodeError;
@@ -21,7 +26,9 @@ pub enum GeminiError {
     Parse(String),
     /// Rate limit exceeded (includes retry delay if available).
     RateLimit {
+        /// What the API said about the limit.
         message: String,
+        /// How long the API asked us to wait, when it said.
         retry_after_secs: Option<u64>,
     },
 }
@@ -29,45 +36,70 @@ pub enum GeminiError {
 /// Gemini API error response structure.
 #[derive(Debug, Deserialize)]
 pub struct ApiErrorResponse {
+    /// The error the API reported, when it reported one.
     pub error: Option<ApiErrorDetail>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ApiErrorDetail {
+    /// Numeric status code.
     pub code: Option<i32>,
+    /// Human-readable description.
     pub message: Option<String>,
+    /// Canonical status name, such as `RESOURCE_EXHAUSTED`.
     pub status: Option<String>,
+    /// Structured details, used to distinguish quota failures from retries.
     pub details: Option<Vec<ApiErrorInfo>>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 #[serde(untagged)]
 pub enum ApiErrorInfo {
+    /// A quota was exceeded; names which one.
     QuotaFailure(QuotaFailureInfo),
+    /// The API suggested when to retry.
     RetryInfo(RetryInfoDetail),
+    /// Any other detail payload, kept verbatim.
     Other(serde_json::Value),
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct QuotaFailureInfo {
+    /// Type URL identifying this detail payload.
     #[serde(rename = "@type")]
+    /// Detail type URL.
     pub type_url: Option<String>,
+    /// The specific quotas that were exceeded.
     pub violations: Option<Vec<QuotaViolation>>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 #[serde(rename_all = "camelCase")]
+// The `quota_` prefix comes from the wire format and must match it.
+#[allow(clippy::struct_field_names)]
 pub struct QuotaViolation {
+    /// Metric the quota is measured in.
     pub quota_metric: Option<String>,
+    /// Identifier of the exceeded quota.
     pub quota_id: Option<String>,
+    /// The limit that was hit.
     pub quota_value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct RetryInfoDetail {
+    /// Type URL identifying this detail payload.
     #[serde(rename = "@type")]
+    /// Detail type URL.
     pub type_url: Option<String>,
+    /// How long the API suggests waiting before retrying.
     #[serde(rename = "retryDelay")]
+    /// Retry delay duration.
     pub retry_delay: Option<String>,
 }
 
@@ -88,27 +120,25 @@ impl ApiErrorResponse {
         // Check for quota violations
         if let Some(details) = &error.details {
             for detail in details {
-                if let ApiErrorInfo::QuotaFailure(quota) = detail {
-                    if quota
+                if let ApiErrorInfo::QuotaFailure(quota) = detail
+                    && quota
                         .type_url
                         .as_deref()
                         .is_some_and(|t| t.contains("QuotaFailure"))
-                    {
-                        if let Some(violations) = &quota.violations {
-                            if let Some(v) = violations.first() {
-                                let quota_id = v.quota_id.as_deref().unwrap_or("unknown");
-                                let quota_value = v.quota_value.as_deref().unwrap_or("?");
-                                return format!(
-                                    "Rate limit exceeded: {} requests/min (limit: {})",
-                                    quota_id.split('-').next().unwrap_or(quota_id).replace(
-                                        "GenerateRequestsPerMinutePerProjectPerModel",
-                                        "requests"
-                                    ),
-                                    quota_value
-                                );
-                            }
-                        }
-                    }
+                    && let Some(violations) = &quota.violations
+                    && let Some(v) = violations.first()
+                {
+                    let quota_id = v.quota_id.as_deref().unwrap_or("unknown");
+                    let quota_value = v.quota_value.as_deref().unwrap_or("?");
+                    return format!(
+                        "Rate limit exceeded: {} requests/min (limit: {})",
+                        quota_id
+                            .split('-')
+                            .next()
+                            .unwrap_or(quota_id)
+                            .replace("GenerateRequestsPerMinutePerProjectPerModel", "requests"),
+                        quota_value
+                    );
                 }
             }
         }
@@ -117,14 +147,15 @@ impl ApiErrorResponse {
     }
 
     /// Extract retry delay in seconds from the error response.
+    #[must_use]
     pub fn retry_delay_secs(&self) -> Option<u64> {
         let details = self.error.as_ref()?.details.as_ref()?;
         for detail in details {
-            if let ApiErrorInfo::RetryInfo(info) = detail {
-                if let Some(delay) = &info.retry_delay {
-                    // Parse "20s" format
-                    return delay.trim_end_matches('s').parse().ok();
-                }
+            if let ApiErrorInfo::RetryInfo(info) = detail
+                && let Some(delay) = &info.retry_delay
+            {
+                // Parse "20s" format
+                return delay.trim_end_matches('s').parse().ok();
             }
         }
         None
@@ -163,10 +194,10 @@ impl fmt::Display for GeminiError {
 /// Parse HTTP error to extract a user-friendly message.
 fn parse_http_error_message(err: &ZenwaveError) -> String {
     // Try to parse as Gemini API error response
-    if let Some(body) = err.response_body() {
-        if let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body) {
-            return api_error.friendly_message();
-        }
+    if let Some(body) = err.response_body()
+        && let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body)
+    {
+        return api_error.friendly_message();
     }
 
     // Fall back to status-based messages
@@ -198,6 +229,7 @@ impl std::error::Error for GeminiError {}
 
 impl GeminiError {
     /// Check if this error is retryable.
+    #[must_use]
     pub const fn is_retryable(&self) -> bool {
         match self {
             Self::Http(err) => {
@@ -215,6 +247,7 @@ impl GeminiError {
     }
 
     /// Get suggested retry delay in seconds.
+    #[must_use]
     pub fn retry_delay_secs(&self) -> Option<u64> {
         match self {
             Self::RateLimit {
@@ -222,10 +255,10 @@ impl GeminiError {
             } => *retry_after_secs,
             Self::Http(err) => {
                 // Try to parse from response body
-                if let Some(body) = err.response_body() {
-                    if let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body) {
-                        return api_error.retry_delay_secs();
-                    }
+                if let Some(body) = err.response_body()
+                    && let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body)
+                {
+                    return api_error.retry_delay_secs();
                 }
                 None
             }
@@ -236,21 +269,21 @@ impl GeminiError {
     /// Convert a zenwave error to a `GeminiError`, detecting rate limits.
     pub(crate) fn from_http(err: ZenwaveError) -> Self {
         // Check if it's a rate limit error
-        if let zenwave::Error::Http { status, .. } = &err {
-            if status.as_u16() == 429 {
-                if let Some(body) = err.response_body() {
-                    if let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body) {
-                        return Self::RateLimit {
-                            message: api_error.friendly_message(),
-                            retry_after_secs: api_error.retry_delay_secs(),
-                        };
-                    }
-                }
+        if let zenwave::Error::Http { status, .. } = &err
+            && status.as_u16() == 429
+        {
+            if let Some(body) = err.response_body()
+                && let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(body)
+            {
                 return Self::RateLimit {
-                    message: "Rate limit exceeded".to_string(),
-                    retry_after_secs: None,
+                    message: api_error.friendly_message(),
+                    retry_after_secs: api_error.retry_delay_secs(),
                 };
             }
+            return Self::RateLimit {
+                message: "Rate limit exceeded".to_string(),
+                retry_after_secs: None,
+            };
         }
         Self::Http(err)
     }

@@ -33,11 +33,11 @@ mod pooling;
 pub use error::OrtError;
 pub use pooling::PoolingStrategy;
 
+use async_channel::Sender;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use aither_core::EmbeddingModel;
-use ndarray::{Axis, Ix2, Ix3};
+use ndarray::{ArrayD, Axis, Ix2, Ix3};
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use tokenizers::Tokenizer;
 
@@ -63,11 +63,17 @@ use tokenizers::Tokenizer;
 /// # Ok::<(), aither_ort::OrtError>(())
 /// ```
 pub struct OrtEmbedding {
-    session: Mutex<Session>,
+    inference_tx: Sender<InferenceRequest>,
     tokenizer: Tokenizer,
     dimension: usize,
     pooling: PoolingStrategy,
     normalize: bool,
+}
+
+struct InferenceRequest {
+    input_ids: Vec<i64>,
+    attention_mask: Vec<i64>,
+    response_tx: async_channel::Sender<Result<ArrayD<f32>, OrtError>>,
 }
 
 impl std::fmt::Debug for OrtEmbedding {
@@ -149,40 +155,19 @@ impl EmbeddingModel for OrtEmbedding {
             .iter()
             .map(|&m| i64::from(m))
             .collect();
-        let seq_len = input_ids.len();
-
-        // Create tensors [batch=1, seq_len]
-        let input_ids_tensor =
-            ort::value::Tensor::from_array(([1, seq_len], input_ids.into_boxed_slice()))
-                .map_err(OrtError::from)?;
-        let attention_mask_tensor =
-            ort::value::Tensor::from_array(([1, seq_len], attention_mask.into_boxed_slice()))
-                .map_err(OrtError::from)?;
-
-        // Run inference and extract to owned array (before releasing session lock)
-        let hidden_states_owned = {
-            let mut session = self.session.lock().expect("session lock poisoned");
-            let outputs = session
-                .run(ort::inputs![
-                    "input_ids" => input_ids_tensor,
-                    "attention_mask" => attention_mask_tensor,
-                ])
-                .map_err(OrtError::from)?;
-
-            // Extract hidden states - try common output names
-            let hidden_states = outputs
-                .get("last_hidden_state")
-                .or_else(|| outputs.get("hidden_states"))
-                .or_else(|| outputs.get("output"))
-                .ok_or(OrtError::InvalidOutputShape(0))?;
-
-            let view = hidden_states
-                .try_extract_array::<f32>()
-                .map_err(OrtError::from)?;
-
-            // Convert to owned array before releasing lock
-            view.to_owned()
-        };
+        let (response_tx, response_rx) = async_channel::bounded(1);
+        self.inference_tx
+            .send(InferenceRequest {
+                input_ids,
+                attention_mask,
+                response_tx,
+            })
+            .await
+            .map_err(|_| OrtError::Worker("inference worker is unavailable".to_string()))?;
+        let hidden_states_owned = response_rx
+            .recv()
+            .await
+            .map_err(|_| OrtError::Worker("inference worker dropped response".to_string()))??;
 
         let rank = hidden_states_owned.shape().len();
         let hidden_states_3d = match rank {
@@ -275,7 +260,7 @@ impl OrtEmbeddingBuilder {
         })?;
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| OrtError::tokenizer(&tokenizer_path, e))?;
+            .map_err(|e| OrtError::tokenizer(&tokenizer_path, e.to_string()))?;
 
         // Load ONNX session with optimizations
         let session = Session::builder()?
@@ -285,9 +270,10 @@ impl OrtEmbeddingBuilder {
 
         // Auto-detect dimension from model outputs
         let dimension = detect_embedding_dimension(&session)?;
+        let inference_tx = spawn_inference_worker(session)?;
 
         Ok(OrtEmbedding {
-            session: Mutex::new(session),
+            inference_tx,
             tokenizer,
             dimension,
             pooling: self.pooling,
@@ -343,13 +329,13 @@ fn find_model_file(dir: &Path) -> Result<PathBuf, OrtError> {
 
     // Check onnx subdirectory
     let onnx_dir = dir.join("onnx");
-    if onnx_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&onnx_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "onnx") {
-                    return Ok(path);
-                }
+    if onnx_dir.exists()
+        && let Ok(entries) = std::fs::read_dir(&onnx_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "onnx") {
+                return Ok(path);
             }
         }
     }
@@ -373,17 +359,17 @@ fn find_tokenizer_file(dir: &Path) -> Result<PathBuf, OrtError> {
 /// Detect the embedding dimension from model output metadata.
 fn detect_embedding_dimension(session: &Session) -> Result<usize, OrtError> {
     // Look for the output that contains hidden states
-    for output in &session.outputs {
+    for output in session.outputs() {
         // Get tensor type info if available
-        if let ort::value::ValueType::Tensor { shape, .. } = &output.output_type {
+        if let ort::value::ValueType::Tensor { shape, .. } = output.dtype() {
             // Expect shape [batch, seq_len, hidden_dim] or [batch, hidden_dim]
             if shape.len() >= 2 {
                 // Last dimension is typically the hidden dimension
-                if let Some(&dim) = shape.last() {
-                    if dim > 0 {
-                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                        return Ok(dim as usize);
-                    }
+                if let Some(&dim) = shape.last()
+                    && dim > 0
+                {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    return Ok(dim as usize);
                 }
             }
         }
@@ -396,9 +382,56 @@ fn detect_embedding_dimension(session: &Session) -> Result<usize, OrtError> {
 
 /// Get number of CPU cores for parallelism.
 fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(4)
+    std::thread::available_parallelism().map_or(4, std::num::NonZero::get)
+}
+
+fn spawn_inference_worker(session: Session) -> Result<Sender<InferenceRequest>, OrtError> {
+    let (tx, rx) = async_channel::unbounded::<InferenceRequest>();
+    std::thread::Builder::new()
+        .name("ort-embedding-worker".to_string())
+        .spawn(move || run_inference_worker(session, &rx))
+        .map_err(|error| OrtError::Worker(error.to_string()))?;
+    Ok(tx)
+}
+
+fn run_inference_worker(session: Session, rx: &async_channel::Receiver<InferenceRequest>) {
+    let mut session = session;
+    while let Ok(request) = rx.recv_blocking() {
+        let result = run_inference(&mut session, request.input_ids, request.attention_mask);
+        let _ = request.response_tx.send_blocking(result);
+    }
+}
+
+fn run_inference(
+    session: &mut Session,
+    input_ids: Vec<i64>,
+    attention_mask: Vec<i64>,
+) -> Result<ArrayD<f32>, OrtError> {
+    let seq_len = input_ids.len();
+    let input_ids_tensor =
+        ort::value::Tensor::from_array(([1, seq_len], input_ids.into_boxed_slice()))
+            .map_err(OrtError::from)?;
+    let attention_mask_tensor =
+        ort::value::Tensor::from_array(([1, seq_len], attention_mask.into_boxed_slice()))
+            .map_err(OrtError::from)?;
+
+    let outputs = session
+        .run(ort::inputs![
+            "input_ids" => input_ids_tensor,
+            "attention_mask" => attention_mask_tensor,
+        ])
+        .map_err(OrtError::from)?;
+
+    let hidden_states = outputs
+        .get("last_hidden_state")
+        .or_else(|| outputs.get("hidden_states"))
+        .or_else(|| outputs.get("output"))
+        .ok_or(OrtError::InvalidOutputShape(0))?;
+
+    hidden_states
+        .try_extract_array::<f32>()
+        .map(|view| view.to_owned())
+        .map_err(OrtError::from)
 }
 
 #[cfg(test)]

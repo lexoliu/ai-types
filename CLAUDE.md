@@ -28,7 +28,7 @@ cargo test --package aither-core test_name
 
 ### Core Layer (`core/`)
 `aither-core` defines provider-agnostic traits that all implementations must satisfy:
-- `LanguageModel` / `LLMResponse` – streaming chat with reasoning and tool calling
+- `LanguageModel` / `Event` – streaming chat with reasoning and tool calling
 - `EmbeddingModel` – text vectorization for RAG
 - `ImageGenerator` – progressive image generation
 - `AudioGenerator` / `AudioTranscriber` – TTS and speech recognition
@@ -70,15 +70,15 @@ Model Context Protocol client/server implementation for tool discovery and execu
 
 **Streaming-first**: Every `LanguageModel::respond` returns a stream. Use `futures_lite::StreamExt` for iteration.
 
-**Builders over constructors**: Prefer `Request::new([...]).with_tool(...)` pattern.
+**Builders over constructors**: Prefer the `LLMRequest::new([...]).with_tool(&...)` pattern.
 
-**Tool definition**: Implement the `Tool` trait or use `#[derive(Tool)]` with `schemars::JsonSchema` for argument schemas.
+**Tool definition**: Implement the `Tool` trait (`name()`, an `Arguments` type implementing `schemars::JsonSchema`, and `call(&self, args)` returning `Result<ToolOutput>`), or use the `#[tool]` attribute macro on a free function. A tool's description defaults to the rustdoc on its `Arguments` type; override `Tool::description()` to set it directly. Registration rejects a tool with no description.
 
 **Feature flags**: Provider crates are optional (`openai`, `gemini`, `claude`). Use `full` feature for everything.
 
 ## Rust Version
 
-Requires Rust 1.87+ (edition 2024).
+Requires Rust 1.88+ (edition 2024).
 
 ## Agent development guide
 - Appending is cheap, since it utilizes input cache of LLM.
@@ -89,14 +89,14 @@ Requires Rust 1.87+ (edition 2024).
 
 ## Tool development guide
 - You are not allowed to be special in architecture. You must implement `Tool` trait.
-- Your tool will be converted into bash-based automatically. You should never write workaround to expose CLI commands.
+- Your tool will be converted into IPC-backed terminal commands automatically. You should never write workaround to expose CLI commands.
 
-## Bash-based agent
-Our agent only have a single tool: `bash`. All capabilities are exposed via CLI commands,
+## Terminal-first agent
+Our agent only have a single tool: `terminal`. All capabilities are exposed via CLI commands,
 including web search, web fetch, task management, and LLM queries.
 
 Technically, these command is a wrapper script that calls `aither-ipc <command> "$@"`.
-Through from the agent's perspective, it is just calling a bash tool,
+From the agent's perspective, it is just calling the native `terminal` tool,
 you are stilled require to develop a tool using `Tool` trait. We convert these tools 
 to CLI commands under the hood.
 
@@ -109,6 +109,18 @@ Subagent is useful when:
 - The task can be decomposed into smaller subtasks performed independently
 - You want to isolate context for better focus
 - The task doesn't require interactive user input or feedback. For instance, research a topic or explore a codebase.
+
+## Commit and PR hygiene
+
+Commits and pull request bodies in this repository carry no attribution to the
+tool that wrote them. No `Claude-Session:` trailer, no `Co-Authored-By: Claude`,
+no "Generated with Claude Code" footer.
+
+This has to be stated here because it is not reachable by configuration:
+`includeCoAuthoredBy = false` suppresses the co-author trailer but neither the
+session trailer nor the PR footer, and an agent's own instructions may tell it to
+add them. A rule in this file is what governs work in this repository, so it is
+the only thing that holds across sessions.
 
 ## Bad Smells
 

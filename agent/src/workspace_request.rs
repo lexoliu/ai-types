@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use aither_core::llm::tool::{Tool, ToolOutput};
+use aither_core::llm::tool::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -43,14 +43,23 @@ pub struct WorkspaceAccess {
     pub approved: bool,
 }
 
+/// Internal request payload sent from a session-bound tool to the UI/runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceRequestPayload {
+    /// Session issuing the request.
+    pub session_id: String,
+    /// User-visible request body.
+    pub request: RequestWorkspaceArgs,
+}
+
 /// A workspace access request sent from the tool to the UI.
-pub type WorkspaceRequest = ToolRequest<RequestWorkspaceArgs, bool>;
+pub type WorkspaceRequest = ToolRequest<WorkspaceRequestPayload, bool>;
 
 /// Broker for workspace requests (held by the tool).
-pub type WorkspaceRequestBroker = ToolRequestBroker<RequestWorkspaceArgs, bool>;
+pub type WorkspaceRequestBroker = ToolRequestBroker<WorkspaceRequestPayload, bool>;
 
 /// Queue for workspace requests (held by the UI).
-pub type WorkspaceRequestQueue = ToolRequestQueue<RequestWorkspaceArgs, bool>;
+pub type WorkspaceRequestQueue = ToolRequestQueue<WorkspaceRequestPayload, bool>;
 
 /// Create a new workspace request channel pair.
 #[must_use]
@@ -62,13 +71,17 @@ pub fn channel() -> (WorkspaceRequestBroker, WorkspaceRequestQueue) {
 #[derive(Debug, Clone)]
 pub struct RequestWorkspaceTool {
     broker: WorkspaceRequestBroker,
+    session_id: String,
 }
 
 impl RequestWorkspaceTool {
     /// Create a new workspace request tool.
     #[must_use]
-    pub const fn new(broker: WorkspaceRequestBroker) -> Self {
-        Self { broker }
+    pub fn new(session_id: impl Into<String>, broker: WorkspaceRequestBroker) -> Self {
+        Self {
+            broker,
+            session_id: session_id.into(),
+        }
     }
 }
 
@@ -78,14 +91,21 @@ impl Tool for RequestWorkspaceTool {
     }
 
     type Arguments = RequestWorkspaceArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        let approved = self.broker.request(args.clone()).await?;
+    async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+        let approved = self
+            .broker
+            .request(WorkspaceRequestPayload {
+                session_id: self.session_id.clone(),
+                request: args.clone(),
+            })
+            .await?;
         let access = WorkspaceAccess {
             path: args.path,
             reason: args.reason,
             approved,
         };
-        ToolOutput::json(&access)
+        ToolResult::json(&access)
     }
 }

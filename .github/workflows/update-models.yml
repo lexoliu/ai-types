@@ -1,0 +1,63 @@
+name: Update Models Snapshot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "13 4 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-snapshot:
+    name: Refresh LiteLLM snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch latest LiteLLM snapshot
+        id: snapshot
+        run: |
+          set -euo pipefail
+
+          url="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+          tmp_file="$(mktemp)"
+          curl -fsSL "$url" -o "$tmp_file"
+
+          if cmp -s "$tmp_file" models/data/litellm_snapshot.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            rm -f "$tmp_file"
+            exit 0
+          fi
+
+          mv "$tmp_file" models/data/litellm_snapshot.json
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        if: steps.snapshot.outputs.changed == 'true'
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache Rust artifacts
+        if: steps.snapshot.outputs.changed == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: update-models
+
+      - name: Validate models crate
+        if: steps.snapshot.outputs.changed == 'true'
+        run: cargo test --package aither-models --all-features
+
+      - name: Create pull request
+        if: steps.snapshot.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/update-models-snapshot
+          delete-branch: true
+          commit-message: "Update LiteLLM model snapshot"
+          title: "Update LiteLLM model snapshot"
+          body: |
+            Automated update of `models/data/litellm_snapshot.json` from LiteLLM upstream.
+          add-paths: |
+            models/data/litellm_snapshot.json

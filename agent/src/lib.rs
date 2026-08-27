@@ -32,18 +32,23 @@
 // Core modules
 mod agent;
 pub mod ask_user;
-mod bash_agent;
+mod browser_backend;
 mod builder;
+mod cache_stats;
+mod checkpoint;
 mod compression;
 mod config;
 mod context;
+mod context_window;
 mod error;
 mod event;
 mod fs_util;
+mod handoff;
 mod hook;
 mod model_group;
 mod stream;
 mod subagent_file;
+mod terminal_agent;
 mod todo;
 pub mod tool_request;
 mod tools;
@@ -67,27 +72,30 @@ pub use aither_webfetch as webfetch;
 #[cfg(feature = "websearch")]
 pub use aither_websearch as websearch;
 
-// Sandbox is always available (bash-first design)
+// Sandbox is always available (terminal-first design)
 pub use aither_sandbox as sandbox;
 
 // Public API
 pub use agent::{Agent, CompactResult};
-pub use bash_agent::BashAgentBuilder;
+pub use browser_backend::{BrowserBackend, BrowserBackendError, StaticCdpBrowser};
 pub use builder::AgentBuilder;
+pub use cache_stats::CacheStats;
+pub use checkpoint::AgentCheckpoint;
 pub use compression::{
     CompressionLevel, ContextStrategy, PreserveConfig, PreservedContent, SmartCompressionConfig,
 };
-pub use config::{
-    AgentConfig, AgentKind, ContextAssemblerConfig, ContextBlock, ContextBlockPriority,
-};
-pub use context::{Context, ContextCheckpoint, ConversationMemory, MemoryCheckpoint};
+pub use config::{AgentConfig, AgentKind, ContextAssemblerConfig};
+pub use context::{Context, ContextCheckpoint, ReassemblyReport};
+pub use context_window::{ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot};
 pub use error::AgentError;
 pub use event::AgentEvent;
+pub use handoff::HandoffDocument;
 pub use hook::{
-    HCons, Hook, PostToolAction, PreToolAction, StopContext, StopReason, ToolResultContext,
-    ToolUseContext,
+    CheckpointContext, CheckpointReason, HCons, Hook, PostToolAction, PreToolAction, StopContext,
+    StopReason, ToolResultContext, ToolUseContext, TurnBoundaryAction, TurnBoundaryContext,
 };
 pub use stream::AgentStream;
+pub use terminal_agent::TerminalAgentBuilder;
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoTool, TodoWriteArgs};
 pub use tools::AgentTools;
 
@@ -100,19 +108,19 @@ pub use model_group::{
 pub use aither_attachments::{CacheEntry, FileCache};
 pub use aither_core::llm::Tool;
 
-/// Default system prompt for bash-centric agents.
+/// Default system prompt for terminal-first agents.
 ///
-/// This prompt teaches the LLM to use bash as the primary tool interface,
+/// This prompt teaches the LLM to use `terminal` as the primary tool interface,
 /// with all capabilities exposed as CLI commands that can be piped and composed.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use aither_agent::{Agent, BASH_SYSTEM_PROMPT};
+/// use aither_agent::{Agent, TERMINAL_SYSTEM_PROMPT};
 ///
 /// let agent = Agent::builder(llm)
-///     .system_prompt(BASH_SYSTEM_PROMPT)
-///     .bash(permission_handler, config, output_store)
+///     .system_prompt(TERMINAL_SYSTEM_PROMPT)
+///     .terminal(permission_handler, config, output_store)
 ///     .build();
 /// ```
-pub const BASH_SYSTEM_PROMPT: &str = include_str!("prompts/system.md");
+pub const TERMINAL_SYSTEM_PROMPT: &str = include_str!("prompts/system.md");

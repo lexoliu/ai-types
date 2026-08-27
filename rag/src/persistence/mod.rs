@@ -15,6 +15,7 @@ pub use rkyv_backend::RkyvPersistence;
 
 use crate::error::Result;
 use crate::types::IndexEntry;
+use std::future::Future;
 use std::path::Path;
 
 /// Trait for persistence backends.
@@ -22,12 +23,21 @@ use std::path::Path;
 /// Persistence backends handle saving and loading index entries to/from storage.
 pub trait Persistence: Send + Sync {
     /// Saves all index entries to storage.
-    fn save(&self, entries: &[IndexEntry]) -> Result<()>;
+    ///
+    /// # Errors
+    /// Returns an error when the backend cannot write or serialize entries.
+    fn save<'a>(
+        &'a self,
+        entries: &'a [IndexEntry],
+    ) -> impl Future<Output = Result<()>> + Send + 'a;
 
     /// Loads all index entries from storage.
     ///
     /// Returns an empty vector if no data exists.
-    fn load(&self) -> Result<Vec<IndexEntry>>;
+    ///
+    /// # Errors
+    /// Returns an error when the backend cannot read or deserialize entries.
+    fn load(&self) -> impl Future<Output = Result<Vec<IndexEntry>>> + Send + '_;
 
     /// Returns the file extension used by this backend.
     fn extension(&self) -> &'static str;

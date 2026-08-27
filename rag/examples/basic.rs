@@ -12,7 +12,7 @@ impl EmbeddingModel for DemoEmbedder {
         4
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>> {
+    fn embed(&self, text: &str) -> impl std::future::Future<Output = Result<Vec<f32>>> + Send {
         let mut vector = vec![0.0; self.dim()];
         for (idx, byte) in text.bytes().enumerate() {
             let bucket = idx % self.dim();
@@ -25,7 +25,7 @@ impl EmbeddingModel for DemoEmbedder {
                 *v /= norm;
             }
         }
-        Ok(vector)
+        std::future::ready(Ok(vector))
     }
 }
 
@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
                     eprintln!("Skipped {}: {}", path.display(), reason);
                 }
             }
-            _ => {}
+            IndexStage::Chunking => {}
         })
         .await?;
 
@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
             top_k: 2,
         })
         .await?;
-    println!("\nTool response:\n{}", response.as_str().unwrap_or(""));
+    println!("\nTool response:\n{}", response.render_for_cli()?);
 
     // Direct search
     println!("\nDirect search results:");

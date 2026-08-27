@@ -1,0 +1,3 @@
+{{ message }}
+
+Run `{{ tool_name }} --help` for usage information.

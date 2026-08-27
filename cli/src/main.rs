@@ -2,16 +2,16 @@
 //!
 //! A REPL-style interface for testing agents with `OpenAI`, Claude, or Gemini.
 //!
-//! # Bash-First Design
+//! # Terminal-First Design
 //!
-//! The agent has a single `bash` tool. All other capabilities are exposed as
-//! terminal commands that can be run within bash scripts:
+//! The agent has a single `terminal` tool. All other capabilities are exposed as
+//! terminal commands that can be run within terminal sessions:
 //!
 //! - `websearch "query"` - Search the web
 //! - `webfetch "url"` - Fetch and read web pages
 //! - `todo ...` - Track tasks
 //!
-//! Standard bash commands (ls, cat, grep, find, etc.) work normally.
+//! Standard shell commands (ls, cat, grep, find, etc.) work normally.
 //!
 //! # Usage
 //!
@@ -37,27 +37,29 @@
 
 mod hook;
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aither_agent::sandbox::{
-    ToolRegistryBuilder, cli_to_json,
-    permission::{BashMode, PermissionError, PermissionHandler, StatefulPermissionHandler},
+    CommandPayload, ToolRegistryBuilder, cli_to_json,
+    permission::{PermissionError, PermissionHandler, TerminalMode},
     schema_to_help,
 };
 use aither_agent::specialized::SubagentTool;
-use aither_agent::{Agent, BashAgentBuilder, Hook};
+use aither_agent::{Agent, Hook, TerminalAgentBuilder};
 use aither_core::LanguageModel;
 use aither_core::llm::Role;
 use aither_mcp::{McpConnection, McpServersConfig};
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use async_lock::Mutex as AsyncMutex;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use executor_core::tokio::TokioGlobal;
-use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 mod provider;
@@ -97,27 +99,27 @@ const DEFAULT_DOMAIN_WHITELIST: &[&str] = &[
 /// - Unsafe: always ask for each script
 #[derive(Debug, Default)]
 struct InteractivePermissionHandler {
-    /// Whether network mode has been approved (auto-approves all domains).
-    network_approved: std::sync::atomic::AtomicBool,
-    /// Cache of approved domains for cases where network mode isn't blanket approved.
-    approved_domains: std::sync::RwLock<std::collections::HashSet<String>>,
+    /// Cache of approved domains outside the default whitelist.
+    approved_domains: ArcSwap<HashSet<String>>,
 }
 
 impl InteractivePermissionHandler {
     fn new() -> Self {
         Self {
-            network_approved: std::sync::atomic::AtomicBool::new(false),
-            approved_domains: std::sync::RwLock::new(std::collections::HashSet::new()),
+            approved_domains: ArcSwap::from_pointee(HashSet::new()),
         }
     }
 }
 
 impl PermissionHandler for InteractivePermissionHandler {
-    async fn check(&self, mode: BashMode, script: &str) -> Result<bool, PermissionError> {
-        // This will be wrapped in StatefulPermissionHandler for network mode
-        match mode {
-            BashMode::Sandboxed => Ok(true), // Always allow
-            BashMode::Network | BashMode::Unsafe => {
+    fn check(
+        &self,
+        mode: TerminalMode,
+        script: &str,
+    ) -> impl std::future::Future<Output = Result<bool, PermissionError>> + Send {
+        std::future::ready(match mode {
+            TerminalMode::Sandboxed => Ok(true), // Always allow
+            TerminalMode::Unsafe => {
                 // Display script and ask for permission (show full script, no truncation)
                 let mode_desc = mode.description();
                 let display_script = script.trim().replace('\n', "; ");
@@ -131,39 +133,42 @@ impl PermissionHandler for InteractivePermissionHandler {
                 eprintln!();
 
                 if approved {
-                    // Mark network as approved to skip domain prompts
-                    if mode == BashMode::Network {
-                        self.network_approved
-                            .store(true, std::sync::atomic::Ordering::Release);
-                    }
                     Ok(true)
                 } else {
                     Err(PermissionError::Denied("user declined".to_string()))
                 }
             }
-        }
+        })
     }
 
-    async fn check_domain(&self, domain: &str, _port: u16) -> bool {
-        // If network mode was approved, allow all domains
-        if self
-            .network_approved
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return true;
-        }
+    fn check_domain(
+        &self,
+        domain: &str,
+        _port: u16,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        std::future::ready(self.prompt_for_domain(domain))
+    }
 
+    fn will_wait_for_approval(
+        &self,
+        _mode: TerminalMode,
+        _script: &str,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        std::future::ready(true)
+    }
+}
+
+impl InteractivePermissionHandler {
+    /// Prompts once per new domain, remembering the answer.
+    fn prompt_for_domain(&self, domain: &str) -> bool {
         // Check default whitelist
         if DEFAULT_DOMAIN_WHITELIST.contains(&domain) {
             return true;
         }
 
         // Check if already approved
-        {
-            let approved = self.approved_domains.read().expect("domain cache lock");
-            if approved.contains(domain) {
-                return true;
-            }
+        if self.approved_domains.load().contains(domain) {
+            return true;
         }
 
         // Prompt user for new domain
@@ -176,8 +181,11 @@ impl PermissionHandler for InteractivePermissionHandler {
 
         if approved {
             // Cache approval for this domain
-            let mut cache = self.approved_domains.write().expect("domain cache lock");
-            cache.insert(domain.to_string());
+            self.approved_domains.rcu(|domains| {
+                let mut next = HashSet::clone(domains);
+                next.insert(domain.to_string());
+                next
+            });
             true
         } else {
             false
@@ -187,10 +195,10 @@ impl PermissionHandler for InteractivePermissionHandler {
 
 /// Expand ~ to home directory in a path.
 fn expand_tilde(path: &std::path::Path) -> PathBuf {
-    if let Ok(stripped) = path.strip_prefix("~") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
-        }
+    if let Ok(stripped) = path.strip_prefix("~")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(stripped);
     }
     path.to_path_buf()
 }
@@ -232,9 +240,9 @@ fn read_yes_no() -> Result<bool> {
     }
 }
 
-/// Register MCP tools as bash IPC commands.
+/// Register MCP tools as terminal IPC commands.
 ///
-/// This makes MCP tools available as bash commands (e.g., `resolve-library-id "tokio"`)
+/// This makes MCP tools available as terminal commands (e.g., `resolve-library-id "tokio"`)
 /// instead of direct LLM tool calls.
 fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
     let tools: Vec<_> = conn
@@ -280,7 +288,7 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
                 // Parse CLI args into JSON object
                 let arguments = match parse_cli_args_to_json(&schema, &args) {
                     Ok(value) => value,
-                    Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
+                    Err(error) => return Err(error.to_string()),
                 };
 
                 // Call the MCP tool
@@ -288,7 +296,7 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
                 match conn.call(&tool_name, arguments).await {
                     Ok(result) => {
                         // Extract text content from result
-                        result
+                        let content = result
                             .content
                             .into_iter()
                             .filter_map(|c| {
@@ -299,9 +307,10 @@ fn register_mcp_tools(conn: McpConnection, registry: &mut ToolRegistryBuilder) {
                                 }
                             })
                             .collect::<Vec<_>>()
-                            .join("\n")
+                            .join("\n");
+                        Ok(Some(CommandPayload::Text { content }))
                     }
-                    Err(e) => format!("{{\"error\": \"{e}\"}}"),
+                    Err(error) => Err(error.to_string()),
                 }
             })
         });
@@ -373,15 +382,13 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    // ACP server mode
-    if args.acp {
-        return run_acp_server().await;
-    }
-
     // Create cloud provider
     let base_url = args.base_url.as_deref();
     let (cloud, model, provider_name) = if let Some(provider) = args.provider {
-        let model = args.model.as_deref().unwrap_or(provider.default_model());
+        let model = args
+            .model
+            .as_deref()
+            .unwrap_or_else(|| provider.default_model());
         (
             provider.create(model, base_url)?,
             model.to_string(),
@@ -408,21 +415,59 @@ async fn main() -> Result<()> {
         println!();
     }
 
-    // Headless mode: run single prompt and exit
-    if let Some(ref prompt) = args.prompt {
-        return run_headless(cloud, &args, prompt).await;
+    // ACP server mode: serve editors over stdio rather than running a REPL.
+    if args.acp {
+        return run_acp_server(cloud).await;
     }
 
-    run_repl(cloud, &args).await
+    // Headless mode: run single prompt and exit
+    if let Some(ref prompt) = args.prompt {
+        return Box::pin(run_headless(cloud, &args, prompt)).await;
+    }
+
+    Box::pin(run_repl(cloud, &args)).await
 }
 
 /// Run as ACP server for editor integration.
-async fn run_acp_server() -> Result<()> {
+///
+/// Each session the editor opens gets its own agent, sandboxed to the working
+/// directory the editor supplied for that session.
+async fn run_acp_server(cloud: CloudProvider) -> Result<()> {
     use aither_acp::AcpServer;
 
-    let mut server = AcpServer::stdio("aither", env!("CARGO_PKG_VERSION"))?;
+    let mut server = AcpServer::stdio("aither", env!("CARGO_PKG_VERSION"), move |cwd| {
+        let cloud = cloud.clone();
+        async move { acp_session_agent(cloud, cwd).await }
+    });
     server.run().await?;
     Ok(())
+}
+
+/// Build the agent backing a single ACP session.
+async fn acp_session_agent(
+    cloud: CloudProvider,
+    cwd: std::path::PathBuf,
+) -> std::result::Result<
+    Agent<CloudProvider, CloudProvider, CloudProvider>,
+    aither_acp::protocol::AcpError,
+> {
+    let to_acp = |err: anyhow::Error| aither_acp::protocol::AcpError::Transport(err.to_string());
+
+    let permission_handler = InteractivePermissionHandler::new();
+    let terminal_tool =
+        aither_agent::sandbox::TerminalTool::new_in(&cwd, permission_handler, TokioGlobal)
+            .await
+            .map_err(|err| to_acp(err.into()))?;
+
+    let agent = TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
+        .tool(aither_agent::websearch::WebSearchTool::default())
+        .tool(aither_agent::webfetch::WebFetchTool::new())
+        .tool(aither_agent::TodoTool::new())
+        .tool(aither_agent::sandbox::builtin::AskCommand::new(cloud))
+        .with_default_prompt()
+        .build();
+
+    Ok(agent)
 }
 
 async fn build_agent(
@@ -430,20 +475,23 @@ async fn build_agent(
     args: &Args,
 ) -> Result<Agent<CloudProvider, CloudProvider, CloudProvider, aither_agent::HCons<DebugHook, ()>>>
 {
-    // Create bash tool (creates random four-word working dir under system temp)
+    // Create terminal tool (creates random four-word working dir under system temp)
     // Uses interactive permission handler:
     // - Sandboxed: always allow (no prompt)
     // - Network: ask once, then remember
     // - Unsafe: always ask for each script
     let workdir_parent = std::env::temp_dir().join("aither");
-    let permission_handler = StatefulPermissionHandler::new(InteractivePermissionHandler::new());
-    let bash_tool =
-        aither_agent::sandbox::BashTool::new_in(&workdir_parent, permission_handler, TokioGlobal)
-            .await?;
+    let permission_handler = InteractivePermissionHandler::new();
+    let terminal_tool = aither_agent::sandbox::TerminalTool::new_in(
+        &workdir_parent,
+        permission_handler,
+        TokioGlobal,
+    )
+    .await?;
 
-    // Create bash-centric agent builder
-    // All tools become IPC commands accessible via bash
-    let mut builder = BashAgentBuilder::new(cloud.clone(), bash_tool)
+    // Create terminal-first agent builder
+    // All tools become IPC commands accessible via terminal
+    let mut builder = TerminalAgentBuilder::new(cloud.clone(), terminal_tool)
         .tool(aither_agent::websearch::WebSearchTool::default())
         .tool(aither_agent::webfetch::WebFetchTool::new())
         .tool(aither_agent::TodoTool::new())
@@ -529,20 +577,13 @@ async fn build_agent(
         }
     }
 
-    // Create SubagentTool and register as bash IPC command
+    // Create SubagentTool and register as a terminal IPC command
     // Set base_dir to sandbox directory so paths like .subagents/ resolve correctly
     let subagent_tool = SubagentTool::new(cloud)
         .with_builtins()
         .with_base_dir(builder.sandbox_dir().to_string())
-        .with_bash_tool_factory(builder.bash_tool_factory());
-    let mut subagent_desc = String::from("Spawn subagent for complex tasks (types: ");
-    let subagent_names: Vec<_> = subagent_tool
-        .type_descriptions()
-        .iter()
-        .map(|(n, _)| *n)
-        .collect();
-    subagent_desc.push_str(&subagent_names.join(", "));
-    subagent_desc.push(')');
+        .with_terminal_tool_factory(builder.terminal_tool_factory());
+    let subagent_desc = format_subagent_description(&subagent_tool);
     builder = builder.tool_with_desc(subagent_tool, subagent_desc);
 
     // Add system prompt
@@ -555,11 +596,23 @@ async fn build_agent(
     Ok(builder.hook(DebugHook).build())
 }
 
+fn format_subagent_description(subagent_tool: &SubagentTool<CloudProvider>) -> String {
+    let mut subagent_desc = String::from("Spawn subagent for complex tasks (types: ");
+    let subagent_names = subagent_tool
+        .type_descriptions()
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>();
+    subagent_desc.push_str(&subagent_names.join(", "));
+    subagent_desc.push(')');
+    subagent_desc
+}
+
 /// Run a single prompt and exit (headless mode).
 async fn run_headless(cloud: CloudProvider, args: &Args, prompt: &str) -> Result<()> {
     let mut agent = build_agent(cloud, args).await?;
 
-    match agent.query(prompt).await {
+    match Box::pin(agent.query(prompt)).await {
         Ok(response) => {
             println!("{response}");
             Ok(())
@@ -627,7 +680,7 @@ async fn run_repl(cloud: CloudProvider, args: &Args) -> Result<()> {
 
         // Query the agent
         println!("\nAgent>");
-        match agent.query(input).await {
+        match Box::pin(agent.query(input)).await {
             Ok(response) => {
                 println!("{response}");
             }

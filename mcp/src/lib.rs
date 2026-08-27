@@ -101,7 +101,7 @@
 //! tools.register(AnotherTool::new());
 //!
 //! // Create and run the MCP server over stdio
-//! let mut server = McpServer::stdio(tools, "my-server", "1.0.0")?;
+//! let mut server = McpServer::stdio(tools, "my-server", "1.0.0");
 //! server.run().await?;
 //! ```
 //!
@@ -136,12 +136,19 @@
 //! }
 //! ```
 
+#[cfg(feature = "client")]
 mod client;
 pub mod protocol;
+#[cfg(feature = "server")]
 mod server;
 pub mod transport;
 
 // Re-export main types
-pub use client::{McpConnection, McpServerConfig, McpServersConfig, McpToolService};
+#[cfg(feature = "client")]
+pub use client::{
+    McpClient, McpConnection, McpServerConfig, McpServersConfig, McpToolService,
+    register_terminal_commands,
+};
 pub use protocol::{CallToolResult, Content, McpError};
+#[cfg(feature = "server")]
 pub use server::McpServer;

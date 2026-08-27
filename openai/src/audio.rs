@@ -12,22 +12,28 @@ use zenwave::{
 };
 
 impl AudioGenerator for OpenAI {
-    fn generate(&self, prompt: &str) -> impl futures_core::Stream<Item = Data> + Send {
+    type Error = OpenAIError;
+
+    fn generate(
+        &self,
+        prompt: &str,
+    ) -> impl futures_core::Stream<Item = Result<Data, Self::Error>> + Send {
         let cfg = self.config();
         let text = prompt.to_owned();
-        futures_lite::stream::iter(vec![synthesize(cfg, text)])
-            .then(|fut| fut)
-            .map(|result| handle_audio_result(result, "synthesis"))
+        futures_lite::stream::iter(vec![synthesize(cfg, text)]).then(|fut| fut)
     }
 }
 
 impl AudioTranscriber for OpenAI {
-    fn transcribe(&self, audio: &[u8]) -> impl futures_core::Stream<Item = String> + Send {
+    type Error = OpenAIError;
+
+    fn transcribe(
+        &self,
+        audio: &[u8],
+    ) -> impl futures_core::Stream<Item = Result<String, Self::Error>> + Send {
         let cfg = self.config();
         let payload = audio.to_vec();
-        futures_lite::stream::iter(vec![transcribe_once(cfg, payload)])
-            .then(|fut| fut)
-            .map(handle_transcription_result)
+        futures_lite::stream::iter(vec![transcribe_once(cfg, payload)]).then(|fut| fut)
     }
 }
 
@@ -112,30 +118,4 @@ struct SpeechRequest<'a> {
 #[derive(Debug, Deserialize)]
 struct TranscriptionResponse {
     text: String,
-}
-
-fn handle_audio_result(result: Result<Vec<u8>, OpenAIError>, context: &'static str) -> Vec<u8> {
-    match result {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            assert!(
-                !cfg!(debug_assertions),
-                "OpenAI audio {context} failed: {err}"
-            );
-            Vec::new()
-        }
-    }
-}
-
-fn handle_transcription_result(result: Result<String, OpenAIError>) -> String {
-    match result {
-        Ok(text) => text,
-        Err(err) => {
-            assert!(
-                !cfg!(debug_assertions),
-                "OpenAI audio transcription failed: {err}"
-            );
-            String::new()
-        }
-    }
 }

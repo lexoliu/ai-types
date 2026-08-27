@@ -62,59 +62,54 @@
 //!
 //! ### Structured Output with Tools
 //!
-//! ```rust,ignore
-//! use aither_core::{LanguageModel, llm::{Message, Request, Tool}};
-//! use serde::{Deserialize, Serialize};
+//! ```rust
+//! use aither_core::llm::{LLMRequest, Message, Tool, ToolResult};
 //! use schemars::JsonSchema;
+//! use serde::Deserialize;
+//! use std::borrow::Cow;
 //!
-//! #[derive(JsonSchema, Deserialize, Serialize)]
+//! /// Get current weather for a location.
+//! #[derive(JsonSchema, Deserialize)]
 //! struct WeatherQuery {
+//!     /// City to report on, e.g. "Tokyo".
 //!     location: String,
-//!     units: Option<String>,
 //! }
 //!
 //! struct WeatherTool;
 //!
 //! impl Tool for WeatherTool {
-//!     const NAME: &str = "get_weather";
-//!     const DESCRIPTION: &str = "Get current weather for a location";
+//!     fn name(&self) -> Cow<'static, str> {
+//!         Cow::Borrowed("get_weather")
+//!     }
+//!
 //!     type Arguments = WeatherQuery;
-//!     
-//!     async fn call(&mut self, args: Self::Arguments) -> aither::Result {
-//!         Ok(format!("Weather in {}: 22°C, sunny", args.location))
+//!     type Res = ToolResult;
+//!
+//!     async fn call(&self, args: Self::Arguments) -> aither_core::Result<Self::Res> {
+//!         Ok(ToolResult::text(format!("Weather in {}: 22°C, sunny", args.location)))
 //!     }
 //! }
 //!
-//! async fn weather_bot(model: impl LanguageModel) -> aither_core::Result {
-//!     let request = Request::new(vec![
-//!         Message::user("What's the weather like in Tokyo?")
-//!     ]).with_tool(WeatherTool);
-//!     
-//!     // Model can now call the weather tool automatically
-//!     let response: String = model.generate(request).await?;
-//!     Ok(response)
-//! }
+//! // Advertise the tool on a request. The model replies with a ToolCall event;
+//! // executing it is up to the caller (see `aither-agent`).
+//! let request = LLMRequest::new([Message::user("What is the weather in Tokyo?")])
+//!     .with_tool(&WeatherTool);
 //! ```
 //!
 //! See [`llm::tool`] for more details on using tools with language models.
 //!
 //! ### Semantic Search with Embeddings
 //!
-//! ```rust,ignore
+//! ```rust
 //! use aither_core::EmbeddingModel;
 //!
-//! async fn find_similar_docs(
+//! async fn embed_query(
 //!     model: impl EmbeddingModel,
 //!     query: &str,
-//!     documents: &[&str]
 //! ) -> aither_core::Result<Vec<f32>> {
-//!     // Convert query to vector
-//!     let query_embedding = model.embed(query).await?;
-//!     
-//!     // In a real app, you'd compare with document embeddings
-//!     // and find the most similar ones using cosine similarity
-//!     
-//!     Ok(query_embedding)
+//!     // Compare this against your stored document embeddings with cosine
+//!     // similarity, or hand it to `aither-rag`.
+//!     model.embed(query).await
 //! }
 //! ```
 //!

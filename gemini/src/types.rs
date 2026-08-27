@@ -1,3 +1,5 @@
+use crate::error::GeminiError;
+use aither_core::llm::model::ReasoningEffort;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -236,21 +238,6 @@ impl Part {
         }
     }
 
-    pub(crate) const fn function_call(name: String, args: Value) -> Self {
-        Self {
-            text: None,
-            thought: None,
-            thought_signature: None,
-            inline_data: None,
-            file_data: None,
-            function_call: Some(FunctionCall { name, args }),
-            function_response: None,
-            executable_code: None,
-            code_execution_result: None,
-            metadata: None,
-        }
-    }
-
     pub(crate) const fn function_call_with_signature(
         name: String,
         args: Value,
@@ -279,12 +266,11 @@ impl Part {
     }
 
     fn collect_thoughts(&self, output: &mut Vec<String>) {
-        if self.is_thought() {
-            if let Some(text) = &self.text {
-                if !text.is_empty() {
-                    output.push(text.clone());
-                }
-            }
+        if self.is_thought()
+            && let Some(text) = &self.text
+            && !text.is_empty()
+        {
+            output.push(text.clone());
         }
     }
 
@@ -390,6 +376,8 @@ pub struct FunctionResponse {
     pub(crate) response: Value,
 }
 
+// Every variant names a kind of tool, so the shared suffix is the point.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(untagged)] // This allows deserialization to try matching one variant after another
 pub enum GeminiTool {
@@ -405,6 +393,10 @@ pub enum GeminiTool {
         #[serde(rename = "codeExecution")]
         code_execution: CodeExecution,
     },
+    UrlContextTool {
+        #[serde(rename = "urlContext")]
+        url_context: UrlContext,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -412,6 +404,9 @@ pub struct GoogleSearch {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeExecution {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UrlContext {}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FunctionDeclaration {
@@ -580,6 +575,8 @@ pub struct Candidate {
     pub(crate) safety_ratings: Vec<SafetyRating>,
 }
 
+// The `_token_count` suffix comes from the wire format and must match it.
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageMetadata {
@@ -638,12 +635,59 @@ pub struct EmbeddingValue {
     pub(crate) values: Vec<f32>,
 }
 
+/// Thinking depth requested from a Gemini model.
+///
+/// Gemini's legacy `thinkingBudget` token count and `thinkingLevel` are
+/// mutually exclusive: sending both returns a 400. Only the level is modelled,
+/// because a level is what the portable [`ReasoningEffort`] scale actually
+/// expresses — translating it into a token count would be inventing precision
+/// the caller never supplied.
+///
+/// [`ReasoningEffort`]: aither_core::llm::model::ReasoningEffort
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingLevel {
+    /// Least thinking. Only accepted by some models; others reject it.
+    Minimal,
+    /// Shallow thinking.
+    Low,
+    /// Balanced thinking depth.
+    Medium,
+    /// Deepest thinking.
+    High,
+}
+
+impl TryFrom<ReasoningEffort> for ThinkingLevel {
+    type Error = GeminiError;
+
+    /// Maps the portable effort ladder onto Gemini's `thinkingLevel`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GeminiError::Api`] for a level Gemini has no equivalent of.
+    /// Clamping `Max` down to `High` would quietly deliver less reasoning than
+    /// the caller paid for, so the mismatch is surfaced instead.
+    fn try_from(effort: ReasoningEffort) -> Result<Self, Self::Error> {
+        match effort {
+            ReasoningEffort::Minimal => Ok(Self::Minimal),
+            ReasoningEffort::Low => Ok(Self::Low),
+            ReasoningEffort::Medium => Ok(Self::Medium),
+            ReasoningEffort::High => Ok(Self::High),
+            ReasoningEffort::None => Err(GeminiError::Api(
+                "Gemini has no 'none' thinking level; omit reasoning_effort, or use Minimal"
+                    .to_string(),
+            )),
+            other @ (ReasoningEffort::XHigh | ReasoningEffort::Max) => Err(GeminiError::Api(
+                format!("Gemini thinkingLevel tops out at High; {other:?} is not available"),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingConfig {
     #[serde(rename = "includeThoughts", skip_serializing_if = "Option::is_none")]
     pub(crate) include_thoughts: Option<bool>,
-    #[serde(rename = "tokenBudget", skip_serializing_if = "Option::is_none")]
-    pub(crate) token_budget: Option<i32>,
     #[serde(rename = "thinkingLevel", skip_serializing_if = "Option::is_none")]
-    pub(crate) thinking_level: Option<String>, // enum in doc, string here for simplicity
+    pub(crate) thinking_level: Option<ThinkingLevel>,
 }

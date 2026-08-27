@@ -1,22 +1,18 @@
 //! Container exec implementation backed by bollard.
 
-use std::future::Future;
-use std::process::{ExitStatus, Output};
-use std::sync::Arc;
-use std::time::Duration;
-
 use async_channel::{Receiver, Sender};
 use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::exec::CreateExecOptions;
 use futures_lite::StreamExt;
+use std::future::Future;
+use std::process::{ExitStatus, Output};
+use std::sync::Arc;
 
 use crate::shell_session::{ContainerExec, ContainerExecOutcome};
-
-/// Foreground tasks are promoted when the process blocks on stdin.
-pub const CONTAINER_STDIN_BLOCKED_NOTICE: &str = "Auto-promoted to background: container process appears blocked on stdin (detected via /proc/<pid>/syscall). Use input_terminal to continue.";
-
-const STDIN_WATCH_INTERVAL: Duration = Duration::from_millis(500);
+use crate::stdin_watch::{
+    STDIN_WATCH_INTERVAL, TERMINAL_STDIN_BLOCKED_NOTICE, is_waiting_on_stdin,
+};
 
 /// Executes commands in a running container via Docker exec.
 #[derive(Debug, Clone)]
@@ -32,34 +28,6 @@ impl BollardContainerExec {
     }
 }
 
-fn parse_kernel_u64(value: &str) -> Option<u64> {
-    let raw = value.trim();
-    if let Some(hex) = raw.strip_prefix("0x") {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    raw.parse::<u64>().ok()
-}
-
-/// Detect whether `/proc/<pid>/syscall` indicates `read(0, ...)`.
-#[must_use]
-pub fn is_waiting_on_stdin(syscall_dump: &str) -> bool {
-    let line = syscall_dump.trim();
-    if line.is_empty() || line.eq_ignore_ascii_case("running") {
-        return false;
-    }
-
-    let mut parts = line.split_whitespace();
-    let Some(syscall_no) = parts.next() else {
-        return false;
-    };
-    let Some(fd_raw) = parts.next() else {
-        return false;
-    };
-
-    parse_kernel_u64(syscall_no).is_some_and(|syscall| syscall == 0)
-        && parse_kernel_u64(fd_raw).is_some_and(|fd| fd == 0)
-}
-
 async fn detect_stdin_blocked_inside_container(
     client: &Docker,
     container_id: &str,
@@ -70,7 +38,7 @@ async fn detect_stdin_blocked_inside_container(
         .create_exec(
             container_id,
             CreateExecOptions {
-                cmd: Some(vec!["bash", "-lc", probe_script.as_str()]),
+                cmd: Some(vec!["sh", "-c", probe_script.as_str()]),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 ..Default::default()
@@ -89,10 +57,10 @@ async fn detect_stdin_blocked_inside_container(
         bollard::exec::StartExecResults::Attached { mut output, .. } => {
             while let Some(chunk) = output.next().await {
                 match chunk {
-                    Ok(LogOutput::StdOut { message }) | Ok(LogOutput::Console { message }) => {
+                    Ok(LogOutput::StdOut { message } | LogOutput::Console { message }) => {
                         stdout.push_str(&String::from_utf8_lossy(&message));
                     }
-                    Ok(LogOutput::StdErr { .. }) | Ok(LogOutput::StdIn { .. }) => {}
+                    Ok(LogOutput::StdErr { .. } | LogOutput::StdIn { .. }) => {}
                     Err(e) => return Err(format!("syscall probe stream error: {e}")),
                 }
             }
@@ -129,7 +97,7 @@ async fn kill_exec_pid_inside_container(
         .create_exec(
             container_id,
             CreateExecOptions {
-                cmd: Some(vec!["bash", "-lc", kill_script.as_str()]),
+                cmd: Some(vec!["sh", "-c", kill_script.as_str()]),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 ..Default::default()
@@ -159,8 +127,112 @@ async fn kill_exec_pid_inside_container(
 
 enum StreamEvent {
     Output(Option<Result<LogOutput, bollard::errors::Error>>),
+    Stdin(Result<Vec<u8>, async_channel::RecvError>),
     WatchdogTick,
     Cancel,
+}
+
+fn append_log_output(output: LogOutput, stdout: &mut Vec<u8>, stderr: &mut Vec<u8>) {
+    match output {
+        LogOutput::StdOut { message } | LogOutput::Console { message } => {
+            stdout.extend_from_slice(&message);
+        }
+        LogOutput::StdErr { message } => {
+            stderr.extend_from_slice(&message);
+        }
+        LogOutput::StdIn { .. } => {}
+    }
+}
+
+async fn write_container_stdin<W>(input: &mut W, bytes: &[u8]) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    input
+        .write_all(bytes)
+        .await
+        .map_err(|error| format!("container exec stdin write failed: {error}"))?;
+    input
+        .flush()
+        .await
+        .map_err(|error| format!("container exec stdin flush failed: {error}"))
+}
+
+async fn shutdown_container_stdin<W>(input: &mut W) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    input
+        .shutdown()
+        .await
+        .map_err(|error| format!("container exec stdin shutdown failed: {error}"))
+}
+
+struct WatchdogTick<'a, W> {
+    client: &'a Docker,
+    container_id: &'a str,
+    exec_id: &'a str,
+    input: &'a mut W,
+    stdin_open: &'a mut bool,
+    watchdog_active: &'a mut bool,
+    notice_sent: &'a mut bool,
+    stdin_blocked_notice: Option<&'a Sender<String>>,
+}
+
+async fn handle_container_watchdog_tick<W>(tick: WatchdogTick<'_, W>) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let inspect = tick
+        .client
+        .inspect_exec(tick.exec_id)
+        .await
+        .map_err(|e| format!("failed to inspect running exec for stdin watchdog: {e}"))?;
+
+    if !inspect.running.unwrap_or(false) {
+        if *tick.stdin_open {
+            let _ = shutdown_container_stdin(tick.input).await;
+            *tick.stdin_open = false;
+        }
+        *tick.watchdog_active = false;
+        return Ok(());
+    }
+
+    let Some(pid) = inspect.pid else {
+        return Ok(());
+    };
+    if pid <= 0 {
+        return Ok(());
+    }
+
+    match detect_stdin_blocked_inside_container(tick.client, tick.container_id, pid).await {
+        Ok(true) => {
+            if let Some(notice_tx) = tick.stdin_blocked_notice {
+                let _ = notice_tx.try_send(TERMINAL_STDIN_BLOCKED_NOTICE.to_string());
+            }
+            *tick.notice_sent = true;
+            *tick.watchdog_active = false;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::debug!(error = %error, pid, "stdin watchdog probe failed");
+        }
+    }
+    Ok(())
+}
+
+async fn inspect_exec_exit_status(client: &Docker, exec_id: &str) -> Result<ExitStatus, String> {
+    let inspect = client
+        .inspect_exec(exec_id)
+        .await
+        .map_err(|e| format!("failed to inspect exec: {e}"))?;
+    let exit_code = i32::try_from(inspect.exit_code.unwrap_or(-1))
+        .map_err(|_| "container exec exit code is outside i32 range".to_string())?;
+    Ok(ExitStatusExt::from_raw(exit_code))
 }
 
 impl ContainerExec for BollardContainerExec {
@@ -170,6 +242,7 @@ impl ContainerExec for BollardContainerExec {
         script: &str,
         working_dir: &str,
         kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
         stdin_blocked_notice: Option<Sender<String>>,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
         let container_id = container_id.to_string();
@@ -179,7 +252,8 @@ impl ContainerExec for BollardContainerExec {
 
         async move {
             let config = CreateExecOptions {
-                cmd: Some(vec!["bash", "-c", &script]),
+                cmd: Some(vec!["sh", "-c", &script]),
+                attach_stdin: Some(true),
                 attach_stdout: Some(true),
                 attach_stderr: Some(true),
                 working_dir: Some(working_dir.as_str()),
@@ -197,8 +271,8 @@ impl ContainerExec for BollardContainerExec {
                 .await
                 .map_err(|e| format!("failed to start exec: {e}"))?;
 
-            let mut output = match start {
-                bollard::exec::StartExecResults::Attached { output, .. } => output,
+            let (mut output, mut input) = match start {
+                bollard::exec::StartExecResults::Attached { output, input } => (output, input),
                 bollard::exec::StartExecResults::Detached => {
                     return Err("exec started in detached mode unexpectedly".to_string());
                 }
@@ -208,52 +282,39 @@ impl ContainerExec for BollardContainerExec {
             let mut stderr = Vec::new();
             let mut watchdog_active = stdin_blocked_notice.is_some();
             let mut notice_sent = false;
+            let mut stdin_open = true;
 
             loop {
-                let event = if watchdog_active && !notice_sent {
-                    futures_lite::future::or(
-                        futures_lite::future::or(
-                            async { StreamEvent::Output(output.next().await) },
-                            async {
-                                let _ = kill_rx.recv().await;
-                                StreamEvent::Cancel
-                            },
-                        ),
-                        async {
-                            async_io::Timer::after(STDIN_WATCH_INTERVAL).await;
-                            StreamEvent::WatchdogTick
-                        },
-                    )
-                    .await
-                } else {
-                    futures_lite::future::or(
-                        async { StreamEvent::Output(output.next().await) },
-                        async {
-                            let _ = kill_rx.recv().await;
-                            StreamEvent::Cancel
-                        },
-                    )
-                    .await
+                let event = tokio::select! {
+                    output = async { output.next().await } => StreamEvent::Output(output),
+                    () = async {
+                        let _ = kill_rx.recv().await;
+                    } => StreamEvent::Cancel,
+                    bytes = async { stdin_rx.recv().await }, if stdin_open => StreamEvent::Stdin(bytes),
+                    _ = async_io::Timer::after(STDIN_WATCH_INTERVAL), if watchdog_active && !notice_sent => StreamEvent::WatchdogTick,
                 };
 
                 match event {
-                    StreamEvent::Output(Some(Ok(LogOutput::StdOut { message }))) => {
-                        stdout.extend_from_slice(&message);
+                    StreamEvent::Output(Some(Ok(output))) => {
+                        append_log_output(output, &mut stdout, &mut stderr);
                     }
-                    StreamEvent::Output(Some(Ok(LogOutput::StdErr { message }))) => {
-                        stderr.extend_from_slice(&message);
-                    }
-                    StreamEvent::Output(Some(Ok(LogOutput::Console { message }))) => {
-                        stdout.extend_from_slice(&message);
-                    }
-                    StreamEvent::Output(Some(Ok(LogOutput::StdIn { .. }))) => {}
                     StreamEvent::Output(Some(Err(e))) => {
                         return Err(format!("exec stream error: {e}"));
                     }
                     StreamEvent::Output(None) => {
                         break;
                     }
+                    StreamEvent::Stdin(Ok(bytes)) => {
+                        write_container_stdin(&mut input, &bytes).await?;
+                    }
+                    StreamEvent::Stdin(Err(_)) => {
+                        shutdown_container_stdin(&mut input).await?;
+                        stdin_open = false;
+                    }
                     StreamEvent::Cancel => {
+                        if stdin_open {
+                            let _ = shutdown_container_stdin(&mut input).await;
+                        }
                         if let Err(error) =
                             kill_exec_pid_inside_container(&client, &container_id, &exec_id).await
                         {
@@ -266,50 +327,24 @@ impl ContainerExec for BollardContainerExec {
                         return Ok(ContainerExecOutcome::Killed);
                     }
                     StreamEvent::WatchdogTick => {
-                        let inspect = client.inspect_exec(&exec_id).await.map_err(|e| {
-                            format!("failed to inspect running exec for stdin watchdog: {e}")
-                        })?;
-
-                        if !inspect.running.unwrap_or(false) {
-                            watchdog_active = false;
-                            continue;
-                        }
-
-                        let Some(pid) = inspect.pid else {
-                            continue;
-                        };
-                        if pid <= 0 {
-                            continue;
-                        }
-
-                        match detect_stdin_blocked_inside_container(&client, &container_id, pid)
-                            .await
-                        {
-                            Ok(true) => {
-                                if let Some(notice_tx) = stdin_blocked_notice.as_ref() {
-                                    let _ = notice_tx
-                                        .try_send(CONTAINER_STDIN_BLOCKED_NOTICE.to_string());
-                                }
-                                notice_sent = true;
-                                watchdog_active = false;
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
-                                tracing::debug!(error = %error, pid, "stdin watchdog probe failed");
-                            }
-                        }
+                        handle_container_watchdog_tick(WatchdogTick {
+                            client: &client,
+                            container_id: &container_id,
+                            exec_id: &exec_id,
+                            input: &mut input,
+                            stdin_open: &mut stdin_open,
+                            watchdog_active: &mut watchdog_active,
+                            notice_sent: &mut notice_sent,
+                            stdin_blocked_notice: stdin_blocked_notice.as_ref(),
+                        })
+                        .await?;
                     }
                 }
             }
 
-            let inspect = client
-                .inspect_exec(&exec_id)
-                .await
-                .map_err(|e| format!("failed to inspect exec: {e}"))?;
-
-            let exit_code = inspect.exit_code.unwrap_or(-1) as i32;
+            let status = inspect_exec_exit_status(&client, &exec_id).await?;
             Ok(ContainerExecOutcome::Completed(Output {
-                status: ExitStatusExt::from_raw(exit_code),
+                status,
                 stdout,
                 stderr,
             }))
@@ -336,25 +371,5 @@ impl ExitStatusExt {
     fn from_raw(code: i32) -> ExitStatus {
         use std::os::windows::process::ExitStatusExt as _;
         ExitStatus::from_raw(code as u32)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_waiting_on_stdin;
-
-    #[test]
-    fn stdin_blocked_detection_handles_decimal_and_hex() {
-        assert!(is_waiting_on_stdin("0 0 0 0 0 0"));
-        assert!(is_waiting_on_stdin("0x0 0x0 0x0 0x0"));
-    }
-
-    #[test]
-    fn stdin_blocked_detection_ignores_non_blocking_syscalls() {
-        assert!(!is_waiting_on_stdin("running"));
-        assert!(!is_waiting_on_stdin(""));
-        assert!(!is_waiting_on_stdin("1 0 0 0"));
-        assert!(!is_waiting_on_stdin("0 1 0 0"));
-        assert!(!is_waiting_on_stdin("garbage"));
     }
 }

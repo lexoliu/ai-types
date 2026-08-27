@@ -13,7 +13,7 @@ pub struct MistralProvider {
 
 impl MistralProvider {
     /// Create a new provider with no preconfigured model IDs.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             inner: Arc::new(ProviderConfig::default()),
@@ -54,17 +54,24 @@ impl LanguageModelProvider for MistralProvider {
 
     fn list_models(&self) -> impl Future<Output = Result<Vec<ModelProfile>, Self::Error>> + Send {
         async move {
-            Ok(aither_models::models_for_provider("mistral")
+            let provider = aither_models::Provider::Mistral;
+            Ok(aither_models::models_for_provider(&provider)
                 .map(|model| {
+                    let context_length = model.max_input_tokens().unwrap_or_else(|| {
+                        panic!(
+                            "Mistral model '{}' missing max_input_tokens metadata in aither-models",
+                            model.id()
+                        )
+                    });
                     ModelProfile::new(
-                        model.id,
+                        model.id().to_string(),
                         "mistral",
-                        model.id,
-                        model.name,
-                        model.context_window,
+                        model.id().to_string(),
+                        model.litellm_id().to_string(),
+                        context_length,
                     )
                 })
-                .collect())
+                .collect::<Vec<_>>())
         }
     }
 

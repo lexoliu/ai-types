@@ -1,12 +1,5 @@
-use std::{
-    borrow::Cow,
-    collections::HashSet,
-    future::Future,
-    pin::Pin,
-    sync::{Arc, OnceLock, RwLock},
-};
+use std::{collections::HashSet, future::Future, pin::Pin, sync::Arc};
 
-use aither_core::llm::{Tool, ToolOutput};
 use async_channel::{Receiver, Sender};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -14,7 +7,9 @@ use serde::{Deserialize, Serialize};
 /// Outcome of a container execution request.
 #[derive(Debug)]
 pub enum ContainerExecOutcome {
+    /// The command ran to completion; carries its exit status and output.
     Completed(std::process::Output),
+    /// The command was terminated before it finished.
     Killed,
 }
 
@@ -24,7 +19,7 @@ pub enum ContainerExecOutcome {
 /// container runtime (e.g., Docker via bollard). The framework defines this trait;
 /// the application (may) provides the implementation.
 pub trait ContainerExec: Send + Sync {
-    /// Execute a bash script inside the container, returning stdout/stderr and exit code.
+    /// Execute a terminal command payload inside the container, returning stdout/stderr and exit code.
     ///
     /// Implementations should send a human-readable message to
     /// `stdin_blocked_notice` when they detect the process is blocked on stdin
@@ -36,19 +31,143 @@ pub trait ContainerExec: Send + Sync {
         script: &str,
         working_dir: &str,
         kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
         stdin_blocked_notice: Option<Sender<String>>,
     ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send;
 }
 
-pub(crate) trait ContainerExecObject: Send + Sync {
+/// Object-safe container execution trait.
+pub trait ContainerExecObject: Send + Sync {
+    /// Execute a command inside a container through a boxed future.
     fn exec_boxed<'a>(
         &'a self,
         container_id: &'a str,
         script: &'a str,
         working_dir: &'a str,
         kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
         stdin_blocked_notice: Option<Sender<String>>,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>>;
+}
+
+/// Backend-agnostic container executor handle.
+///
+/// This wraps any [`ContainerExec`] implementation into a cloneable concrete
+/// type that can be passed around without exposing runtime-specific concrete
+/// executor types.
+#[derive(Clone)]
+pub struct ContainerExecHandle {
+    inner: Arc<dyn ContainerExecObject>,
+}
+
+impl std::fmt::Debug for ContainerExecHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContainerExecHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ContainerExecHandle {
+    /// Creates a new handle from a concrete container executor implementation.
+    #[must_use]
+    pub fn new<T>(inner: Arc<T>) -> Self
+    where
+        T: ContainerExec + 'static,
+    {
+        Self { inner }
+    }
+}
+
+impl ContainerExec for ContainerExecHandle {
+    fn exec(
+        &self,
+        container_id: &str,
+        script: &str,
+        working_dir: &str,
+        kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
+        stdin_blocked_notice: Option<Sender<String>>,
+    ) -> impl Future<Output = Result<ContainerExecOutcome, String>> + Send {
+        let inner = Arc::clone(&self.inner);
+        let container_id = container_id.to_string();
+        let script = script.to_string();
+        let working_dir = working_dir.to_string();
+
+        async move {
+            inner
+                .exec_boxed(
+                    &container_id,
+                    &script,
+                    &working_dir,
+                    kill_rx,
+                    stdin_rx,
+                    stdin_blocked_notice,
+                )
+                .await
+        }
+    }
+}
+
+/// Container runtime session metadata.
+#[derive(Clone)]
+pub struct ContainerShellRuntime {
+    exec: Arc<dyn ContainerExecObject>,
+    container_id: String,
+    ipc_host: String,
+}
+
+impl std::fmt::Debug for ContainerShellRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContainerShellRuntime")
+            .field("container_id", &self.container_id)
+            .field("ipc_host", &self.ipc_host)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ContainerShellRuntime {
+    /// Creates a container shell runtime.
+    ///
+    /// # Panics
+    /// Panics if `container_id` or `ipc_host` is empty after trimming.
+    #[must_use]
+    pub fn new(
+        container_id: impl Into<String>,
+        ipc_host: impl Into<String>,
+        exec: ContainerExecHandle,
+    ) -> Self {
+        let container_id = container_id.into();
+        let ipc_host = ipc_host.into();
+        assert!(
+            !container_id.trim().is_empty(),
+            "container runtime requires a non-empty container_id"
+        );
+        assert!(
+            !ipc_host.trim().is_empty(),
+            "container runtime requires a non-empty ipc_host"
+        );
+        Self {
+            exec: exec.inner,
+            container_id,
+            ipc_host,
+        }
+    }
+
+    #[must_use]
+    /// Returns the container id.
+    pub fn container_id(&self) -> &str {
+        &self.container_id
+    }
+
+    #[must_use]
+    /// Returns the host name used for IPC callbacks from the container.
+    pub fn ipc_host(&self) -> &str {
+        &self.ipc_host
+    }
+
+    pub(crate) fn exec(&self) -> Arc<dyn ContainerExecObject> {
+        Arc::clone(&self.exec)
+    }
 }
 
 impl<T: ContainerExec> ContainerExecObject for T {
@@ -58,6 +177,7 @@ impl<T: ContainerExec> ContainerExecObject for T {
         script: &'a str,
         working_dir: &'a str,
         kill_rx: Receiver<()>,
+        stdin_rx: Receiver<Vec<u8>>,
         stdin_blocked_notice: Option<Sender<String>>,
     ) -> Pin<Box<dyn Future<Output = Result<ContainerExecOutcome, String>> + Send + 'a>> {
         Box::pin(self.exec(
@@ -65,41 +185,61 @@ impl<T: ContainerExec> ContainerExecObject for T {
             script,
             working_dir,
             kill_rx,
+            stdin_rx,
             stdin_blocked_notice,
         ))
     }
 }
 
+/// Where a shell command is executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellBackend {
+    /// On this machine, inside the local sandbox.
     Local,
+    /// Inside a container.
     Container,
+    /// On a remote host over SSH.
     Ssh,
 }
 
+/// A named SSH destination the agent may run commands on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SshServer {
+    /// Short name the agent uses to select this server.
     pub name: String,
+    /// SSH target, as passed to `ssh` (for example `user@host`).
     pub target: String,
 }
 
 impl SshServer {
+    /// The name used to address this server.
     #[must_use]
     pub fn id(&self) -> &str {
         &self.name
     }
 }
 
+/// How the sandbox runtime is available on a remote host.
 #[derive(Debug, Clone)]
 pub enum SshRuntimeProfile {
-    Leash { binary: String },
+    /// The `heel` sandbox binary is installed at the given path.
+    Heel {
+        /// Absolute path to the `heel` binary on the remote host.
+        binary: String,
+    },
 }
 
+/// Which shell backends are usable in the current deployment.
+///
+/// Reported to the model so it does not offer a backend that is not configured.
 #[derive(Debug, Clone, Serialize)]
 pub struct ShellRuntimeAvailability {
+    /// Whether local execution is available. Always true in practice.
     pub local: bool,
+    /// Whether a container runtime has been wired up.
     pub container: bool,
+    /// Whether any SSH servers are registered.
     pub ssh: bool,
 }
 
@@ -113,28 +253,37 @@ impl Default for ShellRuntimeAvailability {
     }
 }
 
+/// Approves remote actions before the sandbox performs them.
+///
+/// Connecting to a host and installing software on it are both decisions a user
+/// should make, so they are routed through this trait rather than assumed.
 pub trait SshSessionAuthorizer: Send + Sync {
+    /// Asks whether the agent may open an SSH connection to `target`.
     fn authorize_connect(
         &self,
         target: &str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
 
-    fn authorize_leash_install(
+    /// Asks whether the agent may install the `heel` runtime on `target`.
+    ///
+    /// `details` describes the remote host so the user can judge the request.
+    fn authorize_heel_install(
         &self,
         target: &str,
         details: &str,
     ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + '_>>;
 }
 
+/// Tracks which shell backends are configured and how to reach them.
+///
+/// Cloning shares the same underlying state, so registering a container or SSH
+/// server is visible to every holder.
 #[derive(Clone)]
 pub struct ShellSessionRegistry {
-    availability: Arc<RwLock<ShellRuntimeAvailability>>,
-    ssh_servers: Arc<RwLock<Vec<SshServer>>>,
-    ssh_authorizer: Arc<RwLock<Option<Arc<dyn SshSessionAuthorizer>>>>,
-    /// Container executor — set once, shared across all clones via `OnceLock`.
-    container_exec: Arc<OnceLock<Arc<dyn ContainerExecObject>>>,
-    /// Default container ID — set once, used by container backend.
-    container_id: Arc<OnceLock<String>>,
+    availability: ShellRuntimeAvailability,
+    ssh_servers: Vec<SshServer>,
+    ssh_authorizer: Option<Arc<dyn SshSessionAuthorizer>>,
+    container_runtime: Option<ContainerShellRuntime>,
 }
 
 impl std::fmt::Debug for ShellSessionRegistry {
@@ -145,70 +294,49 @@ impl std::fmt::Debug for ShellSessionRegistry {
 }
 
 impl ShellSessionRegistry {
+    /// Creates a registry advertising the given backends.
     #[must_use]
     pub fn new(availability: ShellRuntimeAvailability) -> Self {
         Self {
-            availability: Arc::new(RwLock::new(availability)),
-            ssh_servers: Arc::new(RwLock::new(Vec::new())),
-            ssh_authorizer: Arc::new(RwLock::new(None)),
-            container_exec: Arc::new(OnceLock::new()),
-            container_id: Arc::new(OnceLock::new()),
+            availability,
+            ssh_servers: Vec::new(),
+            ssh_authorizer: None,
+            container_runtime: None,
         }
     }
 
-    /// Set the container executor (can only be called once; subsequent calls are no-ops).
-    pub fn set_container_exec<T>(&self, exec: Arc<T>)
-    where
-        T: ContainerExec + 'static,
-    {
-        let exec: Arc<dyn ContainerExecObject> = exec;
-        let _ = self.container_exec.set(exec);
+    /// Replaces runtime availability.
+    #[must_use]
+    pub const fn with_availability(mut self, availability: ShellRuntimeAvailability) -> Self {
+        self.availability = availability;
+        self
     }
 
-    /// Set the default container ID for container backend commands.
-    pub fn set_container_id(&self, id: String) {
-        let _ = self.container_id.set(id);
+    /// The currently advertised backends.
+    #[must_use]
+    pub fn with_ssh_authorizer(mut self, authorizer: Arc<dyn SshSessionAuthorizer>) -> Self {
+        self.ssh_authorizer = Some(authorizer);
+        self
     }
 
-    pub fn set_availability(&self, availability: ShellRuntimeAvailability) -> Result<(), String> {
-        *self
-            .availability
-            .write()
-            .map_err(|_| "shell availability lock poisoned".to_string())? = availability;
-        Ok(())
-    }
-
-    pub fn set_ssh_authorizer(
-        &self,
-        authorizer: Arc<dyn SshSessionAuthorizer>,
-    ) -> Result<(), String> {
-        *self
-            .ssh_authorizer
-            .write()
-            .map_err(|_| "ssh authorizer lock poisoned".to_string())? = Some(authorizer);
-        Ok(())
+    /// Sets the container runtime.
+    #[must_use]
+    pub fn with_container_runtime(mut self, runtime: ContainerShellRuntime) -> Self {
+        self.container_runtime = Some(runtime);
+        self
     }
 
     #[must_use]
+    /// Returns runtime availability.
     pub fn availability(&self) -> ShellRuntimeAvailability {
-        self.availability
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.availability.clone()
     }
 
-    /// Get the container executor (if set).
-    pub(crate) fn container_exec(&self) -> Option<Arc<dyn ContainerExecObject>> {
-        self.container_exec.get().cloned()
-    }
-
-    /// Get the configured container ID (if set).
-    #[must_use]
-    pub fn container_id(&self) -> Option<String> {
-        self.container_id.get().cloned()
-    }
-
-    pub fn set_ssh_servers(&self, servers: Vec<SshServer>) -> Result<(), String> {
+    /// Sets SSH server definitions.
+    ///
+    /// # Errors
+    /// Returns an error when a server entry has an empty id/target or duplicates another id.
+    pub fn with_ssh_servers(mut self, servers: Vec<SshServer>) -> Result<Self, String> {
         let mut seen = HashSet::new();
         let mut deduped = Vec::new();
         for server in servers {
@@ -223,35 +351,61 @@ impl ShellSessionRegistry {
             deduped.push(SshServer { name: id, target });
         }
 
-        *self
-            .ssh_servers
-            .write()
-            .map_err(|_| "ssh server lock poisoned".to_string())? = deduped;
-        Ok(())
+        self.ssh_servers = deduped;
+        Ok(self)
     }
 
+    /// Every registered SSH server.
     #[must_use]
+    /// Lists configured SSH servers.
     pub fn list_ssh_servers(&self) -> Vec<SshServer> {
-        self.ssh_servers
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.ssh_servers.clone()
     }
 
+    pub(crate) const fn container_runtime(&self) -> Option<&ContainerShellRuntime> {
+        self.container_runtime.as_ref()
+    }
+
+    /// Returns the default SSH server.
+    ///
+    /// # Errors
+    /// Returns an error when no SSH server is configured or more than one server requires disambiguation.
+    pub fn default_ssh_server(&self) -> Result<SshServer, String> {
+        match self.ssh_servers.as_slice() {
+            [] => Err("no ssh servers are configured".to_string()),
+            [server] => Ok(server.clone()),
+            _ => Err(
+                "ssh_server_id is required because multiple ssh servers are configured".to_string(),
+            ),
+        }
+    }
+
+    /// Looks up a registered server by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `server_id` is blank, names no registered server, or
+    /// the server lock was poisoned.
     pub fn resolve_ssh_server(&self, server_id: &str) -> Result<SshServer, String> {
         let wanted = server_id.trim();
         if wanted.is_empty() {
             return Err("ssh_server_id is required for ssh mode".to_string());
         }
         self.ssh_servers
-            .read()
-            .map_err(|_| "ssh server lock poisoned".to_string())?
             .iter()
             .find(|s| s.id() == wanted)
             .cloned()
             .ok_or_else(|| format!("unknown ssh_server_id: {wanted}"))
     }
 
+    /// Picks the backend to use for a command that did not name one.
+    ///
+    /// Prefers a container when one is configured, since it isolates better
+    /// than running on the host.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither a container nor local execution is available.
     pub fn resolve_local_backend(&self) -> Result<ShellBackend, String> {
         let availability = self.availability();
         if availability.container {
@@ -263,6 +417,11 @@ impl ShellSessionRegistry {
         Err("no local backend available".to_string())
     }
 
+    /// Confirms the SSH backend is configured.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no SSH servers are registered.
     pub fn ensure_ssh_available(&self) -> Result<(), String> {
         if self.availability().ssh {
             Ok(())
@@ -271,83 +430,23 @@ impl ShellSessionRegistry {
         }
     }
 
+    #[must_use]
+    /// Returns the SSH authorizer when configured.
     pub fn ssh_authorizer(&self) -> Option<Arc<dyn SshSessionAuthorizer>> {
-        self.ssh_authorizer.read().ok()?.clone()
+        self.ssh_authorizer.clone()
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ListSshTool {
-    registry: ShellSessionRegistry,
-}
-
-impl ListSshTool {
-    #[must_use]
-    pub const fn new(registry: ShellSessionRegistry) -> Self {
-        Self { registry }
-    }
-}
-
-impl Tool for ListSshTool {
-    fn name(&self) -> Cow<'static, str> {
-        "list_ssh".into()
-    }
-
-    type Arguments = ();
-
-    async fn call(&self, _args: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        let payload = serde_json::json!({
-            "servers": self.registry.list_ssh_servers(),
-        });
-        Ok(ToolOutput::text(payload.to_string()))
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct OpenSshArgs {
-    pub ssh_server_id: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct OpenSshTool {
-    registry: ShellSessionRegistry,
-}
-
-impl OpenSshTool {
-    #[must_use]
-    pub const fn new(registry: ShellSessionRegistry) -> Self {
-        Self { registry }
-    }
-}
-
-impl Tool for OpenSshTool {
-    fn name(&self) -> Cow<'static, str> {
-        "open_ssh".into()
-    }
-
-    type Arguments = OpenSshArgs;
-
-    async fn call(&self, args: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        self.registry
-            .ensure_ssh_available()
-            .map_err(anyhow::Error::msg)?;
-        let server = self
-            .registry
-            .resolve_ssh_server(&args.ssh_server_id)
-            .map_err(anyhow::Error::msg)?;
-        let runtime =
-            bootstrap_ssh_runtime(&server.target, &self.registry.ssh_authorizer()).await?;
-        let payload = serde_json::json!({
-            "ssh_server_id": server.id(),
-            "target": server.target,
-            "runtime": match runtime {
-                SshRuntimeProfile::Leash { .. } => "leash",
-            }
-        });
-        Ok(ToolOutput::text(payload.to_string()))
-    }
-}
-
+/// Prepares a remote host to run sandboxed commands.
+///
+/// Confirms the connection is authorized, probes for the `heel` runtime, and —
+/// with the user's approval — installs it if it is missing.
+///
+/// # Errors
+///
+/// Returns an error if the authorizer denies the connection, the SSH probe
+/// fails, or `heel` is absent and either installation was declined or did not
+/// succeed.
 pub async fn bootstrap_ssh_runtime(
     target: &str,
     authorizer: &Option<Arc<dyn SshSessionAuthorizer>>,
@@ -363,45 +462,45 @@ pub async fn bootstrap_ssh_runtime(
     }
 
     let remote = detect_remote(target).await?;
-    if remote.leash_found {
-        return Ok(SshRuntimeProfile::Leash {
-            binary: remote.leash_path,
+    if remote.heel_found {
+        return Ok(SshRuntimeProfile::Heel {
+            binary: remote.heel_path,
         });
     }
 
     if let Some(auth) = authorizer {
         let details = format!(
-            "Remote {} ({}) does not have leash installed.",
+            "Remote {} ({}) does not have heel installed.",
             remote.os, remote.arch
         );
         let approve_install = auth
-            .authorize_leash_install(target, &details)
+            .authorize_heel_install(target, &details)
             .await
             .map_err(anyhow::Error::msg)?;
-        if approve_install && install_leash(target, &remote).await? {
+        if approve_install && install_heel(target, &remote).await? {
             let verified = detect_remote(target).await?;
-            if verified.leash_found {
-                return Ok(SshRuntimeProfile::Leash {
-                    binary: verified.leash_path,
+            if verified.heel_found {
+                return Ok(SshRuntimeProfile::Heel {
+                    binary: verified.heel_path,
                 });
             }
         }
     }
 
     Err(anyhow::anyhow!(
-        "remote leash runtime unavailable; ssh mode requires leash on the remote host"
+        "remote heel runtime unavailable; ssh mode requires heel on the remote host"
     ))
 }
 
 struct RemoteInfo {
     os: String,
     arch: String,
-    leash_found: bool,
-    leash_path: String,
+    heel_found: bool,
+    heel_path: String,
 }
 
 async fn detect_remote(target: &str) -> Result<RemoteInfo, anyhow::Error> {
-    let probe = "uname -s; uname -m; if command -v leash >/dev/null 2>&1; then command -v leash; elif [ -x \"$HOME/.local/bin/leash\" ]; then printf '%s\\n' \"$HOME/.local/bin/leash\"; else echo __NO_LEASH__; fi";
+    let probe = "uname -s; uname -m; if command -v heel >/dev/null 2>&1; then command -v heel; elif [ -x \"$HOME/.local/bin/heel\" ]; then printf '%s\\n' \"$HOME/.local/bin/heel\"; else echo __NO_HEEL__; fi";
     let output = async_process::Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
@@ -433,26 +532,26 @@ fn parse_remote_probe_output(stdout: &[u8]) -> Result<RemoteInfo, anyhow::Error>
         return Err(anyhow::anyhow!("ssh probe returned unexpected output"));
     }
 
-    let leash_line = lines[2].clone();
-    let leash_found = leash_line != "__NO_LEASH__";
-    if !leash_found {
+    let heel_line = lines[2].clone();
+    let heel_found = heel_line != "__NO_HEEL__";
+    if !heel_found {
         return Ok(RemoteInfo {
             os: lines[0].clone(),
             arch: lines[1].clone(),
-            leash_found,
-            leash_path: String::new(),
+            heel_found,
+            heel_path: String::new(),
         });
     }
 
     Ok(RemoteInfo {
         os: lines[0].clone(),
         arch: lines[1].clone(),
-        leash_found,
-        leash_path: leash_line,
+        heel_found,
+        heel_path: heel_line,
     })
 }
 
-async fn install_leash(target: &str, remote: &RemoteInfo) -> Result<bool, anyhow::Error> {
+async fn install_heel(target: &str, remote: &RemoteInfo) -> Result<bool, anyhow::Error> {
     let local_os = std::env::consts::OS;
     let remote_os = remote.os.to_lowercase();
     let os_match = (local_os == "macos" && remote_os.contains("darwin"))
@@ -466,8 +565,8 @@ async fn install_leash(target: &str, remote: &RemoteInfo) -> Result<bool, anyhow
         return Ok(false);
     }
 
-    let local_leash = find_local_leash().await?;
-    if local_leash.is_empty() {
+    let local_heel = find_local_heel().await?;
+    if local_heel.is_empty() {
         return Ok(false);
     }
 
@@ -486,18 +585,18 @@ async fn install_leash(target: &str, remote: &RemoteInfo) -> Result<bool, anyhow
         return Ok(false);
     }
 
-    let dest = format!("{target}:~/.local/bin/leash");
+    let dest = format!("{target}:~/.local/bin/heel");
     let scp_status = async_process::Command::new("scp")
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
-        .arg(&local_leash)
+        .arg(&local_heel)
         .arg(&dest)
         .stdin(async_process::Stdio::null())
         .status()
         .await
-        .map_err(|e| anyhow::anyhow!("scp leash failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("scp heel failed: {e}"))?;
     if !scp_status.success() {
         return Ok(false);
     }
@@ -508,23 +607,23 @@ async fn install_leash(target: &str, remote: &RemoteInfo) -> Result<bool, anyhow
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg(target)
-        .arg("chmod +x ~/.local/bin/leash && ~/.local/bin/leash --version")
+        .arg("chmod +x ~/.local/bin/heel && ~/.local/bin/heel --version")
         .stdin(async_process::Stdio::null())
         .status()
         .await
-        .map_err(|e| anyhow::anyhow!("verify leash failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("verify heel failed: {e}"))?;
 
     Ok(verify_status.success())
 }
 
-async fn find_local_leash() -> Result<String, anyhow::Error> {
+async fn find_local_heel() -> Result<String, anyhow::Error> {
     let out = async_process::Command::new("sh")
         .arg("-c")
-        .arg("command -v leash || true")
+        .arg("command -v heel || true")
         .stdin(async_process::Stdio::null())
         .output()
         .await
-        .map_err(|e| anyhow::anyhow!("failed to locate local leash: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to locate local heel: {e}"))?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
@@ -538,23 +637,73 @@ fn normalize_arch(raw: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_remote_probe_output;
+    use super::{
+        ShellRuntimeAvailability, ShellSessionRegistry, SshServer, parse_remote_probe_output,
+    };
 
     #[test]
-    fn parse_remote_probe_detects_local_bin_leash_path() {
-        let stdout = b"Linux\nx86_64\n/home/test/.local/bin/leash\n";
+    fn parse_remote_probe_detects_local_bin_heel_path() {
+        let stdout = b"Linux\nx86_64\n/home/test/.local/bin/heel\n";
         let remote = parse_remote_probe_output(stdout).expect("probe output should parse");
         assert_eq!(remote.os, "Linux");
         assert_eq!(remote.arch, "x86_64");
-        assert!(remote.leash_found);
-        assert_eq!(remote.leash_path, "/home/test/.local/bin/leash");
+        assert!(remote.heel_found);
+        assert_eq!(remote.heel_path, "/home/test/.local/bin/heel");
     }
 
     #[test]
-    fn parse_remote_probe_handles_missing_leash() {
-        let stdout = b"Linux\naarch64\n__NO_LEASH__\n";
+    fn parse_remote_probe_handles_missing_heel() {
+        let stdout = b"Linux\naarch64\n__NO_HEEL__\n";
         let remote = parse_remote_probe_output(stdout).expect("probe output should parse");
-        assert!(!remote.leash_found);
-        assert!(remote.leash_path.is_empty());
+        assert!(!remote.heel_found);
+        assert!(remote.heel_path.is_empty());
+    }
+
+    #[test]
+    fn default_ssh_server_uses_single_configured_target() {
+        let registry = ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: false,
+            container: false,
+            ssh: true,
+        })
+        .with_ssh_servers(vec![SshServer {
+            name: "prod".to_string(),
+            target: "root@example.com".to_string(),
+        }])
+        .expect("ssh server should configure");
+
+        let server = registry
+            .default_ssh_server()
+            .expect("single ssh server should become default");
+        assert_eq!(server.id(), "prod");
+        assert_eq!(server.target, "root@example.com");
+    }
+
+    #[test]
+    fn default_ssh_server_requires_disambiguation_when_multiple_exist() {
+        let registry = ShellSessionRegistry::new(ShellRuntimeAvailability {
+            local: false,
+            container: false,
+            ssh: true,
+        })
+        .with_ssh_servers(vec![
+            SshServer {
+                name: "prod".to_string(),
+                target: "root@example.com".to_string(),
+            },
+            SshServer {
+                name: "staging".to_string(),
+                target: "root@staging.example.com".to_string(),
+            },
+        ])
+        .expect("ssh servers should configure");
+
+        let error = registry
+            .default_ssh_server()
+            .expect_err("multiple ssh servers must require explicit selection");
+        assert!(
+            error.contains("ssh_server_id is required"),
+            "unexpected error: {error}"
+        );
     }
 }

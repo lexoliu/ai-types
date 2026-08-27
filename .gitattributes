@@ -1,0 +1,9 @@
+# Line endings are content in this repository, not formatting. askama embeds a
+# template file verbatim, so a CRLF introduced by git's checkout conversion on
+# Windows lands in whatever the template renders -- and the rendered text is
+# not always just displayed. `container_ipc_wrapper.sh` is a shell script built
+# this way, and a trailing carriage return there ends up inside variable values
+# and command names, so it fails somewhere unrelated to where it entered.
+# Normalise the whole tree to LF rather than special-casing the directories
+# that happen to hurt today; `text=auto` still leaves binary files alone.
+* text=auto eol=lf

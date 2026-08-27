@@ -1,6 +1,6 @@
 [package]
 name = "aither-llama"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -14,14 +14,24 @@ categories = ["api-bindings"]
 [dependencies]
 aither-core.workspace = true
 async-channel = "2"
+async-fs = "2"
 futures-core = { version = "0.3", default-features = false }
 futures-lite = "2.6"
 encoding_rs = "0.8"
-llama-cpp-2 = { version = "0.1.133", features = ["sampler"] }
+# Pinned exactly: 0.1.154 dropped `apply_chat_template_oaicompat`, which is what
+# carries the thinking toggle and the model-side tool-call parser used below.
+llama-cpp-2 = { version = "=0.1.133", features = ["sampler"] }
+# llama-cpp-2 0.1.133 asks for `llama-cpp-sys-2 = "0.1.133"`, but that caret range
+# also admits 0.1.154, whose bindings no longer export the oaicompat wrappers 0.1.133
+# calls. Pin the sys crate so a fresh resolve cannot pick that broken pair.
+llama-cpp-sys-2 = "=0.1.133"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
-tracing.workspace = true
+
+# Pinned to force the matching sys version; nothing references it directly.
+[package.metadata.cargo-machete]
+ignored = ["llama-cpp-sys-2"]
 
 [lints]
 workspace = true

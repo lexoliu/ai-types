@@ -1,5 +1,27 @@
 use std::time::Duration;
 
+/// Waits out a retry backoff.
+///
+/// wasm32 has no reactor to park on, so the browser timer runs on the JS event
+/// loop and the delay is awaited through a channel — skipping the wait there
+/// would turn exponential backoff into a hot retry loop against a rate-limited
+/// API.
+async fn sleep(duration: Duration) {
+    #[cfg(not(target_arch = "wasm32"))]
+    async_io::Timer::after(duration).await;
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let millis = u32::try_from(duration.as_millis()).unwrap_or(u32::MAX);
+        let (elapsed_tx, elapsed_rx) = async_channel::bounded::<()>(1);
+        wasm_bindgen_futures::spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(millis).await;
+            let _ = elapsed_tx.send(()).await;
+        });
+        let _ = elapsed_rx.recv().await;
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use zenwave::{Client, client, header};
 
@@ -77,7 +99,7 @@ pub async fn stream_generate(
             Err(e) => {
                 let err = GeminiError::from_http(e);
                 if err.is_retryable() && attempt < MAX_RETRIES {
-                    let delay_secs = err.retry_delay_secs().unwrap_or(2u64.pow(attempt));
+                    let delay_secs = err.retry_delay_secs().unwrap_or_else(|| 2u64.pow(attempt));
                     if debug {
                         tracing::info!(
                             "Gemini streaming error (attempt {}/{}), retrying in {}s: {}",
@@ -87,12 +109,7 @@ pub async fn stream_generate(
                             err
                         );
                     }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    async_io::Timer::after(Duration::from_secs(delay_secs)).await;
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        let _ = delay_secs;
-                    }
+                    sleep(Duration::from_secs(delay_secs)).await;
                     continue;
                 }
                 return Err(err);
@@ -122,7 +139,6 @@ pub async fn stream_generate(
                             Ok(response) => return Some((Ok(response), stream)),
                             Err(e) => {
                                 tracing::debug!("SSE parse error: {} for data: {}", e, data);
-                                continue;
                             }
                         }
                     }
@@ -203,17 +219,15 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
 
         match builder.json().await {
             Ok(res) => {
-                if debug {
-                    if let Ok(json) = serde_json::to_string_pretty(&res) {
-                        tracing::debug!("Gemini response from {endpoint}:\n{json}");
-                    }
+                if debug && let Ok(json) = serde_json::to_string_pretty(&res) {
+                    tracing::debug!("Gemini response from {endpoint}:\n{json}");
                 }
                 return Ok(res);
             }
             Err(e) => {
                 let err = GeminiError::from_http(e);
                 if err.is_retryable() && attempt < MAX_RETRIES {
-                    let delay_secs = err.retry_delay_secs().unwrap_or(2u64.pow(attempt));
+                    let delay_secs = err.retry_delay_secs().unwrap_or_else(|| 2u64.pow(attempt));
                     if debug {
                         tracing::info!(
                             "Gemini POST error (attempt {}/{}), retrying in {}s: {}",
@@ -223,12 +237,7 @@ async fn post_json<T: for<'de> serde::Deserialize<'de> + serde::Serialize, S: Se
                             err
                         );
                     }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    async_io::Timer::after(Duration::from_secs(delay_secs)).await;
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        let _ = delay_secs;
-                    }
+                    sleep(Duration::from_secs(delay_secs)).await;
                     continue;
                 }
                 return Err(err);

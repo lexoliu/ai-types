@@ -4,7 +4,8 @@
 //! Designed to work like Claude Code's `TodoWrite` for tracking multi-step work.
 
 use std::borrow::Cow;
-use std::sync::{Arc, RwLock};
+use std::fmt::Write as _;
+use std::sync::Arc;
 
 #[cfg(test)]
 mod tests {
@@ -54,7 +55,8 @@ mod tests {
     }
 }
 
-use aither_core::llm::{Tool, ToolOutput};
+use aither_core::llm::{Tool, ToolResult};
+use arc_swap::ArcSwap;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -87,7 +89,7 @@ pub struct TodoItem {
 /// Shared todo list state.
 #[derive(Debug, Clone, Default)]
 pub struct TodoList {
-    items: Arc<RwLock<Vec<TodoItem>>>,
+    items: Arc<ArcSwap<Vec<TodoItem>>>,
 }
 
 impl TodoList {
@@ -98,36 +100,55 @@ impl TodoList {
     }
 
     /// Returns all items in the list.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn items(&self) -> Vec<TodoItem> {
-        self.items.read().unwrap().clone()
+        self.items.load_full().as_ref().clone()
     }
 
     /// Replaces the entire todo list with new items.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     pub fn write(&self, items: Vec<TodoItem>) {
-        *self.items.write().unwrap() = items;
+        self.items.store(Arc::new(items));
     }
 
     /// Clears all tasks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     pub fn clear(&self) {
-        self.items.write().unwrap().clear();
+        self.items.store(Arc::new(Vec::new()));
     }
 
     /// Returns the currently in-progress task, if any.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn current_task(&self) -> Option<TodoItem> {
         self.items
-            .read()
-            .unwrap()
+            .load()
             .iter()
             .find(|i| i.status == TodoStatus::InProgress)
             .cloned()
     }
 
     /// Returns a formatted summary of progress.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the list lock was poisoned by a panic in another thread.
     #[must_use]
     pub fn progress_summary(&self) -> String {
-        let items = self.items.read().unwrap();
+        let items = self.items.load();
         if items.is_empty() {
             return String::new();
         }
@@ -147,13 +168,13 @@ impl TodoList {
         let total = items.len();
 
         let mut summary = format!("Progress: {completed}/{total} completed");
-        if in_progress > 0 {
-            if let Some(current) = items.iter().find(|i| i.status == TodoStatus::InProgress) {
-                summary.push_str(&format!(" | Current: {}", current.active_form));
-            }
+        if in_progress > 0
+            && let Some(current) = items.iter().find(|i| i.status == TodoStatus::InProgress)
+        {
+            let _ = write!(summary, " | Current: {}", current.active_form);
         }
         if pending > 0 {
-            summary.push_str(&format!(" | {pending} pending"));
+            let _ = write!(summary, " | {pending} pending");
         }
         summary
     }
@@ -162,7 +183,7 @@ impl TodoList {
 /// Manage an in-memory structured task list for tracking progress on complex work.
 ///
 /// This tool only updates runtime task state shown in UI/context.
-/// It does NOT create or edit TODO.md files on disk.
+/// It does NOT create or edit tasks.md on disk.
 ///
 /// Use proactively when tasks require 3+ steps, involve multiple files,
 /// or need careful organization. Updates replace the entire list.
@@ -219,24 +240,30 @@ impl Tool for TodoTool {
     }
 
     type Arguments = TodoWriteArgs;
+    type Res = ToolResult;
 
-    async fn call(&self, arguments: Self::Arguments) -> aither_core::Result<ToolOutput> {
-        // Validate: at most one task should be in_progress
-        let in_progress_count = arguments
-            .todos
-            .iter()
-            .filter(|t| t.status == TodoStatus::InProgress)
-            .count();
+    fn call(
+        &self,
+        arguments: Self::Arguments,
+    ) -> impl std::future::Future<Output = aither_core::Result<Self::Res>> + Send {
+        std::future::ready((|| {
+            // Validate: at most one task should be in_progress
+            let in_progress_count = arguments
+                .todos
+                .iter()
+                .filter(|t| t.status == TodoStatus::InProgress)
+                .count();
 
-        if in_progress_count > 1 {
-            return Err(anyhow::anyhow!(
-                "Only one task should be in_progress at a time, found {in_progress_count}"
-            ));
-        }
+            if in_progress_count > 1 {
+                return Err(anyhow::anyhow!(
+                    "Only one task should be in_progress at a time, found {in_progress_count}"
+                ));
+            }
 
-        self.list.write(arguments.todos);
+            self.list.write(arguments.todos);
 
-        // TodoWrite succeeds with no output - the UI shows the todo list separately
-        Ok(ToolOutput::Done)
+            // TodoWrite succeeds with no output - the UI shows the todo list separately
+            Ok(ToolResult::Done)
+        })())
     }
 }

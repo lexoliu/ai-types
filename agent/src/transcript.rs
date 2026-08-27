@@ -12,6 +12,7 @@
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+use aither_core::llm::ToolResult;
 use async_fs::OpenOptions;
 use futures_lite::AsyncWriteExt;
 
@@ -22,15 +23,19 @@ pub struct Transcript {
 }
 
 impl Transcript {
+    /// Creates a transcript that appends to `path`.
+    #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
+    /// The file this transcript is written to.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Appends a user turn.
     pub async fn write_user_message(&self, content: &str) {
         let mut block = String::new();
         let _ = writeln!(block, "\n## User\n");
@@ -38,6 +43,7 @@ impl Transcript {
         self.append(&block).await;
     }
 
+    /// Appends an assistant turn. Empty content is skipped.
     pub async fn write_assistant_text(&self, content: &str) {
         if content.is_empty() {
             return;
@@ -48,6 +54,7 @@ impl Transcript {
         self.append(&block).await;
     }
 
+    /// Appends the command a tool was invoked with.
     pub async fn write_tool_call(&self, name: &str, command: &str) {
         let mut block = String::new();
         let _ = writeln!(block, "\n### Tool: {name}\n");
@@ -57,17 +64,17 @@ impl Transcript {
         self.append(&block).await;
     }
 
-    pub async fn write_tool_result(&self, name: &str, result: &Result<String, String>) {
+    /// Append a tool result block.
+    pub async fn write_tool_result(&self, name: &str, result: &ToolResult) {
         let mut block = String::new();
-        match result {
-            Ok(output) => {
-                let truncated = truncate_lines(output, 200);
-                let _ = writeln!(block, "-> {name}: {truncated}\n");
-            }
-            Err(err) => {
-                let truncated = truncate_lines(err, 200);
-                let _ = writeln!(block, "-> {name} (error): {truncated}\n");
-            }
+        let rendered = result
+            .render_for_cli()
+            .unwrap_or_else(|error| format!("failed to render tool result: {error}"));
+        let truncated = truncate_lines(&rendered, 200);
+        if result.is_error() {
+            let _ = writeln!(block, "-> {name} (error): {truncated}\n");
+        } else {
+            let _ = writeln!(block, "-> {name}: {truncated}\n");
         }
         self.append(&block).await;
     }
@@ -75,13 +82,7 @@ impl Transcript {
     /// Marker written on compaction. Deliberately excludes the summary so the
     /// model knows context was lost and should recover from files.
     pub async fn write_compact_marker(&self) {
-        let marker = concat!(
-            "\n---\n\n",
-            "*[Context was compacted here. Earlier messages were summarized and removed. ",
-            "Details may be missing -- recover from files or re-read this transcript ",
-            "if needed.]*\n\n",
-            "---\n\n",
-        );
+        let marker = "\n---\n\n*[Context was compacted here. Earlier messages were summarized and removed. Details may be missing -- recover from files or re-read this transcript if needed.]*\n\n---\n\n";
         self.append(marker).await;
     }
 
